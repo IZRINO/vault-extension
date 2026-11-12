@@ -1,0 +1,15 @@
+{
+  "name": "vault-extension-monorepo",
+  "private": true,
+  "packageManager": "pnpm@12.19.0",
+  "scripts": {
+    "build:wasm": "wasm-pack build crates/vault-core --target web --release && wasm-pack build crates/vault-importers --target web --release",
+    "dev": "pnpm --filter ./apps/extension dev",
+    "build": "pnpm run build:wasm && pnpm --filter ./apps/extension build",
+    "test:rust": "cargo test --workspace"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "vitest": "^5.1.0"
+  }
+}
