@@ -1,4 +1,3 @@
-import KdfWorker from '../../src/kdf.worker?worker';
 import type { Reply } from '../../src/vault-messages';
 
 async function digest(text: string): Promise<string> {
@@ -35,7 +34,8 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
   const run = async (): Promise<unknown> => {
     if (message.operation === 'derive') {
       return new Promise((resolve, reject) => {
-        const worker = new KdfWorker();
+        // Workers must use the extension origin, including during WXT development.
+        const worker = new Worker(browser.runtime.getURL('/kdf-worker.js'));
         const timer = setTimeout(() => { worker.terminate(); reject(new Error('密钥派生超时')); }, 120000);
         const finish = () => { clearTimeout(timer); worker.terminate(); };
         worker.onmessage = ({ data }: MessageEvent<Reply>) => {

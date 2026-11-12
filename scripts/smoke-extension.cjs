@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const root = path.resolve(__dirname, '..');
-const extension = path.join(root, 'apps/extension/.output/chrome-mv3');
+const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const candidates = {
   edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   helium: 'C:/Program Files/imput/Helium/Application/chrome.exe',
@@ -16,7 +16,7 @@ async function run(name) {
   const context = await chromium.launchPersistentContext(profile, { executablePath, headless: true,
     args: ['--disable-extensions-except=' + extension, '--load-extension=' + extension], viewport: { width: 900, height: 850 } });
   const errors = [];
-  const result = { browser: name, version: context.browser().version() };
+  const result = { browser: name, version: context.browser().version(), extension: path.relative(root, extension) };
   try {
     const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 20000 });
     const id = new URL(worker.url()).host;

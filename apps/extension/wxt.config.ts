@@ -2,7 +2,6 @@ import { defineConfig } from 'wxt';
 
 export default defineConfig({
   modules: ['@wxt-dev/module-react'],
-  vite: () => ({ worker: { format: 'es' } }),
   manifest: {
     name: 'Vault · 本地密码库',
     description: '本地加密保存登录、支付卡、身份与开发者凭证。',

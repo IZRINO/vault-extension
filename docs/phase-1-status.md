@@ -32,6 +32,7 @@ IndexedDB 的 vault 表按单条事务保存 head 和 snap 的 Uint8Array 密文
 4. 复制空选择区返回成功却没有清除剪贴板。通过 copy 事件显式写入空文本，并在清理前再次检查当前内容。
 5. 凭证 MessagePack 数组声明了 12 个字段，实际写入 13 个。修正计数，并通过 rmp-serde 交叉验证；旧头格式仍可读取。快照认证直接验证存储字节，避免重编码变化使旧快照失效。
 6. 补齐 Argon2 工作内存、临时凭证克隆和中间 JSON 字符串的释放擦除。
+7. 开发模式通过 Vite `?worker` 生成 localhost Worker 地址，建库时触发 Edge 的 `DWH_INVALID_SCRIPT_URL_ORIGIN` 并终止扩展进程。将密钥 Worker 改为 WXT 独立脚本入口，通过扩展自身地址加载；浏览器回归脚本增加 `VAULT_EXTENSION_PATH`，覆盖开发版产物。
 
 ## 自动验证
 
@@ -45,6 +46,8 @@ IndexedDB 的 vault 表按单条事务保存 head 和 snap 的 Uint8Array 密文
 | TypeScript | tsc --noEmit 通过 |
 | WASM 构建 | 两个模块均通过 WebAssembly.validate；主核 246,113 字节，低于 250 KiB 门禁 |
 | Edge / Helium | 建库、凭证保存、落盘无测试明文、后台强杀恢复、PIN 熔断、备份导入导出、恢复码重设、虚拟 PRF 与不支持时降级、剪贴板清理和防误删、弹出面板及窄屏侧栏通过 |
+
+开发模式 Worker 修复后，Edge / Helium 分别对 `edge-mv3-dev` 开发产物和 `chrome-mv3` 生产产物完成整套回归，四种组合全部通过；TypeScript 编译与 8 项后台集成测试同时通过。
 
 浏览器报告和截图生成在 test-results；该目录不提交到 Git。唤醒时间是本机单条凭证测试的观测值，不是所有库容量和设备上的性能保证。实体认证器与操作系统事件不由虚拟认证器结果替代。
 
