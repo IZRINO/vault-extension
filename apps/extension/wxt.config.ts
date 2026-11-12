@@ -1,28 +1,14 @@
-import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'wxt';
 
-// See https://wxt.dev/api/reference/wxt/interfaces/inlineconfig.html
 export default defineConfig({
   modules: ['@wxt-dev/module-react'],
-  vite: () => ({
-    plugins: [tailwindcss()],
-  }),
+  vite: () => ({ worker: { format: 'es' } }),
   manifest: {
-    permissions: [
-      'storage',
-      'unlimitedStorage',
-      'activeTab',
-      'tabs',
-      'alarms',
-      'idle',
-      'contextMenus',
-      'sidePanel',
-      'clipboardWrite',
-      'clipboardRead',
-      'offscreen',
-    ],
+    name: 'Vault · 本地密码库',
+    description: '本地加密保存登录、支付卡、身份与开发者凭证。',
+    permissions: ['storage', 'unlimitedStorage', 'alarms', 'idle', 'sidePanel', 'clipboardWrite', 'clipboardRead', 'offscreen'],
     optional_permissions: ['privacy'],
-    host_permissions: ['<all_urls>'],
+    optional_host_permissions: ['https://api.pwnedpasswords.com/*'],
     content_security_policy: {
       extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';",
     },

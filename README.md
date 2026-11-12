@@ -11,14 +11,14 @@
 
 ---
 
-> **项目状态**：已完成 `pnpm workspace` + `Cargo workspace` Monorepo 工程脚手架初始化与 v1.3 架构设计规范定稿，正按 [分阶段路线图](#实施路线图roadmap) 推进研发。完整设计细节、威胁模型与协议定义请参阅 [《密码管理器浏览器插件-技术架构与选型文档》](./密码管理器浏览器插件-技术架构与选型文档.md)。
+> **项目状态**：第一阶段本地密码库已实现，包含主密码 / 恢复码 / PIN / PRF 系统解锁、凭证管理与加密备份；Rust、后台集成与 Edge / Helium 自动流程已通过。实体 Windows Hello 与实际锁屏仍待人工验收。实现范围、测试结果与限制见 [第一轮开发与验收记录](./docs/phase-1-status.md)。下文其余全景功能为分阶段目标，尚未全部实现。
 
 ## 设计目标与安全红线
 
 `vault-extension` 旨在提供一款**不依赖任何官方中心化服务器、数据 100% 由用户自主掌控且可完整代码审计**的现代浏览器全能凭证管理扩展：
 
 1. **真正的零知识架构（Zero-Knowledge）**：无官方后端；主密码（Master Password）永不离开本机内存，网站域名（URL / RP ID）、2FA 密钥、备注及条目精确字节长度等全部元数据均经认证加密并按 `256 Bytes` 分桶填充隐藏。
-2. **Rust / WASM 内存隔离与即时擦除**：密钥派生、AEAD 加解密、Passkey 私钥签名、TOTP/HOTP/Steam 口令计算及第三方加密备份解析全部运行于 **Rust 编译的 WebAssembly 线性内存**中，敏感数据用完立即通过 `Zeroize` 擦除，规避 JavaScript 字符串不可变与 GC 滞留导致的内存残留风险。
+2. **Rust / WASM 内存隔离与即时擦除**：密钥派生、AEAD 加解密、Passkey 私钥签名、TOTP/HOTP/Steam 口令计算及第三方加密备份解析全部运行于 **Rust 编译的 WebAssembly 线性内存**中，核心密钥材料与 Rust 敏感缓冲区通过 `Zeroize` 擦除。输入和显示密码时仍会经过 JavaScript 字符串，不能承诺浏览器 GC 内存的确定性擦除。
 3. **全链路加密传输与最小权限隔离**：外部 WebDAV 同步强制要求 `HTTPS (TLS 1.2/1.3)` 叠加应用层 `XChaCha20-Poly1305` 端到端加密与 BLAKE3 状态树防回滚校验；内部 `Content Script ↔ Background Service Worker` 严格校验 `sender.origin` / `tab.url`，仅向页面上下文传递脱敏候选摘要与句柄，绝不下发整库或私钥。
 4. **纯 WebDAV 无锁极简增量同步**：无需自建同步后端，采用 **LSM-Tree 思想的紧凑快照（Snapshot）+ 预写增量日志（WAL Delta）+ HLC 三路合并（3-Way Merge）**；内置**坚果云**与 **Koofr** 官方地址预设，1,000 条全量凭证快照仅 `~200 KB`，单次修改增量传输仅 `~320–512 B`。
 5. **开放生态与零锁定迁移（Zero Lock-in）**：一等公民双向兼容 **Ente Auth 纯文本导出格式**（完整保留置顶、标签、备注等扩展元数据）与 **FIDO CXF 1.0** 行业凭证交换标准，支持主流密码管理器及验证器本地内存直解迁移。
@@ -187,6 +187,7 @@ vault-extension/
 ├── package.json                              # Monorepo 脚本入口
 ├── pnpm-workspace.yaml                       # pnpm 工作区定义
 ├── 密码管理器浏览器插件-技术架构与选型文档.md # 完整技术架构与协议设计规范 (v1.3)
+├── 分期开发与验证计划.md                     # Phase 1–4 研发任务拆解与测试验收清单
 ├── crates/
 │   ├── vault-core/                           # 常驻核心安全引擎 WASM 包 (密码学/Passkey/2FA/同步编解码/三路合并)
 │   └── vault-importers/                      # 按需懒加载导入导出 WASM 包 (CXF/Ente/Bitwarden/KDBX/1PUX/OTP)
@@ -205,7 +206,7 @@ vault-extension/
 ### 环境要求
 
 - **Rust**：`rustc >= 1.85`（支持 Edition 2024），已安装 `wasm32-unknown-unknown` 目标与 [`wasm-pack`](https://rustwasm.github.io/wasm-pack/)
-- **Node.js**：`>= 20` 及 `pnpm`
+- **Node.js**：支持 `node:zlib` Zstandard API 的版本及 `pnpm`；本次验证为 Node.js 26.13.1（标准格式互操作测试需要该 API）
 - **浏览器**：Microsoft Edge、Helium Browser 或任意 Chromium 内核桌面浏览器
 
 ```bash
@@ -230,6 +231,13 @@ pnpm run build
 
 # 5. 运行 Rust 工作区单元测试
 pnpm run test:rust
+
+# 6. 后台集成测试（先生成 WASM 包）
+pnpm run test:extension
+
+# 7. 类型检查与 Edge / Helium 独立配置冒烟
+pnpm --filter ./apps/extension compile
+pnpm run test:smoke
 ```
 
 ### 在浏览器中加载调试
@@ -242,6 +250,8 @@ pnpm run test:rust
 ---
 
 ## 实施路线图（Roadmap）
+
+> 每一期的详细模块拆解、单元测试矩阵、安全靶场用例与实机准出红线见 [《分期开发与验证计划》](./分期开发与验证计划.md)。
 
 - [ ] **Phase 1：密码学底座与本地密码库闭环（MVP）**
   - 跑通 `WXT + React + Rust/WASM` 构建链路及 Edge / Helium 加载验证
