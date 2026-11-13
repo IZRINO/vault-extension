@@ -1,0 +1,120 @@
+/* 取件柜：喷塑钢板的浅灰底，橙红柜门，石墨色文字。 */
+:root {
+  color-scheme: light dark;
+
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-num: Bahnschrift, "DIN Alternate", "Roboto Condensed", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "SFMono-Regular", ui-monospace, monospace;
+
+  --t-xs: 0.75rem;
+  --t-s: 0.8125rem;
+  --t-m: 0.875rem;
+  --t-l: 0.9375rem;
+  --t-xl: 1.0625rem;
+  --t-2xl: 1.25rem;
+  --t-3xl: 1.5rem;
+
+  /* 柜门：顶栏、锁定屏、当前位置 */
+  --door: #cb431e;
+  --door-text: #b23a18;
+  --on-door: #fff;
+  --door-well: rgb(0 0 0 / 0.22);
+  --door-glass: rgb(255 255 255 / 0.18);
+  --door-edge: rgb(255 255 255 / 0.5);
+
+  /* 柜体 */
+  --ground: #f2f3ef;
+  --panel: #fff;
+  --well: #e7e9e3;
+  --line: #d8dcd4;
+  --line-strong: #879089;
+  --ink: #1f2428;
+  --ink-2: #4a5459;
+  --ink-3: #5f696e;
+
+  --primary: #1f2428;
+  --primary-hover: #343c42;
+  --on-primary: #fff;
+
+  /* 绿色只表示“刚刚取到” */
+  --got: #0e7f52;
+  --on-got: #fff;
+  --got-soft: #dcf2e6;
+  --on-got-soft: #0a5a3a;
+
+  --warn-soft: #fff1c9;
+  --on-warn-soft: #4f3a00;
+  --warn-line: #d9a520;
+
+  --danger: #b3261e;
+  --danger-soft: #fce8e6;
+  --on-danger-soft: #7a1712;
+  --danger-line: #d98f88;
+
+  --focus-base: #1f2428;
+  --focus: var(--focus-base);
+
+  --plate-login: #1f2428;
+  --plate-card: #3e5c76;
+  --plate-identity: #6a5a3c;
+  --plate-developer: #4b4f8a;
+  --on-plate: #fff;
+
+  --lamp-on: #8df5bf;
+  --lamp-off: #ffd28a;
+
+  --shadow-1: 0 1px 2px rgb(31 36 40 / 0.1);
+  --shadow-2: 0 12px 32px rgb(31 36 40 / 0.2), 0 2px 6px rgb(31 36 40 / 0.1);
+  --backdrop: rgb(21 24 26 / 0.56);
+
+  --r-s: 6px;
+  --r-m: 8px;
+  --r-l: 12px;
+  --pad: 16px;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --door: #c2401c;
+    --door-text: #ff9a70;
+
+    --ground: #15181a;
+    --panel: #1f2427;
+    --well: #2a3034;
+    --line: #343b40;
+    --line-strong: #6b757b;
+    --ink: #eceeea;
+    --ink-2: #b9c0c3;
+    --ink-3: #98a1a5;
+
+    --primary: #eceeea;
+    --primary-hover: #fff;
+    --on-primary: #15181a;
+
+    --got: #2fb57f;
+    --on-got: #06281a;
+    --got-soft: #12382a;
+    --on-got-soft: #9be8c4;
+
+    --warn-soft: #3a2e0c;
+    --on-warn-soft: #ffe08a;
+    --warn-line: #8a6d17;
+
+    --danger: #ff8a80;
+    --danger-soft: #3b1513;
+    --on-danger-soft: #ffb4ab;
+    --danger-line: #8c3a34;
+
+    --focus-base: #eceeea;
+
+    --plate-login: #47525a;
+    --plate-card: #3f6688;
+    --plate-identity: #7b693f;
+    --plate-developer: #5d62ad;
+
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-2: 0 12px 32px rgb(0 0 0 / 0.55), 0 2px 6px rgb(0 0 0 / 0.4);
+    --backdrop: rgb(0 0 0 / 0.62);
+  }
+}

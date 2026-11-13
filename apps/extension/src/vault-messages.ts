@@ -28,13 +28,15 @@ export interface VaultStatus {
 }
 export interface ItemSummary {
   id: string; title: string; kind: string; subtitle: string;
-  primaryDomain?: string; tags: string[]; pinned: boolean;
-  requireReprompt: boolean; trashed: boolean; cardLast4?: string;
+  primaryDomain?: string | null; tags: string[]; pinned: boolean;
+  requireReprompt: boolean; trashed: boolean; cardLast4?: string | null;
+  cardBrand?: string | null; devSubtype?: string | null; hasTotp?: boolean; updatedAtMs?: number;
 }
 export interface VaultItem {
   id: string; title: string; data: { kind: string; [key: string]: unknown };
   note: string; customFields: { name: string; value: string; hidden: boolean }[];
   tags: string[]; pinned: boolean; requireReprompt: boolean; trashed: boolean; revision?: number;
+  createdAtMs?: number; updatedAtMs?: number;
 }
 export type Reply<T = unknown> = { ok: true; value: T } | { ok: false; error: string };
 export async function request<T = unknown>(message: VaultMessage): Promise<T> {

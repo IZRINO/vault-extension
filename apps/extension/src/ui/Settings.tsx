@@ -1,0 +1,166 @@
+import { useEffect, useState } from 'react';
+import { ArrowLeft, ArrowRightLeft, ChevronRight, Download, Fingerprint, Globe, HardDrive, KeyRound, Lock, Upload } from 'lucide-react';
+import { request, type Proof, type VaultStatus } from '../vault-messages';
+import { registerPrf } from '../webauthn';
+import { Ico, SecretField, SelectField } from './components';
+import { useDialogs } from './dialogs';
+import { download } from './lib';
+import { useOps } from './Main';
+
+export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'browser';
+const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', browser: '浏览器设置' };
+export default function Settings({ status, page, setPage, refresh }: {
+  status: VaultStatus; page: SettingsPage; setPage(page: SettingsPage): void; refresh(): Promise<void>;
+}) {
+  return <div className="view">
+    {page === 'home' ? <><h1 className="page-title">设置</h1><p className="lede">密码库加密保存在这台电脑上。记得另存备份，换电脑时也能带走。</p>
+      <div className="nav-rows">
+        {([
+          ['security', Lock, '解锁与自动锁定', `主密码${status.pinEnabled ? '、PIN' : ''}${status.prf ? '、系统解锁' : ''} · ${status.autoLockMinutes} 分钟后锁定`],
+          ['password', KeyRound, '更改主密码', '用当前主密码设置一个新的主密码'],
+          ['backup', HardDrive, '备份与恢复', '保存加密备份，或从备份恢复凭证'],
+          ['browser', Globe, '浏览器设置', '管理浏览器原生的保存密码提示'],
+        ] as const).map(([id, icon, label, hint]) => <button type="button" className="nav-row" key={id} onClick={() => setPage(id)}>
+          <Ico of={icon} /><span className="grow"><strong>{label}</strong><small>{hint}</small></span><Ico of={ChevronRight} /></button>)}
+      </div><p className="meta">Vault · 本地密码库</p></>
+      : <div className="view-head"><button type="button" className="icon-btn" aria-label="返回设置" onClick={() => setPage('home')}><Ico of={ArrowLeft} /></button><h1>{titles[page]}</h1></div>}
+    {page === 'security' && <Security status={status} refresh={refresh} />}
+    {page === 'password' && <ChangePassword refresh={refresh} />}
+    {page === 'backup' && <Backup refresh={refresh} />}
+    {page === 'browser' && <BrowserSettings />}
+  </div>;
+}
+
+function Security({ status, refresh }: { status: VaultStatus; refresh(): Promise<void> }) {
+  const { busy, work, notify } = useOps();
+  const dialogs = useDialogs();
+  const [pin, setPin] = useState('');
+  async function verified(action: (proof: Proof) => Promise<void>) {
+    const proof = await dialogs.proof();
+    try { await action(proof); } finally { proof.secret = ''; }
+  }
+  return <>
+    <SelectField label="自动锁定" value={status.autoLockMinutes} onChange={value => void work(async () => {
+      await request({ type: 'set-autolock', minutes: Number(value) }); await refresh(); notify('自动锁定时间已更新。');
+    })} disabled={busy} hint="系统锁屏会立即锁定。查看状态不会延长解锁时间。">
+      {[1, 5, 15, 30, 60, 240].map(minutes => <option key={minutes} value={minutes}>{minutes} 分钟无操作后</option>)}
+    </SelectField>
+    <form className="section" onSubmit={event => { event.preventDefault(); void work(() => verified(async proof => {
+      await request({ type: 'create-pin', pin, proof }); setPin(''); await refresh(); notify('已设置本机 PIN。');
+    })); }}>
+      <h2>本机 PIN <span className="state-tag">{status.pinEnabled ? '已启用' : '未设置'}</span></h2>
+      <p className="hint">只在这台电脑上使用。连续输错 5 次后，需改用主密码。</p>
+      <SecretField label="6–12 位数字" inputMode="numeric" autoComplete="new-password" pattern="[0-9]{6,12}" required minLength={6} maxLength={12} value={pin} onChange={setPin} />
+      <div className="actions"><button className="btn btn-primary" disabled={busy}>{status.pinEnabled ? '更换 PIN' : '设置 PIN'}</button>
+        {status.pinEnabled && <button type="button" className="btn" disabled={busy} onClick={() => void work(async () => {
+          await request({ type: 'remove-pin' }); await refresh(); notify('已移除本机 PIN，可以继续用主密码解锁。');
+        })}>移除 PIN</button>}</div>
+    </form>
+    <section className="section"><h2>系统解锁 <span className="state-tag">{status.prf ? '已启用' : '未设置'}</span></h2>
+      <p className="hint">使用 Windows Hello 或系统认证器。启用时会验证是否支持安全解锁；不支持时可以使用本机 PIN。</p>
+      <button type="button" className="btn" disabled={busy} onClick={() => void work(async () => {
+        if (status.prf) { await request({ type: 'remove-prf' }); await refresh(); notify('系统解锁已移除。'); return; }
+        await verified(async proof => {
+          let credential: Awaited<ReturnType<typeof registerPrf>> | undefined;
+          try { credential = await registerPrf(); await request({ type: 'register-prf', ...credential, proof }); }
+          catch (e) { throw new Error((e instanceof Error ? e.message : '系统解锁不可用。') + ' 可以改用本机 PIN。'); }
+          finally { credential?.output.fill(0); }
+        });
+        await refresh(); notify('系统解锁自检通过，已启用。');
+      })}><Ico of={Fingerprint} />{status.prf ? '移除系统解锁' : '设置系统解锁'}</button>
+    </section>
+  </>;
+}
+
+function ChangePassword({ refresh }: { refresh(): Promise<void> }) {
+  const { busy, work, notify } = useOps();
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [again, setAgain] = useState('');
+  return <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
+    if (next !== again) throw new Error('两次新主密码输入不一致。');
+    await request({ type: 'change-password', currentPassword: current, newPassword: next });
+    setCurrent(''); setNext(''); setAgain(''); await refresh(); notify('主密码已更新，请重新设置 PIN 和系统解锁。');
+  }); }}>
+    <p className="lede">凭证和应急恢复码会保留。更改后，本机 PIN 和系统解锁需要重新设置。</p>
+    <SecretField label="当前主密码" autoComplete="current-password" value={current} onChange={setCurrent} required autoFocus />
+    <SecretField label="新主密码" autoComplete="new-password" minLength={12} maxLength={1024} value={next} onChange={setNext} required />
+    <SecretField label="再次输入新主密码" autoComplete="new-password" minLength={12} maxLength={1024} value={again} onChange={setAgain} required />
+    <button className="btn btn-primary" disabled={busy}>更新主密码</button>
+  </form>;
+}
+
+function Backup({ refresh }: { refresh(): Promise<void> }) {
+  const { busy, work, notify } = useOps();
+  const dialogs = useDialogs();
+  const [mode, setMode] = useState<'export' | 'import'>('export');
+  const [password, setPassword] = useState('');
+  const [again, setAgain] = useState('');
+  const [file, setFile] = useState<File>();
+  const [inputVersion, setInputVersion] = useState(0);
+  return <>
+    <div className="chips" role="group" aria-label="备份操作">
+      <button type="button" className="chip" aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setPassword(''); setAgain(''); }}>导出备份</button>
+      <button type="button" className="chip" aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setPassword(''); setAgain(''); }}>导入备份</button>
+    </div>
+    <p className="lede">{mode === 'export' ? '备份包含整个密码库。用一个独立密码加密，再把文件存到另一台设备或 U 盘。' : '选择之前导出的 .vaultpack 文件。导入会合并凭证，相同编号保留较新版本。'}</p>
+    <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
+      if (mode === 'export' && password !== again) throw new Error('两次备份密码输入不一致。');
+      if (mode === 'import') {
+        if (!file) throw new Error('请先选择备份文件。');
+        if (file.size > 16 * 1024 * 1024) throw new Error('备份不能超过 16 MiB。');
+        if (!await dialogs.confirm({ title: '合并备份中的凭证？', body: '当前条目会保留；相同编号的凭证按较新版本合并。建议先导出当前密码库的备份。', confirmLabel: '验证并导入' })) return;
+      }
+      const proof = await dialogs.proof();
+      try {
+        if (mode === 'export') {
+          const bytes = await request<number[]>({ type: 'export', password, proof });
+          download('Vault-' + new Date().toISOString().slice(0, 10) + '.vaultpack', new Uint8Array(bytes), 'application/octet-stream');
+          notify('已生成加密备份，请确认文件已保存。');
+        } else {
+          const count = await request<number>({ type: 'import', bytes: Array.from(new Uint8Array(await file!.arrayBuffer())), password, proof });
+          setFile(undefined); setInputVersion(value => value + 1); notify('已合并 ' + count + ' 条凭证。');
+        }
+        setPassword(''); setAgain(''); await refresh();
+      } finally { proof.secret = ''; }
+    }); }}>
+      {mode === 'import' && <label className="field">导入加密备份<input key={inputVersion} className="input" type="file" accept=".vaultpack" required onChange={event => setFile(event.target.files?.[0])} /></label>}
+      <SecretField label="备份密码" autoComplete="off" required minLength={mode === 'export' ? 12 : undefined} maxLength={1024} value={password} onChange={setPassword}
+        hint={mode === 'export' ? '至少 12 个字符。请单独记好，恢复备份时会用到。' : '填写导出这个文件时设置的密码。'} />
+      {mode === 'export' && <SecretField label="再次输入备份密码" autoComplete="off" required minLength={12} value={again} onChange={setAgain} />}
+      <button className="btn btn-primary" disabled={busy || (mode === 'import' && !file)}><Ico of={mode === 'export' ? Download : Upload} />{mode === 'export' ? '导出 .vaultpack' : '验证并导入'}</button>
+    </form>
+  </>;
+}
+
+function BrowserSettings() {
+  const { busy, work, fail, notify } = useOps();
+  const [nativeDisabled, setNativeDisabled] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let live = true;
+    void browser.permissions.contains({ permissions: ['privacy'] }).then(async granted => {
+      if (granted) {
+        const setting = await browser.privacy.services.passwordSavingEnabled.get({});
+        if (live) setNativeDisabled(setting.levelOfControl === 'controlled_by_this_extension' && !setting.value);
+      }
+    }).catch(fail).finally(() => { if (live) setLoaded(true); });
+    return () => { live = false; };
+  }, [fail]);
+  return <section className="section">
+    <h2>浏览器的保存密码提示</h2>
+    <p className="lede">如果浏览器自带的保存提示让你困扰，可以在这里关闭。浏览器会先询问权限。</p>
+    <button type="button" className="btn" disabled={busy || !loaded} onClick={() => {
+      void browser.permissions.request({ permissions: ['privacy'] }).then(granted => {
+        if (!granted) { notify('未授权，浏览器设置没有改变。'); return; }
+        return work(async () => {
+          if (nativeDisabled) await browser.privacy.services.passwordSavingEnabled.clear({});
+          else await browser.privacy.services.passwordSavingEnabled.set({ value: false });
+          const setting = await browser.privacy.services.passwordSavingEnabled.get({});
+          setNativeDisabled(setting.levelOfControl === 'controlled_by_this_extension' && !setting.value);
+          notify(nativeDisabled ? '已交还浏览器控制。' : '已关闭浏览器的保存密码提示。');
+        });
+      }).catch(fail);
+    }}><Ico of={ArrowRightLeft} />{nativeDisabled ? '恢复浏览器设置' : '关闭原生保存提示'}</button>
+  </section>;
+}

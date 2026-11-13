@@ -13,7 +13,7 @@ async function run(name) {
   const executablePath = process.env.VAULT_BROWSER_PATH || candidates[name];
   await fs.access(executablePath);
   const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'vault-smoke-' + name + '-'));
-  const context = await chromium.launchPersistentContext(profile, { executablePath, headless: true,
+  const context = await chromium.launchPersistentContext(profile, { executablePath, headless: process.env.VAULT_HEADED !== '1',
     args: ['--disable-extensions-except=' + extension, '--load-extension=' + extension], viewport: { width: 900, height: 850 } });
   const errors = [];
   const result = { browser: name, version: context.browser().version(), extension: path.relative(root, extension) };
@@ -120,6 +120,7 @@ async function run(name) {
       hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true, hasPrf: true,
     } });
     await page.getByRole('button', { name: '设置', exact: true }).click();
+    await page.getByRole('button', { name: /解锁与自动锁定/ }).click();
     await page.getByRole('button', { name: '设置系统解锁', exact: true }).click();
     await page.getByRole('dialog').getByLabel('主密码', { exact: true }).fill(newProof.secret);
     await page.getByRole('dialog').getByRole('button', { name: '验证', exact: true }).click();
@@ -137,6 +138,7 @@ async function run(name) {
       hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true, hasPrf: false,
     } });
     await page.getByRole('button', { name: '设置', exact: true }).click();
+    await page.getByRole('button', { name: /解锁与自动锁定/ }).click();
     await page.getByRole('button', { name: '设置系统解锁', exact: true }).click();
     await page.getByRole('dialog').getByLabel('主密码', { exact: true }).fill(newProof.secret);
     await page.getByRole('dialog').getByRole('button', { name: '验证', exact: true }).click();
