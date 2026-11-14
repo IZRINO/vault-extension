@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
 import { isVaultPage } from './sender-policy';
 import { VaultController } from './vault-controller';
-import type { VaultStatus, VaultItem, ItemSummary } from './vault-messages';
+import type { BackupExport, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
 import type { LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
@@ -107,6 +107,58 @@ describe('real WASM + background session integration', () => {
       expect(new TextDecoder().decode(state.files!.snap)).not.toContain(marker);
       expect(JSON.stringify(state.settings)).not.toContain(marker);
     }
+  });
+  it('clears only the entire trash the user confirmed and refuses a stale confirmation', async () => {
+    const controller = await unlocked();
+    for (const title of ['Match', 'Hidden by search', 'Still active']) {
+      await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record(title)) });
+    }
+    const items = await controller.handle({ type: 'list' }) as ItemSummary[];
+    const id = (title: string) => items.find(item => item.title === title)!.id;
+    const confirmed = [id('Match'), id('Hidden by search')];
+    await controller.handle({ type: 'trash', id: confirmed[0]!, trashed: true });
+    await controller.handle({ type: 'trash', id: confirmed[1]!, trashed: true });
+    await expect(controller.handle({ type: 'empty-trash', expectedIds: [confirmed[0]!] })).rejects.toThrow('重新核对');
+    await controller.handle({ type: 'trash', id: confirmed[1]!, trashed: false });
+    await controller.handle({ type: 'trash', id: id('Still active'), trashed: true });
+    await expect(controller.handle({ type: 'empty-trash', expectedIds: confirmed })).rejects.toThrow('重新核对');
+    expect(await controller.handle({ type: 'list' })).toHaveLength(3);
+    await controller.handle({ type: 'trash', id: id('Still active'), trashed: false });
+    await controller.handle({ type: 'trash', id: confirmed[1]!, trashed: true });
+    expect(await controller.handle({ type: 'empty-trash', expectedIds: confirmed })).toBe(2);
+    expect(await controller.handle({ type: 'list' })).toMatchObject([{ title: 'Still active', trashed: false }]);
+  });
+  it('rejects an oversized save and retains the last readable vault on disk and in memory', async () => {
+    const controller = await unlocked();
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Keep this')) });
+    const stored = structuredClone(state.files);
+    const item = record('Too big');
+    item.note = 'x'.repeat(32 * 1024 * 1024);
+    await expect(controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) })).rejects.toThrow('32 MiB');
+    expect(state.files).toEqual(stored);
+    expect(await controller.handle({ type: 'list' })).toMatchObject([{ title: 'Keep this' }]);
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Next edit')) });
+    await controller.lock();
+    expect(await (await unlocked()).handle({ type: 'list' })).toHaveLength(2);
+  });
+  it('retains the backup reminder until confirmed and never clears edits made after exporting', async () => {
+    const controller = await unlocked();
+    const exportBackup = async () => await controller.handle({ type: 'export', password: 'Test-Backup-Password#2026', proof }) as BackupExport;
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('First')) });
+    const first = await exportBackup();
+    expect(first.bytes.length).toBeGreaterThan(0);
+    expect(state.files!.changesSinceBackup).toBe(1);
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Second')) });
+    const second = await exportBackup();
+    expect(state.files!.changesSinceBackup).toBe(2);
+    const recreated = new VaultController();
+    await recreated.handle({ type: 'backup-saved', receipt: first.receipt });
+    expect(state.files!.changesSinceBackup).toBe(1);
+    await recreated.handle({ type: 'backup-saved', receipt: second.receipt });
+    await recreated.handle({ type: 'upsert', itemJson: JSON.stringify(record('Third')) });
+    await recreated.handle({ type: 'backup-saved', receipt: first.receipt });
+    await recreated.handle({ type: 'backup-saved', receipt: second.receipt });
+    expect(state.files!.changesSinceBackup).toBe(1);
   });
   it('recovery rotates only the header and invalidates shortcuts', async () => {
     const controller = await unlocked();

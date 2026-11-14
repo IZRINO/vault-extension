@@ -12,6 +12,8 @@ pub enum VaultError {
     RepromptRequired,
     RngFailure,
     CodecError(String),
+    CompactObjectTooLarge,
+    VaultpackTooLarge,
 }
 
 impl VaultError {
@@ -27,6 +29,8 @@ impl VaultError {
             Self::RepromptRequired => "REPROMPT_REQUIRED",
             Self::RngFailure => "RNG_FAILURE",
             Self::CodecError(_) => "CODEC_ERROR",
+            Self::CompactObjectTooLarge => "COMPACT_OBJECT_TOO_LARGE",
+            Self::VaultpackTooLarge => "VAULTPACK_TOO_LARGE",
         }
     }
 
@@ -42,6 +46,8 @@ impl VaultError {
             Self::ItemNotFound(id) => id.as_str(),
             Self::RepromptRequired => "secondary verification required for high-sensitivity item",
             Self::RngFailure => "CSPRNG entropy source unavailable",
+            Self::CompactObjectTooLarge => "密码库超过 32 MiB 容量上限。本次没有保存，请减少内容后重试。",
+            Self::VaultpackTooLarge => "备份文件不能超过 16 MiB。",
         };
         let code = self.code();
         let mut out = String::with_capacity(code.len() + 2 + detail.len());

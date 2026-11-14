@@ -18,6 +18,16 @@ use crate::model::{
 
 pub const HEAD_MAGIC: [u8; 4] = *b"VLTH";
 pub const VAULTPACK_MAGIC: [u8; 4] = *b"VLTP";
+const MAX_MSGPACK_BYTES: usize = 32 * 1024 * 1024;
+const MAX_VAULTPACK_BYTES: usize = 16 * 1024 * 1024;
+const VAULTPACK_HEADER_BYTES: usize = 62;
+
+fn check_vaultpack_size(bytes: usize) -> Result<(), VaultError> {
+    if bytes > MAX_VAULTPACK_BYTES {
+        return Err(VaultError::VaultpackTooLarge);
+    }
+    Ok(())
+}
 
 // ============================================================================
 // Compact Direct-Slice RFC MessagePack Wire Codec (zero `rmp` / `io::Cursor` bloat)
@@ -1210,7 +1220,7 @@ pub fn encode_msgpack_zstd_padded<T: MsgPackWire>(value: &T) -> Result<SecretByt
 /// Decodes `256-byte bucket padded` -> `Zstandard` -> `MessagePack`.
 pub fn decode_msgpack_zstd_padded<T: MsgPackWire>(padded: &[u8]) -> Result<T, VaultError> {
     let compressed = crate::crypto::unpad_from_256_bucket(padded)?;
-    let mut raw = zstd_decompress_bounded(compressed.as_slice(), 32 * 1024 * 1024)?;
+    let mut raw = zstd_decompress_bounded(compressed.as_slice(), MAX_MSGPACK_BYTES)?;
     let mut reader = MpReader::new(raw.as_slice());
     let decoded = T::decode_msgpack(&mut reader);
     raw.zeroize();
@@ -1225,8 +1235,11 @@ pub fn seal_compact_object<T: MsgPackWire>(
     hlc_epoch: u64,
     value: &T,
 ) -> Result<Vec<u8>, VaultError> {
-    let mut msgpack = Vec::new();
+    let mut msgpack = Zeroizing::new(Vec::new());
     value.encode_msgpack(&mut msgpack);
+    if msgpack.len() > MAX_MSGPACK_BYTES {
+        return Err(VaultError::CompactObjectTooLarge);
+    }
     let mut compressed = Zeroizing::new(zstd_compress(msgpack.as_slice()));
     msgpack.zeroize();
     let env = SealedEnvelope::seal_bucketed(key, role, object_id, hlc_epoch, &compressed)?;
@@ -1242,7 +1255,7 @@ pub fn open_compact_object<T: MsgPackWire>(
 ) -> Result<T, VaultError> {
     let env = SealedEnvelope::from_bytes(envelope_bytes)?;
     let compressed = env.open_bucketed(key, expected_role, expected_object_id)?;
-    let mut decompressed = zstd_decompress_bounded(compressed.as_slice(), 32 * 1024 * 1024)?;
+    let mut decompressed = zstd_decompress_bounded(compressed.as_slice(), MAX_MSGPACK_BYTES)?;
     let mut reader = MpReader::new(decompressed.as_slice());
     let res = T::decode_msgpack(&mut reader);
     decompressed.zeroize();
@@ -1277,7 +1290,7 @@ pub fn open_snapshot(
 ) -> Result<VaultSnapshot, VaultError> {
     let env = SealedEnvelope::from_bytes(snap_bytes)?;
     let compressed = env.open_bucketed(keys.snap_key(), FileRole::Snap, expected_snapshot_id)?;
-    let mut raw = Zeroizing::new(zstd_decompress_bounded(compressed.as_slice(), 32 * 1024 * 1024)?);
+    let mut raw = Zeroizing::new(zstd_decompress_bounded(compressed.as_slice(), MAX_MSGPACK_BYTES)?);
     // Authenticate the bytes actually stored. Re-encoding would invalidate older compact encodings.
     if raw.len() < 34 || raw[raw.len() - 34..raw.len() - 32] != [0xc4, 32] {
         return Err(mp_read_err());
@@ -1309,7 +1322,9 @@ pub fn export_vaultpack(
         now_ms,
         snapshot,
     )?;
-    let mut out = Vec::with_capacity(62 + env_bytes.len());
+    let file_len = VAULTPACK_HEADER_BYTES + env_bytes.len();
+    check_vaultpack_size(file_len)?;
+    let mut out = Vec::with_capacity(file_len);
     out.extend_from_slice(&VAULTPACK_MAGIC);
     out.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
     out.extend_from_slice(&now_ms.to_le_bytes());
@@ -1323,6 +1338,7 @@ pub fn export_vaultpack(
 }
 
 pub fn import_vaultpack(raw: &[u8], backup_password: &[u8]) -> Result<VaultSnapshot, VaultError> {
+    check_vaultpack_size(raw.len())?;
     let mut pos = 0usize;
     let magic = read_exact_arr::<4>(raw, &mut pos)?;
     if magic != VAULTPACK_MAGIC {
@@ -1358,4 +1374,18 @@ pub fn import_vaultpack(raw: &[u8], backup_password: &[u8]) -> Result<VaultSnaps
         Some("vaultpack:v1"),
         env_bytes,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vaultpack_file_limit_includes_the_header_and_rejects_oversize_before_decoding() {
+        let largest_envelope = MAX_VAULTPACK_BYTES - VAULTPACK_HEADER_BYTES;
+        assert!(check_vaultpack_size(VAULTPACK_HEADER_BYTES + largest_envelope).is_ok());
+        assert_eq!(check_vaultpack_size(VAULTPACK_HEADER_BYTES + largest_envelope + 1), Err(VaultError::VaultpackTooLarge));
+        let oversized = vec![0; MAX_VAULTPACK_BYTES + 1];
+        assert!(matches!(import_vaultpack(&oversized, b"unused"), Err(VaultError::VaultpackTooLarge)));
+    }
 }

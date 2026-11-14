@@ -7,6 +7,8 @@ interface VaultDbSchema extends DBSchema {
 export interface VaultFiles {
   head: Uint8Array; snap: Uint8Array; vaultId: string; keyEpoch: number;
   updatedAtMs: number; changesSinceBackup: number;
+  /** Absolute change count covered by the latest confirmed backup; absent on older vaults. */
+  backedUpChangeCount?: number;
 }
 export interface SessionState {
   key: Uint8Array; wrap: Uint8Array; unlockedAtMs: number; lastActivityMs: number;

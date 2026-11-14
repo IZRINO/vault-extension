@@ -95,7 +95,7 @@ async function run(name) {
     await send({ type: 'upsert', itemJson: JSON.stringify(item) });
     await assert.rejects(send({ type: 'get', id: item.id, repromptVerified: true }));
     assert.equal((await send({ type: 'get', id: item.id, proof })).title, item.title);
-    const backup = await send({ type: 'export', password: 'Backup-Password-2026!', proof });
+    const { bytes: backup } = await send({ type: 'export', password: 'Backup-Password-2026!', proof });
     assert(!Buffer.from(backup).toString().includes('Never-Persist-Plaintext#9981'));
     await send({ type: 'trash', id: item.id, trashed: true });
     await send({ type: 'delete', id: item.id });

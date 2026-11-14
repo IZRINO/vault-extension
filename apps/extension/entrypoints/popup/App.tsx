@@ -163,7 +163,12 @@ function Unlocked({ status, refresh }: { status: VaultStatus; refresh(): Promise
           </div></details>
         </article>)}</div>
         {visible.length === 0 && <div className="empty"><span className="empty-mark">＋</span><h2>{query ? '没有匹配的凭证' : filter === 'trash' ? '回收站为空' : '留好每一把钥匙。'}</h2><p>{query ? '换一个名称、账号或标签试试。' : filter === 'trash' ? '移除的凭证会先保存在这里。' : '从一个登录项开始，把重要信息放在一起。'}</p>{!query && filter !== 'trash' && <button onClick={() => setEditor(newItem())}>添加登录项</button>}</div>}
-        {filter === 'trash' && visible.length > 0 && <button className="danger" disabled={busy} onClick={() => { if (confirm('永久清空整个回收站？此操作无法撤销。')) void work(async () => { await request({ type: 'empty-trash' }); await reload(); }); }}>清空回收站</button>}
+        {filter === 'trash' && visible.length > 0 && <button className="danger" disabled={busy} onClick={() => {
+          const expectedIds = items.filter(item => item.trashed).map(item => item.id);
+          if (confirm(`永久删除回收站里全部 ${expectedIds.length} 条凭证（包括搜索未显示的条目）？此操作无法撤销。`)) {
+            void work(async () => { await request({ type: 'empty-trash', expectedIds }); await reload(); });
+          }
+        }}>清空回收站</button>}
       </>)}
       {tab === 'settings' && <Settings status={status} proof={proof} refresh={reload} work={work} busy={busy} notice={setNotice} />}
       {tab === 'generator' && <Generator copy={copy} work={work} busy={busy} />}

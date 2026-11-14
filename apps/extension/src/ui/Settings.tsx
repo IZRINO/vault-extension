@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRightLeft, ChevronRight, Download, Fingerprint, Globe, HardDrive, KeyRound, Lock, Upload } from 'lucide-react';
-import { request, type Proof, type VaultStatus } from '../vault-messages';
+import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultStatus } from '../vault-messages';
 import { registerPrf } from '../webauthn';
 import { Ico, SecretField, SelectField } from './components';
 import { useDialogs } from './dialogs';
@@ -98,25 +98,29 @@ function Backup({ refresh }: { refresh(): Promise<void> }) {
   const [again, setAgain] = useState('');
   const [file, setFile] = useState<File>();
   const [inputVersion, setInputVersion] = useState(0);
+  const [pendingBackup, setPendingBackup] = useState<BackupReceipt>();
+  const receipt = mode === 'export' ? pendingBackup : undefined;
+  const confirmHeading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => { if (receipt) confirmHeading.current?.focus(); }, [receipt]);
   return <>
     <div className="chips" role="group" aria-label="备份操作">
-      <button type="button" className="chip" aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setPassword(''); setAgain(''); }}>导出备份</button>
-      <button type="button" className="chip" aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setPassword(''); setAgain(''); }}>导入备份</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setPassword(''); setAgain(''); }}>导出备份</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setPassword(''); setAgain(''); }}>导入备份</button>
     </div>
     <p className="lede">{mode === 'export' ? '备份包含整个密码库。用一个独立密码加密，再把文件存到另一台设备或 U 盘。' : '选择之前导出的 .vaultpack 文件。导入会合并凭证，相同编号保留较新版本。'}</p>
-    <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
+    {!receipt && <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
       if (mode === 'export' && password !== again) throw new Error('两次备份密码输入不一致。');
       if (mode === 'import') {
         if (!file) throw new Error('请先选择备份文件。');
-        if (file.size > 16 * 1024 * 1024) throw new Error('备份不能超过 16 MiB。');
+        if (file.size > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
         if (!await dialogs.confirm({ title: '合并备份中的凭证？', body: '当前条目会保留；相同编号的凭证按较新版本合并。建议先导出当前密码库的备份。', confirmLabel: '验证并导入' })) return;
       }
       const proof = await dialogs.proof();
       try {
         if (mode === 'export') {
-          const bytes = await request<number[]>({ type: 'export', password, proof });
+          const { bytes, receipt } = await request<BackupExport>({ type: 'export', password, proof });
           download('Vault-' + new Date().toISOString().slice(0, 10) + '.vaultpack', new Uint8Array(bytes), 'application/octet-stream');
-          notify('已生成加密备份，请确认文件已保存。');
+          setPendingBackup(receipt);
         } else {
           const count = await request<number>({ type: 'import', bytes: Array.from(new Uint8Array(await file!.arrayBuffer())), password, proof });
           setFile(undefined); setInputVersion(value => value + 1); notify('已合并 ' + count + ' 条凭证。');
@@ -129,7 +133,18 @@ function Backup({ refresh }: { refresh(): Promise<void> }) {
         hint={mode === 'export' ? '至少 12 个字符。请单独记好，恢复备份时会用到。' : '填写导出这个文件时设置的密码。'} />
       {mode === 'export' && <SecretField label="再次输入备份密码" autoComplete="off" required minLength={12} value={again} onChange={setAgain} />}
       <button className="btn btn-primary" disabled={busy || (mode === 'import' && !file)}><Ico of={mode === 'export' ? Download : Upload} />{mode === 'export' ? '导出 .vaultpack' : '验证并导入'}</button>
-    </form>
+    </form>}
+    {receipt && <section className="section">
+      <h2 ref={confirmHeading} tabIndex={-1}>确认备份已保存</h2>
+      <p className="hint">请检查浏览器的下载记录，确认 .vaultpack 文件已经保存。如果取消了下载，备份提醒会保留。</p>
+      <div className="actions">
+        <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void work(async () => {
+          await request({ type: 'backup-saved', receipt });
+          setPendingBackup(undefined); await refresh(); notify('已记录这次备份。');
+        })}>文件已保存</button>
+        <button type="button" className="btn" disabled={busy} onClick={() => setPendingBackup(undefined)}>未保存</button>
+      </div>
+    </section>}
   </>;
 }
 

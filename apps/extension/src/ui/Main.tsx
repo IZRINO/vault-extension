@@ -150,10 +150,13 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
       if (mounted.current) setNotice('已永久删除。');
     });
   };
-  const emptyTrash = async (count: number) => {
-    if (!await dialogs.confirm({ title: '清空回收站？', body: '回收站里的 ' + count + ' 条凭证会被永久删除，无法恢复。', confirmLabel: '清空回收站', danger: true })) return;
+  const emptyTrash = async (expectedIds: string[]) => {
+    const body = `将永久删除回收站里的全部 ${expectedIds.length} 条凭证，无法恢复。` +
+      (query.trim() ? '也会删除未出现在当前搜索结果里的条目。' : '');
+    if (!await dialogs.confirm({ title: '清空整个回收站？', body, confirmLabel: '清空回收站', danger: true })) return;
     await work(async () => {
-      await request({ type: 'empty-trash' });
+      try { await request({ type: 'empty-trash', expectedIds }); }
+      catch (error) { await reload().catch(() => undefined); throw error; }
       await reload();
       if (mounted.current) setNotice('回收站已清空。');
     });
@@ -194,7 +197,7 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
           {tab === 'vault' && screen.name === 'list' && <VaultList items={items} query={query} filter={filter} changesSinceBackup={status.changesSinceBackup}
             setFilter={setFilter} clearQuery={() => setQuery('')} open={summary => void open(summary)} quickCopy={quickCopy}
             create={() => create('login')} restore={item => void setTrashed(item, false)} remove={item => void remove(item)}
-            emptyTrash={count => void emptyTrash(count)} backup={() => void go('settings', 'backup')} />}
+            emptyTrash={ids => void emptyTrash(ids)} backup={() => void go('settings', 'backup')} />}
           {tab === 'vault' && screen.name === 'detail' && <ItemDetail key={screen.item.id} item={screen.item}
             back={() => setScreen({ name: 'list' })} edit={() => setScreen({ name: 'edit', item: screen.item, back: screen.item })}
             setTrashed={trashed => void setTrashed(screen.item, trashed)} remove={() => void remove(screen.item)} />}

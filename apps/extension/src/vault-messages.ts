@@ -1,6 +1,14 @@
 export type Proof = { method: 'master' | 'pin'; secret: string };
+export const MAX_VAULTPACK_BYTES = 16 * 1024 * 1024;
+export interface BackupReceipt { vaultId: string; changeCount: number }
+export interface BackupExport { bytes: number[]; receipt: BackupReceipt }
+export function capacityErrorText(error: unknown): string | undefined {
+  if (typeof error !== 'string') return;
+  const prefix = ['COMPACT_OBJECT_TOO_LARGE: ', 'VAULTPACK_TOO_LARGE: '].find(value => error.startsWith(value));
+  return prefix ? error.slice(prefix.length) : undefined;
+}
 export type VaultMessage =
-  | { type: 'status' | 'lock' | 'list' | 'audit' | 'empty-trash' | 'remove-pin' | 'remove-prf' }
+  | { type: 'status' | 'lock' | 'list' | 'audit' | 'remove-pin' | 'remove-prf' }
   | { type: 'create'; masterPassword: string; calibrate?: boolean }
   | { type: 'unlock'; password: string }
   | { type: 'unlock-pin'; pin: string }
@@ -10,12 +18,14 @@ export type VaultMessage =
   | { type: 'upsert'; itemJson: string; proof?: Proof }
   | { type: 'trash'; id: string; trashed: boolean }
   | { type: 'delete'; id: string }
+  | { type: 'empty-trash'; expectedIds: string[] }
   | { type: 'create-pin'; pin: string; proof: Proof }
   | { type: 'set-autolock'; minutes: number }
   | { type: 'generate-password' | 'generate-passphrase'; optionsJson: string }
   | { type: 'strength'; password: string; hints: string[] }
   | { type: 'copy-sensitive'; value: string }
   | { type: 'export'; password: string; proof: Proof }
+  | { type: 'backup-saved'; receipt: BackupReceipt }
   | { type: 'import'; bytes: number[]; password: string; proof: Proof }
   | { type: 'register-prf'; credentialId: number[]; salt: number[]; output: number[]; proof: Proof }
   | { type: 'unlock-prf'; output: number[] }

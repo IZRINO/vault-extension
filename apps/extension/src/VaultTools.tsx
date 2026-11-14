@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { request, type Proof, type VaultStatus } from './vault-messages';
+import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultStatus } from './vault-messages';
 import { registerPrf } from './webauthn';
 
 export function download(name: string, data: BlobPart, type: string) {
@@ -14,6 +14,7 @@ export function Settings({ status, proof, refresh, work, busy, notice }: ToolsPr
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [backupPassword, setBackupPassword] = useState('');
+  const [pendingBackup, setPendingBackup] = useState<BackupReceipt>();
   const [file, setFile] = useState<File>();
   const [nativeDisabled, setNativeDisabled] = useState(false);
   useEffect(() => {
@@ -53,15 +54,19 @@ export function Settings({ status, proof, refresh, work, busy, notice }: ToolsPr
     <div className="settings-section"><h3>加密备份</h3><p className="hint">备份包含整个密码库。用独立密码加密后保存到其他设备。</p>
       <label>备份密码<input type="password" autoComplete="off" minLength={12} value={backupPassword} onChange={e => setBackupPassword(e.target.value)} /></label>
       <button disabled={busy || backupPassword.length < 12} onClick={() => void work(async () => {
-        const bytes = await request<number[]>({ type: 'export', password: backupPassword, proof: await proof() });
+        const { bytes, receipt } = await request<BackupExport>({ type: 'export', password: backupPassword, proof: await proof() });
         download('Vault-' + new Date().toISOString().slice(0, 10) + '.vaultpack', new Uint8Array(bytes), 'application/octet-stream');
-        setBackupPassword(''); await refresh(); notice('已生成加密备份，请确认下载文件已保存。');
+        setBackupPassword(''); setPendingBackup(receipt); notice('请确认备份文件已保存。');
       })}>导出 .vaultpack</button>
+      {pendingBackup && <button disabled={busy} onClick={() => void work(async () => {
+        await request({ type: 'backup-saved', receipt: pendingBackup });
+        setPendingBackup(undefined); await refresh(); notice('已记录这次备份。');
+      })}>文件已保存</button>}
       <label>导入加密备份<input type="file" accept=".vaultpack" onChange={e => setFile(e.target.files?.[0])} /></label>
       <p className="hint">导入将合并条目；相同编号以较新版本为准。</p>
       <button disabled={busy || !file || !backupPassword} onClick={() => void work(async () => {
         if (!file) return;
-        if (file.size > 16 * 1024 * 1024) throw new Error('备份不能超过 16 MiB。');
+        if (file.size > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
         if (!confirm('导入将合并备份中的凭证，是否继续？')) return;
         const count = await request<number>({ type: 'import', bytes: Array.from(new Uint8Array(await file.arrayBuffer())), password: backupPassword, proof: await proof() });
         setBackupPassword(''); setFile(undefined); await refresh(); notice('已合并 ' + count + ' 条凭证。');

@@ -1,7 +1,7 @@
 import { loadVaultCore, randomBytes } from './vault-core';
 import { derive, offscreen } from './bridge';
 import * as store from './vault-storage';
-import type { ItemSummary, Proof, VaultItem, VaultMessage, VaultStatus } from './vault-messages';
+import { capacityErrorText, MAX_VAULTPACK_BYTES, type BackupExport, type ItemSummary, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
 
 export const LOCK_ALARM = 'vault-lock';
 export const CLIPBOARD_ALARM = 'vault-clipboard';
@@ -9,6 +9,7 @@ type Core = Awaited<ReturnType<typeof loadVaultCore>>;
 type Engine = InstanceType<Core['WasmVaultEngine']>;
 type Created = { head: number[]; snap: number[]; wrap: number[]; vaultId: string; keyEpoch: number; recoveryCode: string };
 type Rotation = { head: number[]; wrap: number[]; keyEpoch: number };
+type Mutation = { head_bytes: Uint8Array; snap_bytes: Uint8Array; count: number; free(): void };
 
 export class VaultController {
   private core?: Core;
@@ -134,17 +135,28 @@ export class VaultController {
     if (summary.requireReprompt) await this.verify(proof, check);
   }
 
-  private async saveMutation(result: { head_bytes: Uint8Array; snap_bytes: Uint8Array; count: number; free(): void }, check: () => void) {
+  private async saveMutation(mutate: () => Mutation, check: () => void) {
+    let result: Mutation | undefined;
     try {
       check();
+      result = mutate();
       const files = { ...this.files!, head: result.head_bytes, snap: result.snap_bytes, updatedAtMs: Date.now(),
         changesSinceBackup: (this.files!.changesSinceBackup ?? 0) + result.count };
       await store.saveVaultFiles(files);
       this.files = files;
       check();
       return result.count;
-    } catch (error) { await this.lock(); throw error; }
-    finally { result.free(); }
+    } catch (error) {
+      // A rejected WASM mutation may have changed in-memory items before encoding failed.
+      // Restore the committed snapshot before serving any further reads or writes.
+      if (this.session) {
+        try { this.engine!.restore_from_session(this.session.key, this.session.wrap, this.files!.head, this.files!.snap); }
+        catch { await this.lock(); }
+      }
+      const text = capacityErrorText(error);
+      if (text) throw new Error(text);
+      throw error;
+    } finally { result?.free(); }
   }
 
   private async dispatch(message: VaultMessage, check: () => void): Promise<unknown> {
@@ -216,15 +228,22 @@ export class VaultController {
           const existing = JSON.parse(engine.get_item_json(item.id, true)) as VaultItem;
           if (existing.revision !== item.revision) throw new Error('条目已在其他窗口更新，请重新打开后编辑。');
         }
-        return this.saveMutation(engine.upsert_item_json(message.itemJson, Date.now(), '本机'), check);
+        return this.saveMutation(() => engine.upsert_item_json(message.itemJson, Date.now(), '本机'), check);
       }
-      case 'trash': return this.saveMutation(engine.set_trashed(message.id, message.trashed, Date.now()), check);
+      case 'trash': return this.saveMutation(() => engine.set_trashed(message.id, message.trashed, Date.now()), check);
       case 'delete': {
         const item = (JSON.parse(engine.list_summaries_json()) as ItemSummary[]).find(i => i.id === message.id);
         if (!item?.trashed) throw new Error('请先将条目移入回收站。');
-        return this.saveMutation(engine.delete_permanently(message.id, Date.now()), check);
+        return this.saveMutation(() => engine.delete_permanently(message.id, Date.now()), check);
       }
-      case 'empty-trash': return this.saveMutation(engine.empty_trash(Date.now()), check);
+      case 'empty-trash': {
+        const expected = new Set(message.expectedIds);
+        const trashed = (JSON.parse(engine.list_summaries_json()) as ItemSummary[]).filter(item => item.trashed);
+        if (!trashed.length || expected.size !== trashed.length || !trashed.every(item => expected.has(item.id))) {
+          throw new Error('回收站内容已变化，请重新核对后再清空。');
+        }
+        return this.saveMutation(() => engine.empty_trash(Date.now()), check);
+      }
       case 'audit': return JSON.parse(engine.run_security_audit_json());
       case 'generate-password': return core.wasm_generate_password(message.optionsJson);
       case 'generate-passphrase': return core.wasm_generate_passphrase(message.optionsJson);
@@ -261,13 +280,25 @@ export class VaultController {
         this.validatePassword(message.password);
         const bytes = await derive<number[]>('wasm_export_vaultpack', [session.key, session.wrap, this.files.head, this.files.snap, message.password, Date.now()]);
         check();
-        this.files = { ...this.files, changesSinceBackup: 0 };
-        await store.saveVaultFiles(this.files);
-        return bytes;
+        return { bytes, receipt: { vaultId: this.files.vaultId, changeCount: (this.files.backedUpChangeCount ?? 0) + this.files.changesSinceBackup } } satisfies BackupExport;
+      }
+      case 'backup-saved': {
+        const { vaultId, changeCount } = message.receipt;
+        const backedUp = this.files.backedUpChangeCount ?? 0;
+        const total = backedUp + this.files.changesSinceBackup;
+        if (vaultId !== this.files.vaultId || !Number.isSafeInteger(changeCount) || changeCount < 0 || changeCount > total) {
+          throw new Error('无法确认这份备份，请重新导出。');
+        }
+        if (changeCount > backedUp) {
+          const files = { ...this.files, backedUpChangeCount: changeCount, changesSinceBackup: total - changeCount };
+          await store.saveVaultFiles(files);
+          this.files = files;
+        }
+        return null;
       }
       case 'import': {
         await this.verify(message.proof, check);
-        if (!Array.isArray(message.bytes) || message.bytes.length > 16 * 1024 * 1024) throw new Error('备份不能超过 16 MiB。');
+        if (!Array.isArray(message.bytes) || message.bytes.length > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
         const output = await derive<{ head: number[]; snap: number[]; count: number }>('wasm_import_vaultpack_into_vault',
           [session.key, session.wrap, this.files.head, this.files.snap, new Uint8Array(message.bytes), message.password, Date.now()]);
         check();

@@ -28,12 +28,13 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
   items: ItemSummary[] | undefined; query: string; filter: string; changesSinceBackup: number;
   setFilter(filter: string): void; clearQuery(): void; open(item: ItemSummary): void;
   quickCopy(item: ItemSummary, key: string, label: string): Promise<boolean>;
-  create(): void; restore(item: ItemSummary): void; remove(item: ItemSummary): void; emptyTrash(count: number): void; backup(): void;
+  create(): void; restore(item: ItemSummary): void; remove(item: ItemSummary): void; emptyTrash(expectedIds: string[]): void; backup(): void;
 }) {
   const { busy } = useOps();
   const visible = items ? filterItems(items, filter, query) : [];
   const searching = query.trim() !== '';
   const filterName = filters.find(entry => entry.id === filter)?.label;
+  const trash = filter === 'trash' ? (items ?? []).filter(item => item.trashed) : [];
   return <div className="view">
     <div className="toolbar">
       <div className="chips" role="group" aria-label="分类筛选">
@@ -46,9 +47,9 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
       <span className="grow">已经有 {changesSinceBackup} 处改动还没备份。存一份加密备份，电脑出问题时也能找回来。</span>
       <button type="button" className="btn btn-s" onClick={backup}>去备份</button>
     </div>}
-    {filter === 'trash' && visible.length > 0 && <div className="trash-bar">
-      <p className="hint">回收站里有 {visible.length} 条凭证，可以恢复，也可以永久删除。</p>
-      <button type="button" className="btn btn-s btn-danger" disabled={busy} onClick={() => emptyTrash(visible.length)}>清空回收站</button>
+    {trash.length > 0 && <div className="trash-bar">
+      <p className="hint">回收站共 {trash.length} 条凭证。{searching ? `当前搜索显示 ${visible.length} 条。` : '可以恢复，也可以永久删除。'}</p>
+      <button type="button" className="btn btn-s btn-danger" disabled={busy} onClick={() => emptyTrash(trash.map(item => item.id))}>清空回收站</button>
     </div>}
     {visible.length > 0 && <ul className="rows">
       {visible.map(item => <li className="row" key={item.id}>

@@ -1,4 +1,5 @@
 import { loadVaultCore } from '../src/vault-core';
+import { capacityErrorText } from '../src/vault-messages';
 
 export default defineUnlistedScript(() => {
   self.onmessage = async ({ data }: MessageEvent<{ operation: string; args: unknown[] }>) => {
@@ -20,8 +21,8 @@ export default defineUnlistedScript(() => {
         result.free();
       } else if (result instanceof Uint8Array) value = Array.from(result);
       self.postMessage({ ok: true, value });
-    } catch {
-      self.postMessage({ ok: false, error: '验证失败或数据损坏，请检查输入。' });
+    } catch (error) {
+      self.postMessage({ ok: false, error: capacityErrorText(error) ?? '验证失败或数据损坏，请检查输入。' });
     } finally {
       for (const arg of data.args) if (arg instanceof Uint8Array) arg.fill(0);
       data.args.length = 0;

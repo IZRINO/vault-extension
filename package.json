@@ -8,7 +8,8 @@
     "build": "pnpm run build:wasm && pnpm --filter ./apps/extension build",
     "test:rust": "cargo test --workspace",
     "test:extension": "vitest run",
-    "test:smoke": "node scripts/smoke-extension.cjs"
+    "test:smoke": "node scripts/smoke-extension.cjs",
+    "test:data-safety": "node scripts/test-data-safety.cjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.65.0",
