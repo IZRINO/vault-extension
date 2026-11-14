@@ -34,18 +34,21 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
   const run = async (): Promise<unknown> => {
     if (message.operation === 'derive') {
       return new Promise((resolve, reject) => {
-        // Workers must use the extension origin, including during WXT development.
-        const worker = new Worker(browser.runtime.getURL('/kdf-worker.js'));
-        const timer = setTimeout(() => { worker.terminate(); reject(new Error('密钥派生超时')); }, 120000);
+        // Keep optional WASM out of the unlock path, including when WXT inlines worker assets.
+        const operation = message.payload.operation;
+        const entry = operation === 'parse-browser-csv' ? '/csv-worker.js'
+          : operation === 'validate-totp' ? '/otp-worker.js' : '/kdf-worker.js';
+        const worker = new Worker(browser.runtime.getURL(entry));
+        const timer = setTimeout(() => { worker.terminate(); reject(new Error('后台任务超时，请重试。')); }, 120000);
         const finish = () => { clearTimeout(timer); worker.terminate(); };
         worker.onmessage = ({ data }: MessageEvent<Reply>) => {
           finish();
           if (data.ok) resolve(data.value); else reject(new Error(data.error));
         };
-        worker.onerror = () => { finish(); reject(new Error('密钥线程启动失败')); };
+        worker.onerror = () => { finish(); reject(new Error('后台线程启动失败，请重试。')); };
         const args = message.payload.args.map((v: unknown) =>
           v && typeof v === 'object' && 'bytes' in v ? new Uint8Array((v as { bytes: number[] }).bytes) : v);
-        worker.postMessage({ operation: message.payload.operation, args });
+        worker.postMessage({ operation, args });
         for (const arg of args) if (arg instanceof Uint8Array) arg.fill(0);
       });
     }

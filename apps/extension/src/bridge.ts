@@ -6,7 +6,7 @@ export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
   const run = tail.then(async () => {
     if (!await browser.offscreen.hasDocument()) {
       await browser.offscreen.createDocument({ url: 'offscreen.html', reasons: ['WORKERS', 'CLIPBOARD'],
-        justification: 'Run password derivation in an isolated worker and clear copied secrets.' });
+        justification: 'Run local vault tasks in isolated workers and clear copied secrets.' });
     }
     try {
       const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault-offscreen', operation, payload });

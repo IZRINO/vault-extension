@@ -50,6 +50,15 @@ export default function ItemEditor({ initial, save, close, onDirty }: {
         </div>)}
         <button type="button" className="btn" onClick={() => update('uris', [...uris, { uri: '' }])}><Ico of={Plus} />添加网站</button>
       </fieldset>
+      <details className="fold">
+        <summary>两步验证码（可选）<Ico of={ChevronRight} /></summary>
+        <div className="fold-body">
+          <SecretField label="验证码设置密钥" value={text(item.data.totpUri)} maxLength={4096} autoComplete="off" spellCheck={false}
+            hint="从网站的两步验证设置页粘贴密钥（Base32）或 otpauth://totp 链接，不是当前的 6 位验证码。清空可移除设置。"
+            onChange={value => update('totpUri', value || null)} />
+          <p className="hint">请保留网站提供的恢复码。把密码和验证码放在同一个库里时，别人解锁密码库就能同时取到两者。</p>
+        </div>
+      </details>
     </>}
     {item.data.kind === 'developer' && <TextField label="到期日期" type="date"
       value={item.data.expiresAtMs ? new Date(Number(item.data.expiresAtMs)).toISOString().slice(0, 10) : ''}

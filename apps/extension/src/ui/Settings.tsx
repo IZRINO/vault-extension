@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRightLeft, ChevronRight, Download, Fingerprint, Globe, HardDrive, KeyRound, Lock, Upload } from 'lucide-react';
+import { ArrowLeft, ArrowRightLeft, ChevronRight, Download, FileUp, Fingerprint, Globe, HardDrive, KeyRound, Lock, Upload } from 'lucide-react';
 import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultStatus } from '../vault-messages';
 import { registerPrf } from '../webauthn';
 import { Ico, SecretField, SelectField } from './components';
 import { useDialogs } from './dialogs';
 import { download } from './lib';
 import { useOps } from './Main';
+import BrowserCsv from './BrowserCsv';
 
-export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'browser';
-const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', browser: '浏览器设置' };
+export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'browser';
+const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', browser: '浏览器设置' };
 export default function Settings({ status, page, setPage, refresh }: {
   status: VaultStatus; page: SettingsPage; setPage(page: SettingsPage): void; refresh(): Promise<void>;
 }) {
@@ -19,6 +20,7 @@ export default function Settings({ status, page, setPage, refresh }: {
           ['security', Lock, '解锁与自动锁定', `主密码${status.pinEnabled ? '、PIN' : ''}${status.prf ? '、系统解锁' : ''} · ${status.autoLockMinutes} 分钟后锁定`],
           ['password', KeyRound, '更改主密码', '用当前主密码设置一个新的主密码'],
           ['backup', HardDrive, '备份与恢复', '保存加密备份，或从备份恢复凭证'],
+          ['csv', FileUp, '导入浏览器密码', '预览浏览器导出的 CSV，不覆盖已有凭证'],
           ['browser', Globe, '浏览器设置', '管理浏览器原生的保存密码提示'],
         ] as const).map(([id, icon, label, hint]) => <button type="button" className="nav-row" key={id} onClick={() => setPage(id)}>
           <Ico of={icon} /><span className="grow"><strong>{label}</strong><small>{hint}</small></span><Ico of={ChevronRight} /></button>)}
@@ -27,6 +29,7 @@ export default function Settings({ status, page, setPage, refresh }: {
     {page === 'security' && <Security status={status} refresh={refresh} />}
     {page === 'password' && <ChangePassword refresh={refresh} />}
     {page === 'backup' && <Backup refresh={refresh} />}
+    {page === 'csv' && <BrowserCsv refresh={refresh} />}
     {page === 'browser' && <BrowserSettings />}
   </div>;
 }

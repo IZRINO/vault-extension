@@ -258,6 +258,7 @@ pnpm run test:smoke
   - 实现 `vault-core` 的 Argon2id 异步 Worker 派生、256-bit 应急恢复码双路包装、HKDF + XChaCha20-Poly1305 密钥树、`storage.session` 无感唤醒恢复、PIN / Windows Hello (`PRF` 自检降级) 解锁与 `IndexedDB` 密文存储
   - 完成 Popup / SidePanel 基础增删改查 UI、密码/助记词生成器、高敏二次验证与 Offscreen 剪贴板定时清理
 - [ ] **Phase 2：自动填充引擎 + 内置 2FA + Ente Auth 互通**
+  - 已实现浏览器密码 CSV 预览导入与登录凭证手动 TOTP，见[二期开发记录](./docs/phase-2-status.md)
   - 实现 `ISOLATED` 表单探测、Closed Shadow DOM 隔离填充菜单、跨域 `<iframe>` 防钓鱼确认、关联域名等价组、内网端口隔离、按站黑名单开关与受控输入框填充/捕获保存
   - 实现 TOTP / HOTP / Steam Guard、网页二维码截图识别、下一期预览与分格验证码自动填充
   - 落地 Ente Auth 纯文本双向导入导出、浏览器 CSV / Bitwarden JSON 导入及「密码 + 2FA 智能合并向导」

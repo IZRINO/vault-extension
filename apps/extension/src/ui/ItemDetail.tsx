@@ -5,6 +5,7 @@ import { CopyButton, Ico, MenuButton } from './components';
 import { useDialogs } from './dialogs';
 import { developerFieldVisible, fieldSets, formatDateTime, kinds, openableUrl, plateText, subtypeNames, text } from './lib';
 import { useOps } from './Main';
+import TotpSection from './TotpSection';
 
 export function Fact({ label, value, secret = false }: { label: string; value: string; secret?: boolean }) {
   const [shown, setShown] = useState(false);
@@ -52,6 +53,7 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove }: {
       <div><h2>{item.title}</h2><p>{item.data.kind === 'developer' ? subtypeNames[text(item.data.subtype)] : kinds[item.data.kind]}{item.pinned && ' · 已置顶'}{item.requireReprompt && ' · 需要再次验证'}</p></div></div>
     {item.trashed && <div className="banner banner-warn">这条凭证在回收站里。恢复后可以继续使用。</div>}
     <div className="facts">{fields.map(field => <Fact key={field.key} label={field.label} value={text(item.data[field.key])} secret={field.secret} />)}</div>
+    {item.data.kind === 'login' && !item.trashed && !!item.data.totpUri && <TotpSection setupKey={text(item.data.totpUri)} />}
     {uris.length > 0 && <section className="section"><h2>网站</h2><div className="facts">{uris.map((uri, i) => {
       const url = openableUrl(uri.uri);
       return <div className="fact" key={i}><div className="fact-text"><span className="fact-value">{uri.uri}</span></div>

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vault-core",
     "crates/vault-importers",
+    "crates/vault-otp",
 ]
 
 [workspace.dependencies]

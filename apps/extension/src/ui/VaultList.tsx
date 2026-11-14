@@ -24,11 +24,12 @@ function quickActions(item: ItemSummary): QuickAction[] {
   return [];
 }
 
-export default function VaultList({ items, query, filter, changesSinceBackup, setFilter, clearQuery, open, quickCopy, create, restore, remove, emptyTrash, backup }: {
+export default function VaultList({ items, query, filter, changesSinceBackup, setFilter, clearQuery, open, quickCopy, create, restore, remove, emptyTrash, backup, importCsv }: {
   items: ItemSummary[] | undefined; query: string; filter: string; changesSinceBackup: number;
   setFilter(filter: string): void; clearQuery(): void; open(item: ItemSummary): void;
   quickCopy(item: ItemSummary, key: string, label: string): Promise<boolean>;
   create(): void; restore(item: ItemSummary): void; remove(item: ItemSummary): void; emptyTrash(expectedIds: string[]): void; backup(): void;
+  importCsv(): void;
 }) {
   const { busy } = useOps();
   const visible = items ? filterItems(items, filter, query) : [];
@@ -94,7 +95,10 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
       <span className="plate" aria-hidden="true"><Ico of={PackageOpen} /></span>
       <h2>还没有保存任何凭证</h2>
       <p>先存一个常用网站的账号和密码，以后在这里点一下就能复制。</p>
-      <button type="button" className="btn btn-primary" onClick={create}><Ico of={Plus} />添加登录项</button>
+      <div className="actions">
+        <button type="button" className="btn btn-primary" onClick={create}><Ico of={Plus} />添加登录项</button>
+        <button type="button" className="btn" onClick={importCsv}>从浏览器导入</button>
+      </div>
     </div>)}
   </div>;
 }

@@ -1,9 +1,12 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
+import initCsv, { wasm_parse_browser_csv } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import initOtp, { wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
+import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
 import { VaultController } from './vault-controller';
-import type { BackupExport, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
+import type { BackupExport, BrowserCsvPreview, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
 import type { LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
@@ -20,7 +23,13 @@ vi.mock('./vault-storage', () => ({
 vi.mock('./vault-core', () => ({ loadVaultCore: async () => wasm, randomBytes: (length: number) => crypto.getRandomValues(new Uint8Array(length)) }));
 vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
-  derive: async (operation: keyof typeof wasm, args: unknown[]) => {
+  derive: async (operation: keyof typeof wasm | 'parse-browser-csv' | 'validate-totp', args: unknown[]) => {
+    if (operation === 'parse-browser-csv') return prepareBrowserCsv(wasm_parse_browser_csv(args[0] as Uint8Array));
+    if (operation === 'validate-totp') {
+      try { wasm_validate_totp(args[0] as string); }
+      catch (error) { throw new Error(String(error)); }
+      return null;
+    }
     if (state.pause && operation === 'wasm_unlock_head_with_password') await state.pause;
     const result = (wasm[operation] as (...a: unknown[]) => unknown)(...args);
     if (result instanceof Uint8Array) return Array.from(result);
@@ -46,6 +55,8 @@ let fixture: VaultFiles;
 let recoveryCode: string;
 beforeAll(async () => {
   await init({ module_or_path: await readFile(new URL('../../../crates/vault-core/pkg/vault_core_bg.wasm', import.meta.url)) });
+  await initCsv({ module_or_path: await readFile(new URL('../../../crates/vault-importers/pkg/vault_importers_bg.wasm', import.meta.url)) });
+  await initOtp({ module_or_path: await readFile(new URL('../../../crates/vault-otp/pkg/vault_otp_bg.wasm', import.meta.url)) });
   const output = wasm.wasm_create_new_vault(password, 32768, 2, 4, crypto.getRandomValues(new Uint8Array(32)), Date.now());
   fixture = { head: output.head_bytes, snap: output.snap_bytes, vaultId: output.vault_id, keyEpoch: Number(output.key_epoch), updatedAtMs: Date.now(), changesSinceBackup: 0 };
   recoveryCode = output.recovery_code;
@@ -159,6 +170,62 @@ describe('real WASM + background session integration', () => {
     await recreated.handle({ type: 'backup-saved', receipt: first.receipt });
     await recreated.handle({ type: 'backup-saved', receipt: second.receipt });
     expect(state.files!.changesSinceBackup).toBe(1);
+  });
+  it('previews CSV without writing, rejects stale previews, and adds only new site/account pairs', async () => {
+    const controller = await unlocked();
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Existing', true)) });
+    const [original] = await controller.handle({ type: 'list' }) as ItemSummary[];
+    await controller.handle({ type: 'trash', id: original!.id, trashed: true });
+    const bytes = Array.from(new TextEncoder().encode([
+      'name,url,username,password,note,OTPAuth',
+      'Do not replace,https://EXAMPLE-bank.com:443/settings,tester,Other-Password,,',
+      'New login,https://new.example/a,person,New-Test-Password,"A, B",',
+      'Same CSV account,https://new.example/b,person,Different-Password,,',
+      'Non-web,ftp://other.example,user,Invalid-Password,,not-imported',
+    ].join('\n')));
+    const before = structuredClone(state.files);
+    const preview = () => controller.handle({ type: 'preview-browser-csv', bytes }) as Promise<BrowserCsvPreview>;
+    const importCsv = (stamp: string, check = proof, source = bytes) =>
+      controller.handle({ type: 'import-browser-csv', bytes: source, stamp, proof: check });
+    const old = await preview();
+    expect(old).toMatchObject({
+      ready: 1, skipped: 2, invalid: 1, ignoredOtp: 1,
+      sample: [{ title: 'New login', site: 'new.example', username: 'person' }],
+    });
+    expect(JSON.stringify(old)).not.toContain('New-Test-Password');
+    expect(state.files).toEqual(before);
+    await expect(importCsv(old.stamp, proof, [...bytes, 10])).rejects.toThrow('重新预览');
+    await expect(importCsv(old.stamp, { method: 'master', secret: 'Wrong-Test-Password' })).rejects.toThrow('主密码验证失败');
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Different after preview')) });
+    await expect(importCsv(old.stamp)).rejects.toThrow('重新预览');
+    expect(await importCsv((await preview()).stamp)).toBe(1);
+    const imported = (await controller.handle({ type: 'list' }) as ItemSummary[]).find(item => item.title === 'New login')!;
+    expect((await controller.handle({ type: 'get', id: imported.id }) as VaultItem).note).toBe('A, B');
+    expect((await controller.handle({ type: 'get', id: original!.id, proof }) as VaultItem).data.password).toBe('Unique-Secret-Pass#719');
+    const after = structuredClone(state.files);
+    const repeated = await preview();
+    expect(repeated.ready).toBe(0);
+    expect(await importCsv(repeated.stamp)).toBe(0);
+    expect(state.files).toEqual(after);
+    expect(new TextDecoder().decode(state.files!.snap)).not.toContain('New-Test-Password');
+  });
+  it('rejects invalid TOTP settings and restores a valid protected setup from ciphertext', async () => {
+    const controller = await unlocked();
+    const item = record('Two-step login', true);
+    item.data.totpUri = '123456';
+    await expect(controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) })).rejects.toThrow('设置密钥无效');
+    expect(await controller.handle({ type: 'list' })).toEqual([]);
+    const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+    item.data.totpUri = secret;
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    expect(new TextDecoder().decode(state.files!.snap)).not.toContain(secret);
+    await controller.lock();
+    const restored = await unlocked();
+    const [summary] = await restored.handle({ type: 'list' }) as ItemSummary[];
+    expect(summary!.hasTotp).toBe(true);
+    await expect(restored.handle({ type: 'get', id: summary!.id })).rejects.toThrow('再次验证');
+    const loaded = await restored.handle({ type: 'get', id: summary!.id, proof }) as VaultItem;
+    expect(wasm_totp_at(String(loaded.data.totpUri), 59)).toBe('287082:60');
   });
   it('recovery rotates only the header and invalidates shortcuts', async () => {
     const controller = await unlocked();

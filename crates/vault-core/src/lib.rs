@@ -1,4 +1,5 @@
 pub mod audit;
+mod browser_csv;
 pub mod crypto;
 pub mod error;
 pub mod generator;
@@ -8,7 +9,7 @@ pub mod session;
 pub mod sync_codec;
 
 use wasm_bindgen::prelude::*;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::audit::{
     audit_vault_items, evaluate_password_strength, hibp_match_range_response,
@@ -453,6 +454,10 @@ pub struct WasmMutationResult {
     snap_bytes: Vec<u8>,
 }
 
+impl Drop for WasmMutationResult {
+    fn drop(&mut self) { self.item_json.zeroize(); }
+}
+
 #[wasm_bindgen]
 impl WasmMutationResult {
     #[wasm_bindgen(getter)]
@@ -532,11 +537,12 @@ impl WasmVaultEngine {
 
     pub fn upsert_item_json(
         &mut self,
-        item_json: &str,
+        item_json: String,
         now_ms: f64,
         device_name: Option<String>,
     ) -> Result<WasmMutationResult, JsValue> {
-        let incoming = VaultItem::from_json_str(item_json)?;
+        let item_json = Zeroizing::new(item_json);
+        let incoming = VaultItem::from_json_str(&item_json)?;
         let (saved, head_bytes, snap_bytes) =
             self.inner.upsert_item(incoming, now_ms as u64, device_name)?;
         let saved_json = saved.to_json_value().stringify();
@@ -546,6 +552,17 @@ impl WasmVaultEngine {
             head_bytes,
             snap_bytes,
         })
+    }
+
+    pub fn browser_csv_json(&mut self, rows: String, now_ms: f64, commit: bool) -> Result<WasmMutationResult, JsValue> {
+        let rows = Zeroizing::new(rows);
+        let (items, item_json) = browser_csv::plan(&self.inner.snapshot_ref()?.items, &rows, now_ms as u64)?;
+        let (count, head_bytes, snap_bytes) = if commit && !items.is_empty() {
+            self.inner.import_items_merge(items, now_ms as u64)?
+        } else {
+            (0, Vec::new(), Vec::new())
+        };
+        Ok(WasmMutationResult { item_json, count, head_bytes, snap_bytes })
     }
 
     pub fn set_trashed(
@@ -593,6 +610,7 @@ impl WasmVaultEngine {
         Ok(report.to_json_value().stringify())
     }
 }
+
 
 // ============================================================================
 // Stateless Utility Bindings (Generators, Strength Meter, HIBP k-Anonymity, Card/URI helpers)

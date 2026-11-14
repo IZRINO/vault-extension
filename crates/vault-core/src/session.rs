@@ -388,7 +388,10 @@ impl VaultSession {
         let mut imported_count = 0usize;
         for mut inc in incoming_items {
             inc.normalize_derived_fields();
-            if let Some(existing) = st.snapshot.items.iter_mut().find(|i| i.id == inc.id) {
+            let existing = if inc.id.is_empty() { None } else {
+                st.snapshot.items.iter_mut().find(|i| i.id == inc.id)
+            };
+            if let Some(existing) = existing {
                 if inc.updated_at_ms >= existing.updated_at_ms {
                     existing.apply_update(inc, now_ms, Some("vaultpack".into()));
                     imported_count += 1;

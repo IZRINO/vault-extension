@@ -1,7 +1,12 @@
 export type Proof = { method: 'master' | 'pin'; secret: string };
 export const MAX_VAULTPACK_BYTES = 16 * 1024 * 1024;
+export const MAX_BROWSER_CSV_BYTES = 2 * 1024 * 1024;
 export interface BackupReceipt { vaultId: string; changeCount: number }
 export interface BackupExport { bytes: number[]; receipt: BackupReceipt }
+export interface BrowserCsvPreview {
+  stamp: string; ready: number; skipped: number; invalid: number; ignoredOtp: number;
+  sample: { title: string; site: string; username: string }[];
+}
 export function capacityErrorText(error: unknown): string | undefined {
   if (typeof error !== 'string') return;
   const prefix = ['COMPACT_OBJECT_TOO_LARGE: ', 'VAULTPACK_TOO_LARGE: '].find(value => error.startsWith(value));
@@ -27,6 +32,8 @@ export type VaultMessage =
   | { type: 'export'; password: string; proof: Proof }
   | { type: 'backup-saved'; receipt: BackupReceipt }
   | { type: 'import'; bytes: number[]; password: string; proof: Proof }
+  | { type: 'preview-browser-csv'; bytes: number[] }
+  | { type: 'import-browser-csv'; bytes: number[]; stamp: string; proof: Proof }
   | { type: 'register-prf'; credentialId: number[]; salt: number[]; output: number[]; proof: Proof }
   | { type: 'unlock-prf'; output: number[] }
   | { type: 'hibp'; id: string; proof?: Proof };

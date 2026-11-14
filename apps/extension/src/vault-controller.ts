@@ -1,7 +1,7 @@
 import { loadVaultCore, randomBytes } from './vault-core';
 import { derive, offscreen } from './bridge';
 import * as store from './vault-storage';
-import { capacityErrorText, MAX_VAULTPACK_BYTES, type BackupExport, type ItemSummary, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
+import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type ItemSummary, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
 
 export const LOCK_ALARM = 'vault-lock';
 export const CLIPBOARD_ALARM = 'vault-clipboard';
@@ -10,6 +10,11 @@ type Engine = InstanceType<Core['WasmVaultEngine']>;
 type Created = { head: number[]; snap: number[]; wrap: number[]; vaultId: string; keyEpoch: number; recoveryCode: string };
 type Rotation = { head: number[]; wrap: number[]; keyEpoch: number };
 type Mutation = { head_bytes: Uint8Array; snap_bytes: Uint8Array; count: number; free(): void };
+
+async function digestHex(bytes: Uint8Array<ArrayBuffer>) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+}
 
 export class VaultController {
   private core?: Core;
@@ -140,7 +145,9 @@ export class VaultController {
     try {
       check();
       result = mutate();
-      const files = { ...this.files!, head: result.head_bytes, snap: result.snap_bytes, updatedAtMs: Date.now(),
+      const snap = result.snap_bytes;
+      if (!snap.length) return 0; // An explicit no-op has no new encrypted snapshot.
+      const files = { ...this.files!, head: result.head_bytes, snap, updatedAtMs: Date.now(),
         changesSinceBackup: (this.files!.changesSinceBackup ?? 0) + result.count };
       await store.saveVaultFiles(files);
       this.files = files;
@@ -223,10 +230,17 @@ export class VaultController {
       case 'upsert': {
         const item = JSON.parse(message.itemJson) as VaultItem;
         if (!item.title?.trim()) throw new Error('请输入名称。');
+        let previousTotp: unknown;
         if (item.id) {
           await this.requireItemProof(item.id, message.proof, check);
           const existing = JSON.parse(engine.get_item_json(item.id, true)) as VaultItem;
           if (existing.revision !== item.revision) throw new Error('条目已在其他窗口更新，请重新打开后编辑。');
+          previousTotp = existing.data.totpUri;
+        }
+        const setupKey = item.data.totpUri;
+        if (item.data.kind === 'login' && setupKey != null && setupKey !== previousTotp) {
+          if (typeof setupKey !== 'string' || setupKey.length > 4096) throw new Error('验证码设置密钥无效。');
+          await derive('validate-totp', [setupKey]);
         }
         return this.saveMutation(() => engine.upsert_item_json(message.itemJson, Date.now(), '本机'), check);
       }
@@ -308,6 +322,30 @@ export class VaultController {
         check();
         engine.restore_from_session(session.key, session.wrap, head, snap);
         return output.count;
+      }
+      case 'preview-browser-csv':
+      case 'import-browser-csv': {
+        if (!Array.isArray(message.bytes) || !message.bytes.length || message.bytes.length > MAX_BROWSER_CSV_BYTES) {
+          throw new Error('请选择不超过 2 MiB 的 CSV 文件。');
+        }
+        const bytes = new Uint8Array(message.bytes);
+        try {
+          // Bind the preview to both the selected file and the vault version. Never persist the preview.
+          const stamp = (await Promise.all([digestHex(bytes), digestHex(new Uint8Array(this.files.snap))])).join(':');
+          check();
+          if (message.type === 'import-browser-csv') {
+            if (message.stamp !== stamp) throw new Error('文件或密码库已变更，请重新预览再导入。');
+            await this.verify(message.proof, check);
+          }
+          const rows = await derive<string>('parse-browser-csv', [bytes]);
+          check();
+          if (message.type === 'preview-browser-csv') {
+            const preview = engine.browser_csv_json(rows, Date.now(), false);
+            try { return { ...JSON.parse(preview.item_json), stamp } as BrowserCsvPreview; }
+            finally { preview.free(); }
+          }
+          return this.saveMutation(() => engine.browser_csv_json(rows, Date.now(), true), check);
+        } finally { bytes.fill(0); }
       }
       case 'hibp': {
         await this.requireItemProof(message.id, message.proof, check);

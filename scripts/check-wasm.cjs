@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
-for (const name of ['vault-core', 'vault-importers']) {
+for (const name of ['vault-core', 'vault-importers', 'vault-otp']) {
   const file = 'crates/' + name + '/pkg/' + name.replace('-', '_') + '_bg.wasm';
   const bytes = fs.readFileSync(file);
   assert(WebAssembly.validate(bytes), file + ' cannot load in the current JS runtime');

@@ -197,7 +197,7 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
           {tab === 'vault' && screen.name === 'list' && <VaultList items={items} query={query} filter={filter} changesSinceBackup={status.changesSinceBackup}
             setFilter={setFilter} clearQuery={() => setQuery('')} open={summary => void open(summary)} quickCopy={quickCopy}
             create={() => create('login')} restore={item => void setTrashed(item, false)} remove={item => void remove(item)}
-            emptyTrash={ids => void emptyTrash(ids)} backup={() => void go('settings', 'backup')} />}
+            emptyTrash={ids => void emptyTrash(ids)} backup={() => void go('settings', 'backup')} importCsv={() => void go('settings', 'csv')} />}
           {tab === 'vault' && screen.name === 'detail' && <ItemDetail key={screen.item.id} item={screen.item}
             back={() => setScreen({ name: 'list' })} edit={() => setScreen({ name: 'edit', item: screen.item, back: screen.item })}
             setTrashed={trashed => void setTrashed(screen.item, trashed)} remove={() => void remove(screen.item)} />}
