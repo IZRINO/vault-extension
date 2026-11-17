@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ArrowLeft, ChevronRight, Dices, Eye, EyeOff, Plus, Trash2 } from 'lucide-react';
-import { request, type VaultItem } from '../vault-messages';
+import { MAX_OTP_SETUP_LENGTH, request, type VaultItem } from '../vault-messages';
 import { AreaField, Ico, SecretField, SelectField, SwitchRow, TextField } from './components';
 import { developerFieldVisible, fieldSets, kinds, matchRules, subtypeNames, text } from './lib';
 import { useOps } from './Main';
@@ -53,8 +53,8 @@ export default function ItemEditor({ initial, save, close, onDirty }: {
       <details className="fold">
         <summary>两步验证码（可选）<Ico of={ChevronRight} /></summary>
         <div className="fold-body">
-          <SecretField label="验证码设置密钥" value={text(item.data.totpUri)} maxLength={4096} autoComplete="off" spellCheck={false}
-            hint="从网站的两步验证设置页粘贴密钥（Base32）或 otpauth://totp 链接，不是当前的 6 位验证码。清空可移除设置。"
+          <SecretField label="验证码设置密钥" value={text(item.data.totpUri)} maxLength={MAX_OTP_SETUP_LENGTH} autoComplete="off" spellCheck={false}
+            hint="粘贴网站提供的 Base32 密钥或 otpauth:// 链接，支持 TOTP、HOTP 和 Steam。HOTP 链接需含 counter 计数器；清空可移除设置。"
             onChange={value => update('totpUri', value || null)} />
           <p className="hint">请保留网站提供的恢复码。把密码和验证码放在同一个库里时，别人解锁密码库就能同时取到两者。</p>
         </div>

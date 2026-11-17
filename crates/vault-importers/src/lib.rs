@@ -2,6 +2,8 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+mod ente_auth;
+
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 5001; // header + 5,000 data records
 const MAX_COLUMNS: usize = 64;

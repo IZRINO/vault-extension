@@ -1,19 +1,24 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
-import initCsv, { wasm_parse_browser_csv } from '../../../crates/vault-importers/pkg/vault_importers.js';
-import initOtp, { wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
+import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente_auth } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
 import { VaultController } from './vault-controller';
-import type { BackupExport, BrowserCsvPreview, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
+import type { BackupExport, BrowserCsvPreview, EntePreview, OtpCode, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
 import type { LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
-  settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined }));
+  settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
+  failSave: false, pendingHotp: undefined as Uint8Array | undefined }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
-  saveVaultFiles: async (files: VaultFiles) => { state.files = structuredClone(files); },
+  saveVaultFiles: async (files: VaultFiles, queueHotpChange = false) => {
+    if (state.failSave) throw new Error('Test disk write failed');
+    state.files = structuredClone(files);
+    if (queueHotpChange) state.pendingHotp = new Uint8Array(files.snap);
+  },
   loadSessionState: async () => structuredClone(state.session),
   saveSessionState: async (session: SessionState) => { state.session = structuredClone(session); },
   clearSessionState: async () => { state.session = undefined; },
@@ -23,8 +28,11 @@ vi.mock('./vault-storage', () => ({
 vi.mock('./vault-core', () => ({ loadVaultCore: async () => wasm, randomBytes: (length: number) => crypto.getRandomValues(new Uint8Array(length)) }));
 vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
-  derive: async (operation: keyof typeof wasm | 'parse-browser-csv' | 'validate-totp', args: unknown[]) => {
+  derive: async (operation: keyof typeof wasm | 'parse-browser-csv' | 'validate-totp' | 'generate-hotp' | 'parse-ente' | 'export-ente', args: unknown[]) => {
     if (operation === 'parse-browser-csv') return prepareBrowserCsv(wasm_parse_browser_csv(args[0] as Uint8Array));
+    if (operation === 'parse-ente') return wasm_parse_ente_auth(args[0] as Uint8Array, args[1] as string);
+    if (operation === 'export-ente') return wasm_export_ente_auth(args[0] as string);
+    if (operation === 'generate-hotp') return wasm_otp_at(args[0] as string, 0, 0);
     if (operation === 'validate-totp') {
       try { wasm_validate_totp(args[0] as string); }
       catch (error) { throw new Error(String(error)); }
@@ -64,6 +72,8 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   state.files = structuredClone(fixture); state.session = undefined; state.pause = undefined;
+  state.failSave = false;
+  state.pendingHotp = undefined;
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
     storage: { session: { get: async () => ({}), set: vi.fn() } } });
@@ -253,6 +263,140 @@ describe('real WASM + background session integration', () => {
     expect(state.session).toBeUndefined();
   });
 });
+describe('Ente migration and counter-based codes', () => {
+  const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+  const bytesOf = (text: string) => Array.from(new TextEncoder().encode(text));
+  const token = (kind = 'totp', label = 'GitHub%3Atester', extra = '') =>
+    `otpauth://${kind}/${label}?secret=${secret}&issuer=GitHub${extra}`;
+
+  async function addHotp(controller: VaultController, protectedItem = false) {
+    const item = record('Counter token', protectedItem);
+    item.data.totpUri = token('hotp', 'GitHub%3Atester', '&counter=0');
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    return (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
+  }
+
+  it('commits distinct HOTP counters for concurrent callers and resumes after worker recreation', async () => {
+    const controller = await unlocked();
+    const id = await addHotp(controller);
+    const results = await Promise.all([controller.handle({ type: 'next-hotp', id }), controller.handle({ type: 'next-hotp', id })]) as { code: OtpCode; item: VaultItem }[];
+    expect(results.map(result => result.code.value)).toEqual(['755224', '287082']);
+    expect(results.map(result => result.code.counter)).toEqual(['0', '1']);
+    expect(state.files!.changesSinceBackup).toBe(3);
+    expect(state.pendingHotp).toEqual(state.files!.snap);
+    expect(new TextDecoder().decode(state.pendingHotp)).not.toContain(secret);
+    const restored = new VaultController();
+    const third = await restored.handle({ type: 'next-hotp', id }) as { code: OtpCode; item: VaultItem };
+    expect(third.code.value).toBe('359152');
+    expect(String(third.item.data.totpUri)).toContain('counter=3');
+    await expect(controller.handle({ type: 'upsert', itemJson: JSON.stringify(results[0]!.item) })).rejects.toThrow('其他窗口更新');
+    expect(new TextDecoder().decode(state.files!.snap)).not.toContain(secret);
+  });
+
+  it('does not expose or consume a HOTP code when saving fails, and enforces item protection', async () => {
+    const controller = await unlocked();
+    const id = await addHotp(controller, true);
+    const before = structuredClone(state.files);
+    await expect(controller.handle({ type: 'next-hotp', id })).rejects.toThrow('再次验证');
+    state.failSave = true;
+    await expect(controller.handle({ type: 'next-hotp', id, proof })).rejects.toThrow('disk write failed');
+    expect(state.files).toEqual(before);
+    expect(state.pendingHotp).toBeUndefined();
+    state.failSave = false;
+    const first = await controller.handle({ type: 'next-hotp', id, proof }) as { code: OtpCode };
+    expect(first.code.value).toBe('755224');
+    expect(first.code.counter).toBe('0');
+    await controller.handle({ type: 'trash', id, trashed: true });
+    await expect(controller.handle({ type: 'next-hotp', id, proof })).rejects.toThrow('没有可用');
+  });
+
+  it('previews without secrets or writes and merges only an explicitly selected matching account', async () => {
+    const controller = await unlocked();
+    const old = record('GitHub login', true);
+    old.data.uris = [{ uri: 'https://github.com/login' }];
+    old.tags = ['existing']; old.note = 'Original note';
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(old) });
+    const id = (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
+    const display = encodeURIComponent(JSON.stringify({ note: 'Imported note', tags: ['work'], pinned: true }));
+    const bytes = bytesOf(token('totp', 'GitHub%3Atester', `&codeDisplay=${display}`));
+    const before = structuredClone(state.files);
+    const preview = await controller.handle({ type: 'preview-ente', bytes }) as EntePreview;
+    expect(preview).toMatchObject({ ready: 1, invalid: 0, skipped: 0, suggestions: [{ row: 0, id }] });
+    expect(JSON.stringify(preview)).not.toContain(secret);
+    expect(JSON.stringify(preview)).not.toContain('Original note');
+    expect(state.files).toEqual(before);
+    await expect(controller.handle({ type: 'import-ente', bytes, stamp: preview.stamp, merges: [], proof: { method: 'master', secret: 'Wrong password#' } })).rejects.toThrow('主密码验证失败');
+    await expect(controller.handle({ type: 'import-ente', bytes, stamp: preview.stamp, merges: [{ row: 0, id: 'forged-id' }], proof })).rejects.toThrow('重新预览');
+    expect(await controller.handle({ type: 'import-ente', bytes, stamp: preview.stamp, merges: [{ row: 0, id }], proof })).toBe(1);
+    const merged = await controller.handle({ type: 'get', id, proof }) as VaultItem;
+    expect(merged.data.password).toBe(old.data.password);
+    expect(merged.requireReprompt).toBe(true);
+    expect(merged.note).toBe('Original note\n\nImported note');
+    expect(merged.tags).toEqual(['existing', 'work']);
+    expect(merged.pinned).toBe(true);
+    expect((await controller.handle({ type: 'list' }) as ItemSummary[]).length).toBe(1);
+    const repeat = await controller.handle({ type: 'preview-ente', bytes }) as EntePreview;
+    expect(repeat).toMatchObject({ ready: 0, skipped: 1 });
+  });
+
+  it('preserves independent tokens and trash and rejects a stale import after file or vault changes', async () => {
+    const controller = await unlocked();
+    const bytes = bytesOf(token('steam', 'Steam%3Aaccount', '&digits=5&codeDisplay=' + encodeURIComponent(JSON.stringify({ trashed: true, tags: ['saved'], note: 'Keep me' }))));
+    const first = await controller.handle({ type: 'preview-ente', bytes }) as EntePreview;
+    expect(first).toMatchObject({ ready: 1, trashed: 1, suggestions: [] });
+    await expect(controller.handle({ type: 'import-ente', bytes: [...bytes, 10], stamp: first.stamp, merges: [], proof })).rejects.toThrow('重新预览');
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Added after preview')) });
+    await expect(controller.handle({ type: 'import-ente', bytes, stamp: first.stamp, merges: [], proof })).rejects.toThrow('重新预览');
+    const latest = await controller.handle({ type: 'preview-ente', bytes }) as EntePreview;
+    state.failSave = true;
+    await expect(controller.handle({ type: 'import-ente', bytes, stamp: latest.stamp, merges: [], proof })).rejects.toThrow('disk write failed');
+    expect((await controller.handle({ type: 'list' }) as ItemSummary[]).length).toBe(1);
+    state.failSave = false;
+    await controller.handle({ type: 'import-ente', bytes, stamp: latest.stamp, merges: [], proof });
+    const saved = (await controller.handle({ type: 'list' }) as ItemSummary[]).find(item => item.hasTotp)!;
+    expect(saved.trashed).toBe(true);
+    expect(saved.trashedAtMs).toBeGreaterThan(0);
+    const item = await controller.handle({ type: 'get', id: saved.id }) as VaultItem;
+    expect(item.data.uris).toEqual([]);
+    expect(item.note).toBe('Keep me');
+  });
+
+  it('never suggests merging a different account, deceptive domain, existing token or ambiguous match', async () => {
+    const controller = await unlocked();
+    for (const [title, username, site, setup] of [
+      ['Wrong user', 'different', 'https://github.com', null],
+      ['Deceptive domain', 'tester', 'https://github.com.evil.test', null],
+      ['Has code', 'tester', 'https://github.com', token('hotp', 'GitHub%3Atester', '&counter=10')],
+      ['First match', 'tester', 'https://github.com', null],
+      ['Second match', 'tester', 'https://github.com', null],
+    ]) {
+      const item = record(String(title));
+      item.data = { ...item.data, username, uris: [{ uri: site }], totpUri: setup };
+      await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    }
+    const preview = await controller.handle({ type: 'preview-ente', bytes: bytesOf(token()) }) as EntePreview;
+    expect(preview.ready).toBe(1);
+    expect(preview.suggestions).toEqual([]);
+  });
+
+  it('requires a master password and explicit plaintext consent for a lossless export', async () => {
+    const controller = await unlocked();
+    const id = await addHotp(controller, true);
+    await controller.handle({ type: 'next-hotp', id, proof });
+    await controller.handle({ type: 'trash', id, trashed: true });
+    await expect(controller.handle({ type: 'export-ente', proof, confirmPlaintext: false })).rejects.toThrow('确认风险');
+    await expect(controller.handle({ type: 'export-ente', proof: { method: 'pin', secret: '734928' }, confirmPlaintext: true })).rejects.toThrow('主密码');
+    await expect(controller.handle({ type: 'export-ente', proof: { method: 'master', secret: 'Wrong-Password' }, confirmPlaintext: true })).rejects.toThrow('主密码验证失败');
+    const exported = await controller.handle({ type: 'export-ente', proof, confirmPlaintext: true }) as string;
+    expect(exported).toContain('counter=1');
+    expect(exported).not.toContain('Unique-Secret-Pass#719');
+    const decoded = JSON.parse(wasm_parse_ente_auth(new TextEncoder().encode(exported), '[]'));
+    expect(decoded.rows[0].trashed).toBe(true);
+    const original = await controller.handle({ type: 'preview-ente', bytes: bytesOf(token('hotp', 'GitHub%3Atester', '&counter=0')) }) as EntePreview;
+    expect(original).toMatchObject({ ready: 0, skipped: 1 });
+  });
+});
+
 describe('message source boundary', () => {
   const id = 'trusted-extension';
   it('allows only extension UI, including full page tabs', () => {

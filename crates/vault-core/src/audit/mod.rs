@@ -298,6 +298,9 @@ pub fn audit_vault_items(items: &[VaultItem]) -> VaultSecurityAuditReport {
             continue;
         }
         if let CredentialData::Login(login) = &item.data {
+            if login.password.is_empty() && login.totp_uri.as_ref().is_some_and(|uri| !uri.is_empty()) {
+                continue;
+            }
             total_login_items += 1;
             let mut hints = vec![item.title.clone(), login.username.clone()];
             if let Some(u) = login.uris.first() {

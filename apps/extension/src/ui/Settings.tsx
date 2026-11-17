@@ -7,9 +7,10 @@ import { useDialogs } from './dialogs';
 import { download } from './lib';
 import { useOps } from './Main';
 import BrowserCsv from './BrowserCsv';
+import EnteAuth from './EnteAuth';
 
-export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'browser';
-const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', browser: '浏览器设置' };
+export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'ente' | 'browser';
+const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置' };
 export default function Settings({ status, page, setPage, refresh }: {
   status: VaultStatus; page: SettingsPage; setPage(page: SettingsPage): void; refresh(): Promise<void>;
 }) {
@@ -21,6 +22,7 @@ export default function Settings({ status, page, setPage, refresh }: {
           ['password', KeyRound, '更改主密码', '用当前主密码设置一个新的主密码'],
           ['backup', HardDrive, '备份与恢复', '保存加密备份，或从备份恢复凭证'],
           ['csv', FileUp, '导入浏览器密码', '预览浏览器导出的 CSV，不覆盖已有凭证'],
+          ['ente', ArrowRightLeft, 'Ente Auth 验证器迁移', '导入或导出验证码，可合并到已有登录项'],
           ['browser', Globe, '浏览器设置', '管理浏览器原生的保存密码提示'],
         ] as const).map(([id, icon, label, hint]) => <button type="button" className="nav-row" key={id} onClick={() => setPage(id)}>
           <Ico of={icon} /><span className="grow"><strong>{label}</strong><small>{hint}</small></span><Ico of={ChevronRight} /></button>)}
@@ -30,6 +32,7 @@ export default function Settings({ status, page, setPage, refresh }: {
     {page === 'password' && <ChangePassword refresh={refresh} />}
     {page === 'backup' && <Backup refresh={refresh} />}
     {page === 'csv' && <BrowserCsv refresh={refresh} />}
+    {page === 'ente' && <EnteAuth refresh={refresh} />}
     {page === 'browser' && <BrowserSettings />}
   </div>;
 }

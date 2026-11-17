@@ -30,8 +30,18 @@ function database() {
 export async function loadVaultFiles(): Promise<VaultFiles | undefined> {
   return (await database()).get('vault', 'active');
 }
-export async function saveVaultFiles(files: VaultFiles): Promise<void> {
-  await (await database()).put('vault', { ...files, head: new Uint8Array(files.head), snap: new Uint8Array(files.snap) }, 'active');
+export async function saveVaultFiles(files: VaultFiles, queueHotpChange = false): Promise<void> {
+  const db = await database();
+  const saved = { ...files, head: new Uint8Array(files.head), snap: new Uint8Array(files.snap) };
+  if (!queueHotpChange) { await db.put('vault', saved, 'active'); return; }
+  // Phase 3 will encode WAL deltas. Until then retain the latest encrypted HOTP
+  // snapshot as a coalesced pending change, atomically with the counter update.
+  const tx = db.transaction(['vault', 'pendingChanges'], 'readwrite', { durability: 'strict' });
+  await Promise.all([
+    tx.objectStore('vault').put(saved, 'active'),
+    tx.objectStore('pendingChanges').put(new Uint8Array(files.snap), 'hotp-snapshot'),
+    tx.done,
+  ]);
 }
 export async function loadSessionState(): Promise<SessionState | undefined> {
   const { active } = await browser.storage.session.get<{ active: { key: number[]; wrap: number[]; unlockedAtMs: number; lastActivityMs: number } }>('active');

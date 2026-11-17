@@ -5,7 +5,7 @@ import { CopyButton, Ico, MenuButton } from './components';
 import { useDialogs } from './dialogs';
 import { developerFieldVisible, fieldSets, formatDateTime, kinds, openableUrl, plateText, subtypeNames, text } from './lib';
 import { useOps } from './Main';
-import TotpSection from './TotpSection';
+import TotpSection, { HotpSection } from './TotpSection';
 
 export function Fact({ label, value, secret = false }: { label: string; value: string; secret?: boolean }) {
   const [shown, setShown] = useState(false);
@@ -18,15 +18,17 @@ export function Fact({ label, value, secret = false }: { label: string; value: s
   </div>;
 }
 
-export default function ItemDetail({ item, back, edit, setTrashed, remove }: {
-  item: VaultItem; back(): void; edit(): void; setTrashed(trashed: boolean): void; remove(): void;
+export default function ItemDetail({ item, back, edit, setTrashed, remove, updated }: {
+  item: VaultItem; back(): void; edit(): void; setTrashed(trashed: boolean): void; remove(): void; updated(item: VaultItem): void;
 }) {
   const ops = useOps();
   const dialogs = useDialogs();
   const [onlineNotice, setOnlineNotice] = useState('');
   const [onlineConfirmed, setOnlineConfirmed] = useState(false);
+  const authenticatorOnly = item.data.kind === 'login' && !!item.data.totpUri && !item.data.password;
   const fields = (fieldSets[item.data.kind] ?? []).filter(field => item.data.kind !== 'developer' ||
-    developerFieldVisible(field.key, text(item.data.subtype), item.data[field.key]));
+    developerFieldVisible(field.key, text(item.data.subtype), item.data[field.key]))
+    .filter(field => !authenticatorOnly || field.key !== 'password');
   const uris = (item.data.uris ?? []) as { uri: string }[];
   const history = (item.data.passwordHistory ?? []) as { password: string; changedAtMs: number }[];
   function checkOnline() {
@@ -50,10 +52,12 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove }: {
         : [{ label: '移入回收站', icon: Trash2, danger: true, onSelect: () => setTrashed(true) }]}><Ico of={MoreHorizontal} /></MenuButton>
     </div>
     <div className="identity"><span className="plate plate-l" data-kind={item.data.kind} aria-hidden="true">{plateText(item.title)}</span>
-      <div><h2>{item.title}</h2><p>{item.data.kind === 'developer' ? subtypeNames[text(item.data.subtype)] : kinds[item.data.kind]}{item.pinned && ' · 已置顶'}{item.requireReprompt && ' · 需要再次验证'}</p></div></div>
+      <div><h2>{item.title}</h2><p>{authenticatorOnly ? '两步验证码' : item.data.kind === 'developer' ? subtypeNames[text(item.data.subtype)] : kinds[item.data.kind]}{item.pinned && ' · 已置顶'}{item.requireReprompt && ' · 需要再次验证'}</p></div></div>
     {item.trashed && <div className="banner banner-warn">这条凭证在回收站里。恢复后可以继续使用。</div>}
     <div className="facts">{fields.map(field => <Fact key={field.key} label={field.label} value={text(item.data[field.key])} secret={field.secret} />)}</div>
-    {item.data.kind === 'login' && !item.trashed && !!item.data.totpUri && <TotpSection setupKey={text(item.data.totpUri)} />}
+    {item.data.kind === 'login' && !item.trashed && !!item.data.totpUri && (
+      text(item.data.totpUri).trim().startsWith('otpauth://hotp/')
+        ? <HotpSection item={item} updated={updated} /> : <TotpSection setupKey={text(item.data.totpUri)} />)}
     {uris.length > 0 && <section className="section"><h2>网站</h2><div className="facts">{uris.map((uri, i) => {
       const url = openableUrl(uri.uri);
       return <div className="fact" key={i}><div className="fact-text"><span className="fact-value">{uri.uri}</span></div>
@@ -65,7 +69,7 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove }: {
     {item.tags.length > 0 && <div className="tags">{item.tags.map((tag, i) => <span className="tag" key={i}>{tag}</span>)}</div>}
     {history.length > 0 && <details className="fold"><summary>密码历史 · {history.length} 条<Ico of={ChevronRight} /></summary>
       <div className="fold-body">{history.map((entry, i) => <Fact key={i} label={formatDateTime(entry.changedAtMs)} value={entry.password} secret />)}</div></details>}
-    {item.data.kind === 'login' && !item.trashed && <details className="fold"><summary>在线泄露检查<Ico of={ChevronRight} /></summary><div className="fold-body">
+    {item.data.kind === 'login' && !authenticatorOnly && !item.trashed && <details className="fold"><summary>在线泄露检查<Ico of={ChevronRight} /></summary><div className="fold-body">
       <p className="hint">可选操作。向 Have I Been Pwned 发送密码指纹的前 5 位，不发送密码原文，也不发送网站和账号。</p>
       <label className="check"><input type="checkbox" checked={onlineConfirmed} onChange={event => setOnlineConfirmed(event.target.checked)} />我同意本次联网查询</label>
       <button type="button" className="btn" disabled={ops.busy || !onlineConfirmed} onClick={checkOnline}><Ico of={ShieldCheck} />在线泄露检查</button>

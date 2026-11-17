@@ -1,11 +1,23 @@
 export type Proof = { method: 'master' | 'pin'; secret: string };
 export const MAX_VAULTPACK_BYTES = 16 * 1024 * 1024;
 export const MAX_BROWSER_CSV_BYTES = 2 * 1024 * 1024;
+export const MAX_ENTE_BYTES = 2 * 1024 * 1024;
+export const MAX_OTP_SETUP_LENGTH = 64 * 1024;
 export interface BackupReceipt { vaultId: string; changeCount: number }
 export interface BackupExport { bytes: number[]; receipt: BackupReceipt }
 export interface BrowserCsvPreview {
   stamp: string; ready: number; skipped: number; invalid: number; ignoredOtp: number;
   sample: { title: string; site: string; username: string }[];
+}
+export interface EnteMerge { row: number; id: string }
+export interface EntePreview {
+  stamp: string; ready: number; skipped: number; invalid: number; trashed: number;
+  sample: { title: string; account: string; kind: string }[];
+  suggestions: { row: number; id: string; title: string; account: string }[];
+}
+export interface OtpCode {
+  kind: 'totp' | 'hotp' | 'steam'; value: string; validTo: number | null;
+  nextValue: string | null; counter: string | null; nextSetupKey: string | null;
 }
 export function capacityErrorText(error: unknown): string | undefined {
   if (typeof error !== 'string') return;
@@ -34,6 +46,10 @@ export type VaultMessage =
   | { type: 'import'; bytes: number[]; password: string; proof: Proof }
   | { type: 'preview-browser-csv'; bytes: number[] }
   | { type: 'import-browser-csv'; bytes: number[]; stamp: string; proof: Proof }
+  | { type: 'preview-ente'; bytes: number[] }
+  | { type: 'import-ente'; bytes: number[]; stamp: string; merges: EnteMerge[]; proof: Proof }
+  | { type: 'export-ente'; proof: Proof; confirmPlaintext: boolean }
+  | { type: 'next-hotp'; id: string; proof?: Proof }
   | { type: 'register-prf'; credentialId: number[]; salt: number[]; output: number[]; proof: Proof }
   | { type: 'unlock-prf'; output: number[] }
   | { type: 'hibp'; id: string; proof?: Proof };
@@ -47,6 +63,7 @@ export interface ItemSummary {
   id: string; title: string; kind: string; subtitle: string;
   primaryDomain?: string | null; tags: string[]; pinned: boolean;
   requireReprompt: boolean; trashed: boolean; cardLast4?: string | null;
+  trashedAtMs?: number | null;
   cardBrand?: string | null; devSubtype?: string | null; hasTotp?: boolean; updatedAtMs?: number;
 }
 export interface VaultItem {
@@ -54,6 +71,7 @@ export interface VaultItem {
   note: string; customFields: { name: string; value: string; hidden: boolean }[];
   tags: string[]; pinned: boolean; requireReprompt: boolean; trashed: boolean; revision?: number;
   createdAtMs?: number; updatedAtMs?: number;
+  trashedAtMs?: number;
 }
 export type Reply<T = unknown> = { ok: true; value: T } | { ok: false; error: string };
 export async function request<T = unknown>(message: VaultMessage): Promise<T> {

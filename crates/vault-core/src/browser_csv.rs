@@ -30,6 +30,12 @@ pub(crate) fn plan(existing: &[VaultItem], csv: &str, now: u64) -> Result<(Vec<V
     let root = JVal::parse(csv)?;
     let rows = root.get_field("rows").and_then(JVal::as_array).ok_or_else(invalid_data)?;
     if rows.len() > 5000 { return Err(invalid_data()); }
+    // Prepared Ente records are selected and authorized by the trusted background.
+    if root.get_bool("prepared") {
+        let mut items = Vec::new();
+        for row in rows { items.push(VaultItem::from_json_value(row)?); }
+        return Ok((items, String::new()));
+    }
     let mut seen = Vec::new();
     for item in existing {
         if let CredentialData::Login(login) = &item.data {

@@ -11,7 +11,7 @@
 
 ---
 
-> **项目状态**：第一阶段本地密码库已实现，包含主密码 / 恢复码 / PIN / PRF 系统解锁、凭证管理与加密备份；Rust、后台集成与 Edge / Helium 自动流程已通过。实体 Windows Hello 与实际锁屏仍待人工验收。实现范围、测试结果与限制见 [第一轮开发与验收记录](./docs/phase-1-status.md)。下文其余全景功能为分阶段目标，尚未全部实现。
+> **项目状态（2026-11-17）**：第一阶段本地密码库已实现；第二阶段已有浏览器 CSV 导入、TOTP / HOTP / Steam Guard 和 Ente Auth 文本双向迁移与可选合并。Rust、后台集成与 Edge / Helium 自动回归已通过。网页自动填充、扫码、Bitwarden、WebDAV 和 Passkey 尚未实现；实体 Windows Hello、实际锁屏与原生侧栏仍待人工验收。实现范围、测试结果与限制见 [一期记录](./docs/phase-1-status.md) 与 [二期记录](./docs/phase-2-status.md)。下文全景功能为分阶段目标，尚未全部实现。
 
 ## 设计目标与安全红线
 

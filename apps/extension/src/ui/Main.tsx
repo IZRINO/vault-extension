@@ -200,6 +200,7 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
             emptyTrash={ids => void emptyTrash(ids)} backup={() => void go('settings', 'backup')} importCsv={() => void go('settings', 'csv')} />}
           {tab === 'vault' && screen.name === 'detail' && <ItemDetail key={screen.item.id} item={screen.item}
             back={() => setScreen({ name: 'list' })} edit={() => setScreen({ name: 'edit', item: screen.item, back: screen.item })}
+            updated={item => { setScreen({ name: 'detail', item }); void reload().catch(fail); }}
             setTrashed={trashed => void setTrashed(screen.item, trashed)} remove={() => void remove(screen.item)} />}
           {tab === 'vault' && screen.name === 'edit' && <ItemEditor key={screen.item.id || screen.item.data.kind + String(screen.item.data.subtype)} initial={screen.item}
             save={item => void save(item)} onDirty={value => { dirty.current = value; }}

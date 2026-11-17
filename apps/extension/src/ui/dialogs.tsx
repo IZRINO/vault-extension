@@ -13,12 +13,12 @@ export interface ConfirmOptions {
 
 export interface DialogApi {
   /** 请用户再输入一次主密码或 PIN；用户取消时以 Cancelled 拒绝。 */
-  proof(): Promise<Proof>;
+  proof(options?: { masterOnly?: boolean }): Promise<Proof>;
   confirm(options: ConfirmOptions): Promise<boolean>;
 }
 
 type Pending =
-  | { kind: 'proof'; resolve(proof: Proof): void; reject(error: Error): void }
+  | { kind: 'proof'; masterOnly?: boolean; resolve(proof: Proof): void; reject(error: Error): void }
   | { kind: 'confirm'; options: ConfirmOptions; resolve(value: boolean): void };
 
 const DialogContext = createContext<DialogApi | undefined>(undefined);
@@ -45,7 +45,7 @@ export function DialogHost({ pinEnabled, children }: { pinEnabled: boolean; chil
       setPending(next);
     };
     return {
-      proof: () => new Promise<Proof>((resolve, reject) => show({ kind: 'proof', resolve, reject })),
+      proof: options => new Promise<Proof>((resolve, reject) => show({ kind: 'proof', masterOnly: options?.masterOnly, resolve, reject })),
       confirm: options => new Promise<boolean>(resolve => show({ kind: 'confirm', options, resolve })),
     };
   }, []);
@@ -59,7 +59,7 @@ export function DialogHost({ pinEnabled, children }: { pinEnabled: boolean; chil
   };
   return <DialogContext.Provider value={api}>
     {children}
-    {pending?.kind === 'proof' && <ProofDialog pinEnabled={pinEnabled}
+    {pending?.kind === 'proof' && <ProofDialog pinEnabled={pinEnabled && !pending.masterOnly}
       onSubmit={proof => { finish(); pending.resolve(proof); }}
       onCancel={() => { finish(); pending.reject(new Cancelled('已取消验证。')); }} />}
     {pending?.kind === 'confirm' && <ConfirmDialog options={pending.options} onResult={value => { finish(); pending.resolve(value); }} />}

@@ -1,7 +1,8 @@
 import { loadVaultCore, randomBytes } from './vault-core';
 import { derive, offscreen } from './bridge';
 import * as store from './vault-storage';
-import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type ItemSummary, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
+import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type EntePreview, type ItemSummary, type OtpCode, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
+import { planEnteImport, type EnteBatch } from './ente-auth';
 
 export const LOCK_ALARM = 'vault-lock';
 export const CLIPBOARD_ALARM = 'vault-clipboard';
@@ -140,7 +141,7 @@ export class VaultController {
     if (summary.requireReprompt) await this.verify(proof, check);
   }
 
-  private async saveMutation(mutate: () => Mutation, check: () => void) {
+  private async saveMutation(mutate: () => Mutation, check: () => void, queueHotpChange = false) {
     let result: Mutation | undefined;
     try {
       check();
@@ -149,7 +150,7 @@ export class VaultController {
       if (!snap.length) return 0; // An explicit no-op has no new encrypted snapshot.
       const files = { ...this.files!, head: result.head_bytes, snap, updatedAtMs: Date.now(),
         changesSinceBackup: (this.files!.changesSinceBackup ?? 0) + result.count };
-      await store.saveVaultFiles(files);
+      await store.saveVaultFiles(files, queueHotpChange);
       this.files = files;
       check();
       return result.count;
@@ -239,7 +240,7 @@ export class VaultController {
         }
         const setupKey = item.data.totpUri;
         if (item.data.kind === 'login' && setupKey != null && setupKey !== previousTotp) {
-          if (typeof setupKey !== 'string' || setupKey.length > 4096) throw new Error('验证码设置密钥无效。');
+          if (typeof setupKey !== 'string' || setupKey.length > MAX_OTP_SETUP_LENGTH) throw new Error('验证码设置密钥无效。');
           await derive('validate-totp', [setupKey]);
         }
         return this.saveMutation(() => engine.upsert_item_json(message.itemJson, Date.now(), '本机'), check);
@@ -340,12 +341,66 @@ export class VaultController {
           const rows = await derive<string>('parse-browser-csv', [bytes]);
           check();
           if (message.type === 'preview-browser-csv') {
-            const preview = engine.browser_csv_json(rows, Date.now(), false);
+            const preview = engine.import_records_json(rows, Date.now(), false);
             try { return { ...JSON.parse(preview.item_json), stamp } as BrowserCsvPreview; }
             finally { preview.free(); }
           }
-          return this.saveMutation(() => engine.browser_csv_json(rows, Date.now(), true), check);
+          return this.saveMutation(() => engine.import_records_json(rows, Date.now(), true), check);
         } finally { bytes.fill(0); }
+      }
+      case 'next-hotp': {
+        await this.requireItemProof(message.id, message.proof, check);
+        const item = JSON.parse(engine.get_item_json(message.id, true)) as VaultItem;
+        if (item.trashed || item.data.kind !== 'login' || typeof item.data.totpUri !== 'string') throw new Error('这条凭证没有可用的计数验证码。');
+        const code = JSON.parse(await derive<string>('generate-hotp', [item.data.totpUri])) as OtpCode;
+        check();
+        if (code.kind !== 'hotp' || !code.nextSetupKey) throw new Error('这条凭证使用时间验证码，无需推进计数器。');
+        item.data.totpUri = code.nextSetupKey;
+        // The queue serializes callers; never expose a code before its counter is durable.
+        await this.saveMutation(() => engine.upsert_item_json(JSON.stringify(item), Date.now(), '本机'), check, true);
+        return { code: { ...code, nextSetupKey: null }, item: JSON.parse(engine.get_item_json(item.id, true)) as VaultItem };
+      }
+      case 'preview-ente':
+      case 'import-ente': {
+        if (!Array.isArray(message.bytes) || !message.bytes.length || message.bytes.length > MAX_ENTE_BYTES ||
+            !message.bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+          throw new Error('请选择不超过 2 MiB 的 Ente Auth 文本文件。');
+        }
+        const bytes = new Uint8Array(message.bytes);
+        try {
+          const stamp = (await Promise.all([digestHex(bytes), digestHex(new Uint8Array(this.files.snap))])).join(':');
+          check();
+          if (message.type === 'import-ente') {
+            if (message.stamp !== stamp) throw new Error('文件或密码库已变更，请重新预览再导入。');
+            await this.verify(message.proof, check);
+          }
+          const existing = (JSON.parse(engine.list_summaries_json()) as ItemSummary[])
+            .filter(item => item.kind === 'login').map(item => JSON.parse(engine.get_item_json(item.id, true)) as VaultItem);
+          const setups = existing.filter(item => typeof item.data.totpUri === 'string')
+            .map(item => ({ setupKey: item.data.totpUri, title: item.title, account: item.data.username }));
+          const batch = JSON.parse(await derive<string>('parse-ente', [bytes, JSON.stringify(setups)])) as EnteBatch;
+          check();
+          const plan = planEnteImport(batch, existing, message.type === 'import-ente' ? message.merges : []);
+          if (message.type === 'preview-ente') return { ...plan.preview, stamp } satisfies EntePreview;
+          return this.saveMutation(() => engine.import_records_json(JSON.stringify({ prepared: true, rows: plan.items }), Date.now(), true), check);
+        } finally { bytes.fill(0); }
+      }
+      case 'export-ente': {
+        if (message.confirmPlaintext !== true || message.proof?.method !== 'master') {
+          throw new Error('导出未加密验证码需要确认风险，并再次验证主密码。');
+        }
+        await this.verify(message.proof, check);
+        const items = (JSON.parse(engine.list_summaries_json()) as ItemSummary[])
+          .filter(item => item.kind === 'login' && item.hasTotp)
+          .map(summary => {
+            const item = JSON.parse(engine.get_item_json(summary.id, true)) as VaultItem;
+            return { title: item.title, data: { username: item.data.username, totpUri: item.data.totpUri },
+              note: item.note, tags: item.tags, pinned: item.pinned, trashed: item.trashed };
+          });
+        if (!items.length) throw new Error('密码库里还没有两步验证码。');
+        const text = await derive<string>('export-ente', [JSON.stringify(items)]);
+        check();
+        return text;
       }
       case 'hibp': {
         await this.requireItemProof(message.id, message.proof, check);

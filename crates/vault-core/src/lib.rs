@@ -554,7 +554,7 @@ impl WasmVaultEngine {
         })
     }
 
-    pub fn browser_csv_json(&mut self, rows: String, now_ms: f64, commit: bool) -> Result<WasmMutationResult, JsValue> {
+    pub fn import_records_json(&mut self, rows: String, now_ms: f64, commit: bool) -> Result<WasmMutationResult, JsValue> {
         let rows = Zeroizing::new(rows);
         let (items, item_json) = browser_csv::plan(&self.inner.snapshot_ref()?.items, &rows, now_ms as u64)?;
         let (count, head_bytes, snap_bytes) = if commit && !items.is_empty() {
@@ -1182,6 +1182,17 @@ mod tests {
         let restored = import_vaultpack(&pack_bytes, b"BackupPass#99").unwrap();
         assert_eq!(restored.items.len(), 1);
         assert_eq!(restored.items[0].title, "Pack Secret");
+    }
+
+    #[test]
+    fn password_audit_excludes_standalone_authenticator_entries() {
+        let otp = VaultItem::from_json_str(r#"{"id":"otp","title":"Authenticator","data":{"kind":"login","password":"","totpUri":"JBSWY3DPEHPK3PXP"}}"#).unwrap();
+        let missing = VaultItem::from_json_str(r#"{"id":"missing","title":"Missing password","data":{"kind":"login","password":""}}"#).unwrap();
+        let weak = VaultItem::from_json_str(r#"{"id":"weak","title":"Login","data":{"kind":"login","password":"123456","totpUri":"JBSWY3DPEHPK3PXP"}}"#).unwrap();
+        let report = crate::audit::audit_vault_items(&[otp, missing, weak]);
+        assert_eq!(report.total_login_items, 2);
+        assert_eq!(report.weak_items.len(), 2);
+        assert!(report.weak_items.iter().all(|finding| finding.item_id != "otp"));
     }
 
     #[test]

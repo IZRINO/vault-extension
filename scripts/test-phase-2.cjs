@@ -41,6 +41,8 @@ async function verify(name) {
     context.on('response', response => {
       if (response.status() >= 400 && response.url().startsWith(`chrome-extension://${id}/`)) errors.push(response.url() + ': ' + response.status());
     });
+    const wasmRequests = [];
+    context.on('request', request => { if (request.url().includes('.wasm')) wasmRequests.push(request.url()); });
     await page.addInitScript(() => {
       const fetchResource = globalThis.fetch.bind(globalThis);
       globalThis.vaultOtpLoaded = false;
@@ -70,6 +72,7 @@ async function verify(name) {
       return reply.value;
     }, message);
     await send({ type: 'create', masterPassword: password, calibrate: false });
+    assert(!wasmRequests.some(url => url.includes('vault_importers')), 'Unlock must not load the optional importer');
     await send({ type: 'upsert', itemJson: JSON.stringify({
       title: 'Existing login', data: { kind: 'login', username: 'old', password: 'Existing-Test-Secret', uris: [{ uri: 'https://existing.example' }] },
     }) });
@@ -127,11 +130,14 @@ async function verify(name) {
     await screenshot(page, name, 'totp');
     await page.getByRole('button', { name: '复制验证码', exact: true }).click();
     await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe('359152');
+    await page.clock.setFixedTime(new Date());
+    await verifyEnte(page, send, name);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpLoadedAfterProof: true, totpRotationCopyAndReprompt: true, errors }));
+    console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpLoadedAfterProof: true,
+      totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, steamAndHotp: true, errors }));
   } finally {
     try { await context?.close(); }
     finally {
@@ -140,6 +146,140 @@ async function verify(name) {
       await fs.rm(resolved, { recursive: true, maxRetries: 3, retryDelay: 200 });
     }
   }
+}
+
+async function verifyEnte(page, send, name) {
+  const proof = { method: 'master', secret: password };
+  await send({ type: 'upsert', itemJson: JSON.stringify({
+    title: 'GitHub login', data: { kind: 'login', username: 'tester', password: 'Keep-Original-GitHub-Password', uris: [{ uri: 'https://github.com/login' }] },
+    requireReprompt: true, note: 'Original note', tags: ['existing'],
+  }) });
+  const before = await send({ type: 'list' });
+  const github = before.find(item => item.title === 'GitHub login');
+  const uri = (kind, label, issuer, extra = '') =>
+    `otpauth://${kind}/${label}?secret=${setupKey}&issuer=${issuer}${extra}`;
+  const githubUri = uri('totp', 'GitHub%3Atester', 'GitHub', '&codeDisplay=' + encodeURIComponent(JSON.stringify({
+    pinned: true, tags: ['work'], note: 'Imported note', iconID: 'custom-icon', position: 7,
+  })));
+  const content = [
+    githubUri,
+    uri('totp', 'Acme%3Auser#123', 'Acmeperiod=60', '&algorithm=Algorithm.sha256'),
+    uri('steam', 'Steam%3Atester', 'Steam', '&digits=5'),
+    uri('hotp', 'Counter%3Atester', 'Counter', '&counter=0'),
+    uri('totp', 'Archived%3Aold', 'Archived', '&codeDisplay=' + encodeURIComponent(JSON.stringify({ trashed: true, note: 'Archived note', tags: ['archive'] }))),
+    githubUri,
+    'invalid-record',
+  ].join('\n');
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: /^Ente Auth 验证器迁移/ }).click();
+  await page.getByLabel('Ente Auth 文本文件').setInputFiles({ name: 'ente-auth-export.txt', mimeType: 'text/plain', buffer: Buffer.from(content) });
+  await page.getByRole('button', { name: '预览验证码', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '可导入 5 个验证码' })).toBeVisible();
+  await expect(page.getByText(/重复跳过 1 个，无法读取 1 个/)).toBeVisible();
+  await expect(page.getByText(/1 个会保留在回收站/)).toBeVisible();
+  assert(!(await page.locator('body').innerText()).includes(setupKey), 'Preview must not reveal the seed');
+  assert.equal((await send({ type: 'list' })).length, before.length);
+  const merge = page.getByRole('checkbox', { name: 'GitHub login · tester' });
+  await expect(merge).not.toBeChecked();
+  await merge.check();
+  await screenshot(page, name, 'ente-preview');
+  await page.getByRole('button', { name: '确认导入 5 个', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  assert.equal((await send({ type: 'list' })).length, before.length);
+  await page.getByRole('button', { name: '确认导入 5 个', exact: true }).click();
+  await enterProof(page);
+  await expect(page.getByText('已导入 5 个验证码。')).toBeVisible();
+  const merged = await send({ type: 'get', id: github.id, proof });
+  assert.equal(merged.data.password, 'Keep-Original-GitHub-Password');
+  assert.equal(merged.requireReprompt, true);
+  assert.equal(merged.note, 'Original note\n\nImported note');
+  assert.deepEqual(merged.tags, ['existing', 'work']);
+  const all = await send({ type: 'list' });
+  assert.equal(all.length, before.length + 4);
+  assert(all.find(item => item.title === 'Archived').trashed);
+  const audit = await send({ type: 'audit' });
+  for (const title of ['Acme', 'Steam', 'Counter']) {
+    assert(!audit.weakItems.some(item => item.title === title), 'A standalone OTP is not a weak password');
+  }
+
+  await page.getByRole('button', { name: '密码库', exact: true }).click();
+  await page.getByText('Counter', { exact: true }).click();
+  await expect(page.locator('output[aria-label="当前验证码"]')).toHaveCount(0);
+  await page.getByRole('button', { name: '生成验证码', exact: true }).click();
+  await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText('755224');
+  await page.getByRole('button', { name: '生成下一个验证码', exact: true }).click();
+  await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText('287082');
+  assert(await page.evaluate(() => new Promise((resolve, reject) => {
+    const open = indexedDB.open('vault-extension');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction(['vault', 'pendingChanges']);
+      const current = tx.objectStore('vault').get('active');
+      const pending = tx.objectStore('pendingChanges').get('hotp-snapshot');
+      tx.oncomplete = () => {
+        const same = pending.result instanceof Uint8Array && pending.result.length === current.result.snap.length &&
+          pending.result.every((byte, index) => byte === current.result.snap[index]);
+        db.close(); resolve(same);
+      };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  })), 'HOTP counter and its encrypted pending change must commit together');
+  const changes = (await send({ type: 'status' })).changesSinceBackup;
+  await page.getByRole('button', { name: '复制验证码', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe('287082');
+  assert.equal((await send({ type: 'status' })).changesSinceBackup, changes);
+  await screenshot(page, name, 'hotp');
+  await page.getByRole('button', { name: '编辑', exact: true }).click();
+  await page.getByLabel('备注', { exact: true }).fill('Edited after generating');
+  await page.getByRole('button', { name: '保存凭证', exact: true }).click();
+  await expect(page.getByText('凭证已保存。')).toBeVisible();
+  const counter = all.find(item => item.title === 'Counter');
+  assert((await send({ type: 'get', id: counter.id })).data.totpUri.includes('counter=2'));
+
+  await page.getByText('Steam', { exact: true }).click();
+  await expect(page.getByText('两步验证码', { exact: true })).toHaveCount(2);
+  await expect(page.getByText('密码', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('在线泄露检查', { exact: true })).toHaveCount(0);
+  await page.clock.setFixedTime(new Date(59_000));
+  await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText('PV9M4');
+  await expect(page.locator('output[aria-label="下一期验证码"]')).toBeVisible();
+  await screenshot(page, name, 'steam-next-code');
+  await page.clock.setFixedTime(new Date());
+
+  await send({ type: 'create-pin', pin: '734928', proof });
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: /^Ente Auth 验证器迁移/ }).click();
+  await page.getByRole('button', { name: '导出验证码', exact: true }).click();
+  const exportButton = page.getByRole('button', { name: '导出 Ente Auth 文本', exact: true });
+  await expect(exportButton).toBeDisabled();
+  await page.getByRole('checkbox', { name: /我理解文件未加密/ }).check();
+  await exportButton.click();
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  await exportButton.click();
+  await page.getByRole('dialog').getByRole('button', { name: '验证主密码并导出', exact: true }).click();
+  await expect(page.getByRole('dialog').getByLabel('主密码', { exact: true })).toBeVisible();
+  await expect(page.getByRole('dialog').getByLabel('验证方式')).toHaveCount(0);
+  const downloaded = page.waitForEvent('download');
+  await enterProof(page);
+  const download = await downloaded;
+  assert.match(download.suggestedFilename(), /^Vault-Ente-Auth-.*\.txt$/);
+  const stream = await download.createReadStream();
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  const exported = Buffer.concat(chunks).toString('utf8');
+  assert(exported.includes('counter=2'));
+  assert(!exported.includes('Keep-Original-GitHub-Password'), 'OTP export must not include login passwords');
+  const entries = exported.trim().split('\n').map(line => new URL(line));
+  assert.equal(entries.length, 6);
+  const exportedGithub = entries.find(entry => entry.searchParams.get('issuer') === 'GitHub');
+  const display = JSON.parse(exportedGithub.searchParams.get('codeDisplay'));
+  assert.equal(display.iconID, 'custom-icon');
+  assert.equal(display.note, 'Original note\n\nImported note');
+  assert.deepEqual(display.tags, ['existing', 'work']);
+  assert(JSON.parse(entries.find(entry => entry.searchParams.get('issuer') === 'Archived').searchParams.get('codeDisplay')).trashed);
+  await expect(page.getByText(/已请求下载验证码文本/)).toBeVisible();
+  await screenshot(page, name, 'ente-export');
 }
 
 async function enterProof(page) {

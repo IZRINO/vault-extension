@@ -37,7 +37,8 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
         // Keep optional WASM out of the unlock path, including when WXT inlines worker assets.
         const operation = message.payload.operation;
         const entry = operation === 'parse-browser-csv' ? '/csv-worker.js'
-          : operation === 'validate-totp' ? '/otp-worker.js' : '/kdf-worker.js';
+          : operation === 'parse-ente' || operation === 'export-ente' ? '/ente-worker.js'
+          : operation === 'validate-totp' || operation === 'generate-hotp' ? '/otp-worker.js' : '/kdf-worker.js';
         const worker = new Worker(browser.runtime.getURL(entry));
         const timer = setTimeout(() => { worker.terminate(); reject(new Error('后台任务超时，请重试。')); }, 120000);
         const finish = () => { clearTimeout(timer); worker.terminate(); };
