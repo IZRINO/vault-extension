@@ -1,0 +1,12 @@
+body { height: 100%; overflow: auto; background: var(--panel); }
+.inline-shell { min-height: 100%; }
+.inline-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--door); color: var(--on-door); }
+.inline-close { padding: 4px 8px; border: 1px solid var(--door-edge); border-radius: var(--r-s); color: inherit; background: transparent; }
+.inline-body { display: grid; gap: 12px; padding: 14px; }
+.inline-body h1 { font-size: var(--t-l); }
+.inline-body .banner { overflow-wrap: anywhere; }
+.inline-choices { display: grid; gap: 1px; background: var(--line); }
+.inline-choice { display: grid; gap: 4px; width: 100%; padding: 12px; border: 0; text-align: left; background: var(--panel); overflow-wrap: anywhere; }
+.inline-choice span { color: var(--ink-2); font-size: var(--t-s); }
+.inline-choice:hover { background: var(--well); }
+.inline-choice:disabled { opacity: .6; }

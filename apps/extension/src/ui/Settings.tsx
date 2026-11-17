@@ -8,9 +8,12 @@ import { download } from './lib';
 import { useOps } from './Main';
 import BrowserCsv from './BrowserCsv';
 import EnteAuth from './EnteAuth';
+import { AreaField } from './components';
+import type { AutofillSettings } from '../autofill-policy';
+import Migration from './Migration';
 
-export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'ente' | 'browser';
-const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置' };
+export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'ente' | 'browser' | 'domains' | 'bitwarden' | 'mapped-csv';
+const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置', domains: '关联域名', bitwarden: 'Bitwarden 密码库迁移', 'mapped-csv': 'CSV 字段映射与导出' };
 export default function Settings({ status, page, setPage, refresh }: {
   status: VaultStatus; page: SettingsPage; setPage(page: SettingsPage): void; refresh(): Promise<void>;
 }) {
@@ -23,6 +26,9 @@ export default function Settings({ status, page, setPage, refresh }: {
           ['backup', HardDrive, '备份与恢复', '保存加密备份，或从备份恢复凭证'],
           ['csv', FileUp, '导入浏览器密码', '预览浏览器导出的 CSV，不覆盖已有凭证'],
           ['ente', ArrowRightLeft, 'Ente Auth 验证器迁移', '导入或导出验证码，可合并到已有登录项'],
+          ['bitwarden', ArrowRightLeft, 'Bitwarden 密码库迁移', '支持明文或密码保护的 JSON 导入与导出'],
+          ['mapped-csv', FileUp, 'CSV 字段映射与导出', '选择对应列导入，或导出登录凭证'],
+          ['domains', Globe, '关联域名', '允许指定网站共用登录凭证'],
           ['browser', Globe, '浏览器设置', '管理浏览器原生的保存密码提示'],
         ] as const).map(([id, icon, label, hint]) => <button type="button" className="nav-row" key={id} onClick={() => setPage(id)}>
           <Ico of={icon} /><span className="grow"><strong>{label}</strong><small>{hint}</small></span><Ico of={ChevronRight} /></button>)}
@@ -33,8 +39,30 @@ export default function Settings({ status, page, setPage, refresh }: {
     {page === 'backup' && <Backup refresh={refresh} />}
     {page === 'csv' && <BrowserCsv refresh={refresh} />}
     {page === 'ente' && <EnteAuth refresh={refresh} />}
+    {page === 'bitwarden' && <Migration key="bitwarden" format="bitwarden" refresh={refresh} />}
+    {page === 'mapped-csv' && <Migration key="csv" format="csv" refresh={refresh} />}
+    {page === 'domains' && <EquivalentDomains />}
     {page === 'browser' && <BrowserSettings />}
   </div>;
+}
+
+function EquivalentDomains() {
+  const { busy, work, notify, fail } = useOps();
+  const [value, setValue] = useState('');
+  useEffect(() => {
+    void request<AutofillSettings>({ type: 'autofill-settings' }).then(settings =>
+      setValue(settings.equivalentDomains.map((group: string[]) => group.join(', ')).join('\n'))).catch(fail);
+  }, [fail]);
+  return <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
+    const groups = value.split(/\r?\n/).map(line => line.trim()).filter(Boolean).map(line => line.split(/[,，\s]+/));
+    await request({ type: 'set-equivalent-domains', groups }); notify('关联域名已保存。');
+  }); }}>
+    <p className="lede">同一账号体系的不同主域名可以共用凭证。每行一组，域名之间用逗号分隔。</p>
+    <p className="banner banner-warn">只添加你信任的域名。设置后，这些网站会显示同组网站的登录凭证。</p>
+    <AreaField label="自定义关联域名" value={value} onChange={setValue} rows={6} placeholder="example.com, example.net" />
+    <p className="hint">已内置 Microsoft、Google 和阿里账号体系。公共后缀、内网地址与端口不会加入关联组。</p>
+    <button className="btn btn-primary" disabled={busy}>保存关联域名</button>
+  </form>;
 }
 
 function Security({ status, refresh }: { status: VaultStatus; refresh(): Promise<void> }) {

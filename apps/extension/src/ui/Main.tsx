@@ -11,6 +11,7 @@ import ItemEditor from './ItemEditor';
 import Generator from './Generator';
 import Audit from './Audit';
 import Settings, { type SettingsPage } from './Settings';
+import SiteSettings from './SiteSettings';
 
 export interface Ops {
   busy: boolean;
@@ -194,6 +195,7 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
         {busy && <div className="busy-bar" />}
         {error && <div className="stage-alert"><ErrorBanner text={error} onClose={() => setError('')} /></div>}
         <main className="content" ref={content}>
+          {tab === 'vault' && screen.name === 'list' && <SiteSettings />}
           {tab === 'vault' && screen.name === 'list' && <VaultList items={items} query={query} filter={filter} changesSinceBackup={status.changesSinceBackup}
             setFilter={setFilter} clearQuery={() => setQuery('')} open={summary => void open(summary)} quickCopy={quickCopy}
             create={() => create('login')} restore={item => void setTrashed(item, false)} remove={item => void remove(item)}

@@ -1,0 +1,17 @@
+[package]
+name = "vault-preferences"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+zeroize.workspace = true
+vault-core = { path = "../vault-core" }
+hkdf = "0.12"
+sha2 = "0.10"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--converge", "--strip-debug", "--strip-producers", "--enable-bulk-memory", "--enable-sign-ext", "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-reference-types", "--enable-multivalue"]

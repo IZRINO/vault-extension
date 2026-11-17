@@ -3,6 +3,8 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 mod ente_auth;
+mod bitwarden;
+mod migration_csv;
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 5001; // header + 5,000 data records

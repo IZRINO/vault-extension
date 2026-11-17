@@ -38,7 +38,7 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove, updat
       return ops.work(async () => {
         const proof = item.requireReprompt ? await dialogs.proof() : undefined;
         try {
-          const count = await request<number>({ type: 'hibp', id: item.id, proof });
+          const count = await request<number>({ type: 'hibp', id: item.id, confirmOnline: onlineConfirmed, proof });
           setOnlineNotice(count ? `这个密码出现在泄露数据中 ${count} 次，请尽快更换。` : '本次查询未发现泄露记录，仍建议每个网站使用不同密码。');
         } finally { if (proof) proof.secret = ''; }
       });

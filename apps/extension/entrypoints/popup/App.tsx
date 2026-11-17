@@ -157,7 +157,7 @@ function Unlocked({ status, refresh }: { status: VaultStatus; refresh(): Promise
             <button disabled={busy} onClick={() => void work(async () => { await request({ type: 'trash', id: item.id, trashed: !item.trashed }); await reload(); })}>{item.trashed ? '恢复' : '移入回收站'}</button>
             {!item.trashed && item.kind === 'login' && <button disabled={busy} onClick={() => {
               if (!confirm('可选在线检查：仅发送密码 SHA-1 的前 5 位到 Have I Been Pwned，是否继续？')) return;
-              void browser.permissions.request({ origins: ['https://api.pwnedpasswords.com/*'] }).then(granted => { if (granted) return work(async () => { const count = await request<number>({ type: 'hibp', id: item.id, proof: item.requireReprompt ? await proof() : undefined }); setNotice(count ? '该密码出现在泄露数据中 ' + count + ' 次，请更换。' : '未在本次查询中发现此密码。'); }); }).catch(fail);
+              void browser.permissions.request({ origins: ['https://api.pwnedpasswords.com/*'] }).then(granted => { if (granted) return work(async () => { const count = await request<number>({ type: 'hibp', id: item.id, confirmOnline: true, proof: item.requireReprompt ? await proof() : undefined }); setNotice(count ? '该密码出现在泄露数据中 ' + count + ' 次，请更换。' : '未在本次查询中发现此密码。'); }); }).catch(fail);
             }}>在线泄露检查</button>}
             {item.trashed && <button className="danger" disabled={busy} onClick={() => { if (confirm('永久删除“' + item.title + '”？此操作无法撤销。')) void work(async () => { await request({ type: 'delete', id: item.id }); await reload(); }); }}>永久删除</button>}
           </div></details>

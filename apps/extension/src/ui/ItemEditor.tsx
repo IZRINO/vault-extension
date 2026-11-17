@@ -57,6 +57,7 @@ export default function ItemEditor({ initial, save, close, onDirty }: {
             hint="粘贴网站提供的 Base32 密钥或 otpauth:// 链接，支持 TOTP、HOTP 和 Steam。HOTP 链接需含 counter 计数器；清空可移除设置。"
             onChange={value => update('totpUri', value || null)} />
           <p className="hint">请保留网站提供的恢复码。把密码和验证码放在同一个库里时，别人解锁密码库就能同时取到两者。</p>
+          <ScanOtp onChange={value => update('totpUri', value)} />
         </div>
       </details>
     </>}
@@ -86,3 +87,4 @@ export default function ItemEditor({ initial, save, close, onDirty }: {
       <button className="btn btn-primary" disabled={busy}>{busy ? '正在保存…' : '保存凭证'}</button></div>
   </form>;
 }
+import ScanOtp from './ScanOtp';

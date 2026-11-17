@@ -3,6 +3,10 @@ import { derive, offscreen } from './bridge';
 import * as store from './vault-storage';
 import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type EntePreview, type ItemSummary, type OtpCode, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
 import { planEnteImport, type EnteBatch } from './ente-auth';
+import { uriMatches, validateGroups, webUrl, type AutofillSettings } from './autofill-policy';
+import type { FillCandidate, FillKind, FillPayload } from './autofill-messages';
+import { planMigration, type MigrationBatch } from './migration';
+import { MAX_MIGRATION_BYTES, type MigrationExport } from './vault-messages';
 
 export const LOCK_ALARM = 'vault-lock';
 export const CLIPBOARD_ALARM = 'vault-clipboard';
@@ -25,6 +29,8 @@ export class VaultController {
   private settings?: store.LocalSettings;
   private tail: Promise<unknown> = Promise.resolve();
   private generation = 0;
+  private lastCaptureMs = -Infinity;
+  private autofill?: AutofillSettings;
 
   handle(message: VaultMessage): Promise<unknown> {
     if (message.type === 'lock') return this.lock();
@@ -48,6 +54,7 @@ export class VaultController {
     this.session?.key.fill(0);
     this.session?.wrap.fill(0);
     this.session = undefined;
+    this.autofill = undefined;
     await store.clearSessionState();
     await browser.alarms.clear(LOCK_ALARM);
     void browser.runtime.sendMessage({ target: 'vault-event', type: 'locked' }).catch(() => undefined);
@@ -172,6 +179,10 @@ export class VaultController {
     const engine = this.engine!;
     const settings = this.settings!;
     if (message.type === 'status') return this.status();
+    if (message.type === 'autofill-settings') {
+      if (!engine.is_unlocked() || !this.session) return { sites: {}, equivalentDomains: [] };
+      return this.readAutofillSettings(check);
+    }
     if (message.type === 'strength') return JSON.parse(core.wasm_evaluate_password_strength(message.password, JSON.stringify(message.hints)));
     if (message.type === 'create') {
       if (this.files) throw new Error('本机已有密码库，不能覆盖。');
@@ -224,6 +235,171 @@ export class VaultController {
     check();
     const session = this.session;
     switch (message.type) {
+      case 'csv-headers':
+      case 'preview-migration':
+      case 'import-migration': {
+        const isCsv = message.type === 'csv-headers' || message.format === 'csv';
+        const limit = isCsv ? MAX_BROWSER_CSV_BYTES : MAX_MIGRATION_BYTES;
+        if (!Array.isArray(message.bytes) || !message.bytes.length || message.bytes.length > limit ||
+          !message.bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) throw new Error(isCsv ? '请选择不超过 2 MiB 的 UTF-8 CSV 文件。' : '请选择不超过 16 MiB 的 Bitwarden JSON 文件。');
+        const bytes = new Uint8Array(message.bytes);
+        try {
+          if (message.type === 'csv-headers') return JSON.parse(await derive<string>('csv-headers', [bytes]));
+          if (!['csv', 'bitwarden'].includes(message.format)) throw new Error('不支持的迁移格式。');
+          if (message.password != null && (typeof message.password !== 'string' || message.password.length > 4096)) throw new Error('文件密码过长。');
+          const mapping = JSON.stringify(message.mapping ?? {});
+          const options = new TextEncoder().encode(message.format + ':' + mapping);
+          const stamp = (await Promise.all([digestHex(bytes), digestHex(new Uint8Array(this.files.snap)), digestHex(options)])).join(':');
+          check();
+          if (message.type === 'import-migration') {
+            if (message.stamp !== stamp) throw new Error('文件、字段映射或密码库已变更，请重新预览。');
+            await this.verify(message.proof, check);
+          }
+          const batch = JSON.parse(await derive<string>(isCsv ? 'parse-mapped-csv' : 'parse-bitwarden', [bytes, isCsv ? mapping : message.password ?? ''])) as MigrationBatch;
+          check();
+          if (isCsv) {
+            batch.rows = batch.rows.filter(item => {
+              try {
+                const uri = (item.data.uris as { uri: string }[])[0]!.uri;
+                webUrl(uri); return true;
+              } catch { batch.invalid++; return false; }
+            });
+          }
+          const existing = (JSON.parse(engine.list_summaries_json()) as ItemSummary[]).map(row => JSON.parse(engine.get_item_json(row.id, true)) as VaultItem);
+          const plan = planMigration(batch, existing);
+          if (message.type === 'preview-migration') return { ...plan.preview, stamp };
+          return this.saveMutation(() => engine.import_records_json(JSON.stringify({ prepared: true, rows: plan.items }), Date.now(), true), check);
+        } finally { bytes.fill(0); }
+      }
+      case 'export-migration': {
+        if (!['csv', 'bitwarden'].includes(message.format) || message.proof?.method !== 'master') throw new Error('迁移导出需要再次验证主密码。');
+        if (message.encrypted && message.format !== 'bitwarden') throw new Error('CSV 不支持加密，请选择 Bitwarden JSON。');
+        if (!message.encrypted && message.confirmPlaintext !== true) throw new Error('请先确认明文文件的风险。');
+        if (message.encrypted) this.validatePassword(message.password ?? '');
+        await this.verify(message.proof, check);
+        const items = (JSON.parse(engine.list_summaries_json()) as ItemSummary[]).map(row => JSON.parse(engine.get_item_json(row.id, true)) as VaultItem);
+        const json = JSON.stringify(items);
+        if (message.format === 'csv') {
+          const result = JSON.parse(await derive<string>('export-login-csv', [json])) as MigrationExport;
+          check();
+          return result;
+        }
+        const entropy = randomBytes(64);
+        try {
+          const text = await derive<string>('export-bitwarden', [json, message.encrypted ? message.password! : '', entropy]);
+          check();
+          return { text, count: items.length, skipped: 0 } satisfies MigrationExport;
+        } finally { entropy.fill(0); }
+      }
+      case 'scan-otp': {
+        const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+        if (tab?.id == null || !tab.url) throw new Error('请先打开显示二维码的网站。');
+        webUrl(tab.url);
+        const wait = 600 - (performance.now() - this.lastCaptureMs);
+        if (wait > 0) { await new Promise(resolve => setTimeout(resolve, wait)); check(); }
+        const current = await browser.tabs.get(tab.id);
+        if (!current.active || current.url !== tab.url) throw new Error('网页已改变，请重新扫描。');
+        const values = await offscreen<string[]>('scan-otp', async () => {
+          check();
+          const active = await browser.tabs.get(tab.id!);
+          if (!active.active || active.url !== tab.url) throw new Error('网页已改变，请重新扫描。');
+          this.lastCaptureMs = performance.now();
+          try { return await browser.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 95 }); }
+          catch (error) {
+            if (/activeTab|all_urls|permission/i.test(error instanceof Error ? error.message : String(error))) {
+              throw new Error('截图尚未授权。请先点击浏览器工具栏的 Vault 图标，再扫描当前网站的二维码。');
+            }
+            throw new Error('浏览器暂时无法截图，请稍后重试。');
+          }
+        });
+        check();
+        const after = await browser.tabs.get(tab.id);
+        if (!after.active || after.url !== tab.url) throw new Error('网页已改变，请重新扫描。');
+        if (!values.length) throw new Error('没有找到验证码二维码。请把完整二维码显示在当前页面，或手动粘贴密钥。');
+        return values;
+      }
+      case 'set-equivalent-domains': {
+        const groups = validateGroups(message.groups);
+        const settings = await this.readAutofillSettings(check);
+        await this.saveAutofillSettings({ ...settings, equivalentDomains: groups }, check);
+        return null;
+      }
+      case 'set-autofill-site': {
+        const origin = webUrl(message.origin).origin;
+        const settings = await this.readAutofillSettings(check);
+        settings.sites[origin] = message.flags;
+        await this.saveAutofillSettings(settings, check);
+        return null;
+      }
+      case 'autofill-current': {
+        const url = webUrl(message.url);
+        return (JSON.parse(engine.list_summaries_json()) as ItemSummary[])
+          .filter(item => item.kind === 'login' && !item.trashed).some(summary => {
+            const item = JSON.parse(engine.get_item_json(summary.id, true)) as VaultItem;
+            return item.data.username === message.username && item.data.password === message.password && this.autofillMatches(item, 'login', url, message.groups);
+          });
+      }
+      case 'autofill-candidates': {
+        const url = webUrl(message.url);
+        const results: FillCandidate[] = [];
+        for (const summary of JSON.parse(engine.list_summaries_json()) as ItemSummary[]) {
+          if (summary.trashed || !this.autofillKind(summary.kind, message.kind)) continue;
+          const item = JSON.parse(engine.get_item_json(summary.id, true)) as VaultItem;
+          if (!this.autofillMatches(item, message.kind, url, message.groups)) continue;
+          results.push({ id: item.id, title: item.title, account: item.data.kind === 'login' ? String(item.data.username ?? '') : summary.subtitle,
+            requireReprompt: item.requireReprompt, otpKind: typeof item.data.totpUri === 'string'
+              ? item.data.totpUri.startsWith('otpauth://hotp/') ? 'hotp' : 'totp' : undefined });
+          if (results.length >= 30) break;
+        }
+        return results;
+      }
+      case 'autofill-read': {
+        await this.requireItemProof(message.id, message.proof, check);
+        const item = JSON.parse(engine.get_item_json(message.id, true)) as VaultItem;
+        if (!this.autofillMatches(item, message.kind, webUrl(message.url), message.groups)) throw new Error('凭证不匹配当前网页。');
+        const text = (key: string) => typeof item.data[key] === 'string' ? item.data[key] as string : '';
+        let values: Record<string, string>;
+        if (message.kind === 'otp') {
+          const code = JSON.parse(await derive<string>('generate-otp', [text('totpUri'), Math.floor(Date.now() / 1000)])) as OtpCode;
+          check();
+          if (code.kind === 'hotp') {
+            if (!code.nextSetupKey) throw new Error('计数验证码设置无效。');
+            item.data.totpUri = code.nextSetupKey;
+            await this.saveMutation(() => engine.upsert_item_json(JSON.stringify(item), Date.now(), '本机'), check, true);
+          }
+          values = { otp: code.validTo != null && code.validTo - Math.floor(Date.now() / 1000) < 2 && code.nextValue ? code.nextValue : code.value };
+        } else if (message.kind === 'card') {
+          values = { 'cc-name': text('cardholderName'), 'cc-number': text('cardNumber'), 'cc-csc': text('cvv'),
+            'cc-exp-month': text('expMonth'), 'cc-exp-year': text('expYear'), 'cc-exp': `${text('expMonth')}/${text('expYear')}` };
+        } else if (message.kind === 'identity') {
+          values = { name: text('fullName'), 'given-name': text('fullName').split(' ')[0] ?? '', 'family-name': text('fullName').split(' ').slice(1).join(' '),
+            tel: text('phone'), email: text('email'), 'address-line1': text('addressLine'), 'street-address': text('addressLine'),
+            'address-level1': text('province'), 'address-level2': text('city'), 'postal-code': text('postalCode'), country: text('country'), organization: text('company') };
+        } else {
+          values = message.kind === 'username' ? { username: text('username') } : { username: text('username'), password: text('password') };
+        }
+        const requested = new Set(Array.isArray(message.fields) ? message.fields.filter(field => typeof field === 'string' && field.length <= 256).slice(0, 64) : []);
+        const reserved = new Set(['Bitwarden 保留字段', 'Bitwarden 未识别的验证码设置', 'CSV 未识别的验证码设置']);
+        const custom = Object.fromEntries(item.customFields.filter(field => !['username', 'otp'].includes(message.kind) && requested.has(field.name) && !reserved.has(field.name))
+          .map(field => [field.name, field.value]));
+        return { values, ...(Object.keys(custom).length ? { custom } : {}) } satisfies FillPayload;
+      }
+      case 'autofill-copy-otp': {
+        await this.requireItemProof(message.id, message.proof, check);
+        const item = JSON.parse(engine.get_item_json(message.id, true)) as VaultItem;
+        if (!this.autofillMatches(item, 'otp', webUrl(message.url), message.groups)) throw new Error('验证码不匹配此网页。');
+        const setup = String(item.data.totpUri);
+        if (setup.startsWith('otpauth://hotp/')) return null; // Login filling must never advance a HOTP counter.
+        const code = JSON.parse(await derive<string>('generate-otp', [setup, Math.floor(Date.now() / 1000)])) as OtpCode;
+        check();
+        if (code.kind === 'hotp') return null;
+        const value = code.validTo != null && code.validTo - Math.floor(Date.now() / 1000) < 2 && code.nextValue ? code.nextValue : code.value;
+        const hash = await offscreen<string>('copy', value);
+        check();
+        await browser.storage.session.set({ clipboard: { hash, expiresAt: Date.now() + 30000 } });
+        await browser.alarms.create(CLIPBOARD_ALARM, { when: Date.now() + 30000 });
+        return true;
+      }
       case 'list': return JSON.parse(engine.list_summaries_json());
       case 'get':
         await this.requireItemProof(message.id, message.proof, check);
@@ -403,6 +579,7 @@ export class VaultController {
         return text;
       }
       case 'hibp': {
+        if (message.confirmOnline !== true) throw new Error('请先同意本次联网查询。');
         await this.requireItemProof(message.id, message.proof, check);
         if (!await browser.permissions.contains({ origins: ['https://api.pwnedpasswords.com/*'] })) throw new Error('请先授权泄露检查。');
         const item = JSON.parse(engine.get_item_json(message.id, true)) as VaultItem;
@@ -418,6 +595,63 @@ export class VaultController {
       }
       default: throw new Error('不支持的操作。');
     }
+  }
+  private validateAutofillSettings(value: unknown): AutofillSettings {
+    if (!value || typeof value !== 'object') throw new Error('网站偏好格式无效。');
+    const settings = value as AutofillSettings;
+    if (!settings.sites || typeof settings.sites !== 'object' || Array.isArray(settings.sites) ||
+      Object.keys(settings.sites).length > 1000) throw new Error('网站偏好最多保存 1,000 个网站。');
+    for (const [origin, flags] of Object.entries(settings.sites)) {
+      if (webUrl(origin).origin !== origin || !flags || typeof flags !== 'object' || Object.keys(flags).length !== 3 ||
+        !['inlineDisabled', 'saveDisabled', 'passkeyDisabled'].every(key => typeof flags[key as keyof typeof flags] === 'boolean')) throw new Error('网站偏好格式无效。');
+    }
+    return { sites: structuredClone(settings.sites), equivalentDomains: validateGroups(settings.equivalentDomains) };
+  }
+  private async readAutofillSettings(check: () => void): Promise<AutofillSettings> {
+    if (this.autofill) return structuredClone(this.autofill);
+    const stored = await browser.storage.local.get<{
+      autofillSealed?: { vaultId: string; bytes: number[] }; autofill?: AutofillSettings;
+    }>(['autofillSealed', 'autofill']);
+    check();
+    if (stored.autofillSealed) {
+      const { vaultId, bytes } = stored.autofillSealed;
+      if (vaultId !== this.files!.vaultId || !Array.isArray(bytes) || bytes.length > 256 * 1024 + 1024 ||
+        !bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) throw new Error('网站偏好与当前密码库不一致或已损坏。');
+      const json = await derive<string>('open-preferences', [this.session!.key, this.session!.wrap, new Uint8Array(bytes)]);
+      check();
+      this.autofill = this.validateAutofillSettings(JSON.parse(json));
+      if (stored.autofill) {
+        await browser.storage.local.remove('autofill');
+        check();
+      }
+    } else if (stored.autofill) {
+      // Migrate preferences from development builds only after a successful encrypted write.
+      await this.saveAutofillSettings(this.validateAutofillSettings(stored.autofill), check);
+    } else {
+      this.autofill = { sites: {}, equivalentDomains: [] };
+    }
+    return structuredClone(this.autofill!);
+  }
+  private async saveAutofillSettings(settings: AutofillSettings, check: () => void) {
+    const valid = this.validateAutofillSettings(settings);
+    const json = JSON.stringify(valid);
+    if (new TextEncoder().encode(json).length > 256 * 1024) throw new Error('网站偏好超过 256 KiB。');
+    const bytes = await derive<number[]>('seal-preferences', [this.session!.key, this.session!.wrap, json]);
+    check();
+    await browser.storage.local.set({ autofillSealed: { vaultId: this.files!.vaultId, bytes } });
+    check();
+    this.autofill = valid;
+    await browser.storage.local.remove('autofill');
+    check();
+  }
+  private autofillKind(kind: string, fill: FillKind) {
+    return kind === (fill === 'card' ? 'payment_card' : fill === 'identity' ? 'identity' : 'login');
+  }
+  private autofillMatches(item: VaultItem, fill: FillKind, url: URL, groups: string[][]): boolean {
+    if (item.trashed || !this.autofillKind(item.data.kind, fill)) return false;
+    if (fill === 'card' || fill === 'identity') return true;
+    const uris = item.data.uris as { uri: string; matchRule?: string }[] | undefined;
+    return !!uris?.some(uri => uriMatches(uri, url, groups)) && (fill !== 'otp' || !!item.data.totpUri);
   }
   private validatePassword(password: string) {
     if (typeof password !== 'string' || password.length < 12 || password.length > 1024) throw new Error('密码需要 12–1024 个字符。');

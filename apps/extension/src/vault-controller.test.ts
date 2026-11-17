@@ -1,17 +1,19 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
-import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente_auth } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente_auth, wasm_parse_bitwarden, wasm_export_bitwarden, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv } from '../../../crates/vault-importers/pkg/vault_importers.js';
 import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
+import initPreferences, { wasm_open_preferences, wasm_seal_preferences } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
 import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
 import { VaultController } from './vault-controller';
+import { offscreen } from './bridge';
 import type { BackupExport, BrowserCsvPreview, EntePreview, OtpCode, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
 import type { LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
-  failSave: false, pendingHotp: undefined as Uint8Array | undefined }));
+  failSave: false, pendingHotp: undefined as Uint8Array | undefined, local: {} as Record<string, unknown> }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
   saveVaultFiles: async (files: VaultFiles, queueHotpChange = false) => {
@@ -28,18 +30,25 @@ vi.mock('./vault-storage', () => ({
 vi.mock('./vault-core', () => ({ loadVaultCore: async () => wasm, randomBytes: (length: number) => crypto.getRandomValues(new Uint8Array(length)) }));
 vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
-  derive: async (operation: keyof typeof wasm | 'parse-browser-csv' | 'validate-totp' | 'generate-hotp' | 'parse-ente' | 'export-ente', args: unknown[]) => {
+  derive: async (operation: string, args: unknown[]) => {
+    if (operation === 'seal-preferences') return Array.from(wasm_seal_preferences(args[0] as Uint8Array, args[1] as Uint8Array, args[2] as string));
+    if (operation === 'open-preferences') return wasm_open_preferences(args[0] as Uint8Array, args[1] as Uint8Array, args[2] as Uint8Array);
+    if (operation === 'parse-bitwarden') return wasm_parse_bitwarden(args[0] as Uint8Array, args[1] as string);
+    if (operation === 'export-bitwarden') return wasm_export_bitwarden(args[0] as string, args[1] as string, args[2] as Uint8Array);
+    if (operation === 'csv-headers') return wasm_csv_headers(args[0] as Uint8Array);
+    if (operation === 'parse-mapped-csv') return wasm_parse_mapped_csv(args[0] as Uint8Array, args[1] as string);
+    if (operation === 'export-login-csv') return wasm_export_login_csv(args[0] as string);
     if (operation === 'parse-browser-csv') return prepareBrowserCsv(wasm_parse_browser_csv(args[0] as Uint8Array));
     if (operation === 'parse-ente') return wasm_parse_ente_auth(args[0] as Uint8Array, args[1] as string);
     if (operation === 'export-ente') return wasm_export_ente_auth(args[0] as string);
-    if (operation === 'generate-hotp') return wasm_otp_at(args[0] as string, 0, 0);
+    if (operation === 'generate-hotp' || operation === 'generate-otp') return wasm_otp_at(args[0] as string, args[1] as number ?? 0, 0);
     if (operation === 'validate-totp') {
       try { wasm_validate_totp(args[0] as string); }
       catch (error) { throw new Error(String(error)); }
       return null;
     }
     if (state.pause && operation === 'wasm_unlock_head_with_password') await state.pause;
-    const result = (wasm[operation] as (...a: unknown[]) => unknown)(...args);
+    const result = (wasm[operation as keyof typeof wasm] as (...a: unknown[]) => unknown)(...args);
     if (result instanceof Uint8Array) return Array.from(result);
     if (result instanceof wasm.WasmInitVaultOutput) {
       const value = { head: Array.from(result.head_bytes), snap: Array.from(result.snap_bytes), wrap: Array.from(result.session_wrap_bytes),
@@ -65,6 +74,7 @@ beforeAll(async () => {
   await init({ module_or_path: await readFile(new URL('../../../crates/vault-core/pkg/vault_core_bg.wasm', import.meta.url)) });
   await initCsv({ module_or_path: await readFile(new URL('../../../crates/vault-importers/pkg/vault_importers_bg.wasm', import.meta.url)) });
   await initOtp({ module_or_path: await readFile(new URL('../../../crates/vault-otp/pkg/vault_otp_bg.wasm', import.meta.url)) });
+  await initPreferences({ module_or_path: await readFile(new URL('../../../crates/vault-preferences/pkg/vault_preferences_bg.wasm', import.meta.url)) });
   const output = wasm.wasm_create_new_vault(password, 32768, 2, 4, crypto.getRandomValues(new Uint8Array(32)), Date.now());
   fixture = { head: output.head_bytes, snap: output.snap_bytes, vaultId: output.vault_id, keyEpoch: Number(output.key_epoch), updatedAtMs: Date.now(), changesSinceBackup: 0 };
   recoveryCode = output.recovery_code;
@@ -74,12 +84,69 @@ beforeEach(() => {
   state.files = structuredClone(fixture); state.session = undefined; state.pause = undefined;
   state.failSave = false;
   state.pendingHotp = undefined;
+  state.local = {};
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
-    storage: { session: { get: async () => ({}), set: vi.fn() } } });
+    storage: { session: { get: async () => ({}), set: vi.fn() }, local: {
+      get: async () => structuredClone(state.local),
+      set: async (values: Record<string, unknown>) => { Object.assign(state.local, structuredClone(values)); },
+      remove: async (key: string) => { delete state.local[key]; },
+    } } });
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
 describe('real WASM + background session integration', () => {
+  it('keeps website preferences encrypted, preserves them across password rotation and rejects tampering', async () => {
+    const flags = { inlineDisabled: true, saveDisabled: true, passkeyDisabled: false };
+    const controller = await unlocked();
+    await controller.handle({ type: 'set-autofill-site', origin: 'https://private.example', flags });
+    await controller.handle({ type: 'set-equivalent-domains', groups: [['example.com', 'example.net']] });
+    expect(JSON.stringify(state.local)).not.toContain('private.example');
+    expect(JSON.stringify(state.local)).not.toContain('example.net');
+    expect(state.local).not.toHaveProperty('autofill');
+    await controller.handle({ type: 'change-password', currentPassword: password, newPassword: 'Rotated-Master-Password#2026' });
+    await controller.lock();
+    expect(await controller.handle({ type: 'autofill-settings' })).toEqual({ sites: {}, equivalentDomains: [] });
+    const recreated = new VaultController();
+    await recreated.handle({ type: 'unlock', password: 'Rotated-Master-Password#2026' });
+    expect(await recreated.handle({ type: 'autofill-settings' })).toEqual({
+      sites: { 'https://private.example': flags }, equivalentDomains: [['example.com', 'example.net']],
+    });
+    await recreated.lock();
+    const saved = state.local.autofillSealed as { bytes: number[] };
+    saved.bytes[saved.bytes.length - 1]! ^= 1;
+    const damaged = new VaultController();
+    await damaged.handle({ type: 'unlock', password: 'Rotated-Master-Password#2026' });
+    await expect(damaged.handle({ type: 'autofill-settings' })).rejects.toBeDefined();
+  });
+  it('migrates development plaintext preferences only after an encrypted save succeeds', async () => {
+    const legacy = { sites: {}, equivalentDomains: [['example.com', 'example.net']] };
+    state.local.autofill = legacy;
+    const controller = await unlocked();
+    vi.spyOn(browser.storage.local, 'set').mockRejectedValueOnce(new Error('Test preference write failed'));
+    await expect(controller.handle({ type: 'autofill-settings' })).rejects.toThrow('preference write failed');
+    expect(state.local.autofill).toEqual(legacy);
+    expect(state.local).not.toHaveProperty('autofillSealed');
+    expect(await controller.handle({ type: 'autofill-settings' })).toEqual(legacy);
+    expect(state.local).toHaveProperty('autofillSealed');
+    expect(state.local).not.toHaveProperty('autofill');
+    state.local.autofill = legacy; // The old worker could stop between the encrypted save and cleanup.
+    expect(await new VaultController().handle({ type: 'autofill-settings' })).toEqual(legacy);
+    expect(state.local).not.toHaveProperty('autofill');
+  });
+  it('requires consent for each online lookup even when autofill already grants the website permission', async () => {
+    const lookup = vi.fn(async () => new Response(''));
+    vi.stubGlobal('fetch', lookup);
+    Object.assign(browser, { permissions: { contains: vi.fn(async () => true) } });
+    try {
+      const controller = await unlocked();
+      await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record()) });
+      const id = (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
+      await expect(controller.handle({ type: 'hibp', id, confirmOnline: false })).rejects.toThrow('本次联网');
+      expect(lookup).not.toHaveBeenCalled();
+      expect(await controller.handle({ type: 'hibp', id, confirmOnline: true })).toBe(0);
+      expect(lookup).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
   it('restores after service worker recreation, then rejects the expired session', async () => {
     await unlocked();
     const recreated = new VaultController();
@@ -407,7 +474,76 @@ describe('message source boundary', () => {
       { id, url: 'chrome-extension://' + id + '/popup.html', origin: 'https://example.com' },
       { id, url: 'chrome-extension://' + id + '/popup.html', tab: { url: 'https://example.com' } },
       { id, url: 'chrome-extension://' + id + '/offscreen.html' },
+      { id, url: 'chrome-extension://' + id + '/inline-menu.html', origin: 'chrome-extension://' + id },
       { id: 'other', url: 'chrome-extension://' + id + '/popup.html' },
     ]) expect(isVaultPage(sender, id)).toBe(false);
+  });
+});
+
+describe('phase two migration transactions and autofill reads', () => {
+  const bytes = Array.from(new TextEncoder().encode(JSON.stringify({ encrypted: false, items: [
+    { id: 'source-login', type: 1, name: 'Migration fixture', reprompt: 1, login: { username: 'fixture', password: 'Hidden-Password#2026',
+      uris: [{ uri: 'https://example.com/login' }], totp: 'JBSWY3DPEHPK3PXP' } },
+    { id: 'source-card', type: 3, name: 'Card fixture', card: { number: '4111111111111111', code: '123' } },
+  ] })));
+  it('binds preview to source and snapshot and rolls back a failed batch without partial data', async () => {
+    const controller = await unlocked();
+    const before = structuredClone(state.files);
+    const preview = await controller.handle({ type: 'preview-migration', format: 'bitwarden', bytes }) as { ready: number; stamp: string };
+    expect(preview.ready).toBe(2);
+    expect(JSON.stringify(preview)).not.toContain('Hidden-Password');
+    expect(state.files).toEqual(before);
+    state.failSave = true;
+    await expect(controller.handle({ type: 'import-migration', format: 'bitwarden', bytes, stamp: preview.stamp, proof })).rejects.toThrow('disk write failed');
+    expect(await controller.handle({ type: 'list' })).toEqual([]);
+    state.failSave = false;
+    expect(await controller.handle({ type: 'import-migration', format: 'bitwarden', bytes, stamp: preview.stamp, proof })).toBe(2);
+    await expect(controller.handle({ type: 'import-migration', format: 'bitwarden', bytes, stamp: preview.stamp, proof })).rejects.toThrow('重新预览');
+    const repeat = await controller.handle({ type: 'preview-migration', format: 'bitwarden', bytes }) as { ready: number; skipped: number };
+    expect(repeat).toMatchObject({ ready: 0, skipped: 2 });
+    const login = (await controller.handle({ type: 'list' }) as ItemSummary[]).find(item => item.kind === 'login')!;
+    await expect(controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com', kind: 'login', groups: [] })).rejects.toThrow('再次验证');
+    await expect(controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com.evil.test', kind: 'login', groups: [], proof })).rejects.toThrow('不匹配');
+    const fill = await controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com', kind: 'username', groups: [], proof });
+    expect(fill).toEqual({ values: { username: 'fixture' } });
+    expect(JSON.stringify(fill)).not.toContain('Hidden-Password');
+    const item = await controller.handle({ type: 'get', id: login.id, proof }) as VaultItem;
+    item.customFields.push({ name: 'department', value: 'Visible department', hidden: true },
+      { name: 'CSV 未识别的验证码设置', value: 'Reserved-Seed-Do-Not-Fill', hidden: true });
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item), proof });
+    const fields = ['department', 'Bitwarden 保留字段', 'CSV 未识别的验证码设置'];
+    const custom = await controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com', kind: 'login', fields, groups: [], proof });
+    expect(custom).toMatchObject({ custom: { department: 'Visible department' } });
+    expect(JSON.stringify(custom)).not.toContain('Reserved-Seed');
+    expect(JSON.stringify(custom)).not.toContain('sourceId');
+    expect(await controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com', kind: 'username', fields, groups: [], proof }))
+      .toEqual({ values: { username: 'fixture' } });
+  });
+  it('requires a master proof and explicit plaintext consent for full-vault migration exports', async () => {
+    const controller = await unlocked();
+    await expect(controller.handle({ type: 'export-migration', format: 'bitwarden', proof, confirmPlaintext: false })).rejects.toThrow('风险');
+    await expect(controller.handle({ type: 'export-migration', format: 'bitwarden', proof: { method: 'pin', secret: '123456' }, confirmPlaintext: true })).rejects.toThrow('主密码');
+    await expect(controller.handle({ type: 'export-migration', format: 'bitwarden', proof: { method: 'master', secret: 'Wrong master' }, confirmPlaintext: true })).rejects.toThrow('主密码验证失败');
+  });
+  it('copies only time codes with clipboard expiry and never advances HOTP as part of login filling', async () => {
+    vi.mocked(offscreen).mockClear();
+    vi.mocked(offscreen).mockResolvedValue('fixture-clipboard-hash');
+    const controller = await unlocked();
+    const value = record('OTP copy fixture', true);
+    value.data.uris = [{ uri: 'https://example.com' }];
+    value.data.totpUri = 'JBSWY3DPEHPK3PXP';
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(value) });
+    const id = (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
+    await expect(controller.handle({ type: 'autofill-copy-otp', id, url: 'https://example.com', groups: [] })).rejects.toThrow('再次验证');
+    expect(await controller.handle({ type: 'autofill-copy-otp', id, url: 'https://example.com', groups: [], proof })).toBe(true);
+    expect(offscreen).toHaveBeenCalledWith('copy', expect.stringMatching(/^\d{6}$/));
+    expect(browser.storage.session.set).toHaveBeenCalledWith({ clipboard: { hash: 'fixture-clipboard-hash', expiresAt: expect.any(Number) } });
+    const latest = await controller.handle({ type: 'get', id, proof }) as VaultItem;
+    latest.data.totpUri = 'otpauth://hotp/Fixture?secret=JBSWY3DPEHPK3PXP&counter=5';
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(latest), proof });
+    vi.mocked(offscreen).mockClear();
+    expect(await controller.handle({ type: 'autofill-copy-otp', id, url: 'https://example.com', groups: [], proof })).toBeNull();
+    expect(offscreen).not.toHaveBeenCalled();
+    expect((await controller.handle({ type: 'get', id, proof }) as VaultItem).data.totpUri).toContain('counter=5');
   });
 });
