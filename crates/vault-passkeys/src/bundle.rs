@@ -31,8 +31,10 @@ pub fn merge<'a>(base: &[u8], candidates: impl IntoIterator<Item = &'a [u8]>) ->
         for incoming in read(data)? {
             if let Some(known) = keys.iter_mut().find(|key| key.rp_id == incoming.rp_id && key.credential_id == incoming.credential_id) {
                 if !known.same_key(&incoming) || known.increment != incoming.increment { return Err(INVALID); }
-                if !incoming.count_unverified { known.count = known.count.max(incoming.count); }
-                known.count_unverified &= incoming.count_unverified;
+                if !incoming.count_unverified {
+                    known.count = if known.count_unverified { incoming.count } else { known.count.max(incoming.count) };
+                    known.count_unverified = false;
+                }
                 known.pack_backup_verified |= incoming.pack_backup_verified;
             } else {
                 keys.push(incoming);
@@ -43,7 +45,6 @@ pub fn merge<'a>(base: &[u8], candidates: impl IntoIterator<Item = &'a [u8]>) ->
     keys.sort_by(|left, right| left.rp_id.cmp(&right.rp_id).then(left.credential_id.cmp(&right.credential_id)));
     write(&keys)
 }
-
 #[derive(Default)]
 pub struct CounterEvidence(BTreeMap<(String, Vec<u8>), Vec<Passkey>>);
 impl CounterEvidence {
@@ -67,8 +68,12 @@ impl CounterEvidence {
             if !key.increment { continue; }
             let latest = self.0.get(&(key.rp_id.clone(), key.credential_id.clone())).into_iter().flatten()
                 .filter(|known| key.same_key(known)).map(|known| known.count).max();
-            if let Some(count) = latest { key.count = key.count.max(count); key.count_unverified = false; }
-            else { key.count_unverified = true; }
+            if let Some(count) = latest {
+                key.count = if key.count_unverified { count } else { key.count.max(count) };
+                key.count_unverified = false;
+            } else {
+                key.count_unverified = true;
+            }
         }
         write(&keys)
     }

@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 const { webdavFixture } = require('./webdav-fixture.cjs');
+const { makeKeepassxcFixture } = require('./test-kdbx.cjs');
 
 const extension = path.resolve(process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const browsers = {
@@ -56,9 +57,7 @@ function readCbor(bytes) {
 }
 
 async function fixture() {
-  const html = () => {
-    const challenge = randomBytes(32).toString('base64url');
-    return `<!doctype html>
+  const html = challenge => `<!doctype html>
       <html><title>Local WebAuthn verifier</title><body>
       <label>Account <input type="text" autocomplete="username webauthn"></label>
       <button id="start">Start ceremony</button>
@@ -90,12 +89,14 @@ async function fixture() {
       };
       document.querySelector('#start').onclick = start;
       </script></body></html>`;
-  };
   let served = 0;
+  const challenges = new Map();
   const reply = (req, res) => {
     if (req.url === '/favicon.ico') { res.writeHead(204).end(); return; }
     ++served;
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(html());
+    const challenge = randomBytes(32).toString('base64url');
+    if (/^\/keepassxc\/[a-f0-9]{32}$/.test(req.url)) challenges.set(req.url, challenge);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }).end(html(challenge));
   };
   const listen = (server, host, port) => new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -112,11 +113,18 @@ async function fixture() {
     if (!['EADDRNOTAVAIL', 'EAFNOSUPPORT'].includes(error.code)) { await done(); throw error; }
   }
   const origin = `http://localhost:${port}`;
-  return { async page(local) {
+  return { origin, consumeChallenge(url) {
+    const endpoint = new URL(url).pathname;
+    const challenge = challenges.get(endpoint);
+    assert(challenge, 'The local RP must have issued this challenge');
+    challenges.delete(endpoint);
+    return challenge;
+  }, async page(local, keepassxc = false) {
     const page = await local.context.newPage();
     await page.bringToFront();
     const before = served;
-    const response = await page.goto(origin, { waitUntil: 'domcontentloaded' }).catch(error => {
+    const url = keepassxc ? `${origin}/keepassxc/${randomBytes(16).toString('hex')}` : origin;
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(error => {
       throw new Error(`Local WebAuthn verifier did not load (HTTP requests served: ${served - before})`, { cause: error });
     });
     assert.equal(response?.status(), 200, 'The loopback verifier must serve the ceremony page');
@@ -208,7 +216,7 @@ async function register(local, page, alg, increment = false) {
   return { alg, id: reg.value.id, publicKey };
 }
 
-async function sign(local, page, expected, conditional, flags, count = 0) {
+async function sign(local, page, expected, conditional, flags, count = 0, issuedChallenge) {
   const before = await local.send({ type: 'status' });
   await page.bringToFront();
   await set(page, { kind: 'assert', conditional, uv: flags & 4 ? 'required' : 'discouraged', allow: expected.id });
@@ -225,12 +233,28 @@ async function sign(local, page, expected, conditional, flags, count = 0) {
   if (!conditional) await prompt.getByRole('radio').first().check();
   if (flags & 4) await prompt.getByLabel('主密码', { exact: true }).fill(local.password);
   await prompt.getByRole('button', { name: '确认登录' }).click();
-  const assertion = auth(await result(page), 'webauthn.get', new URL(page.url()).origin, await page.evaluate(() => window.challenge), flags);
+  const challenge = issuedChallenge ?? await page.evaluate(() => window.challenge);
+  const assertion = auth(await result(page), 'webauthn.get', new URL(page.url()).origin, challenge, flags);
   assert.equal(assertion.value.id, expected.id);
   assert.equal(assertion.data.readUInt32BE(33), count);
   assert.equal(verify(expected.alg === -7 ? 'sha256' : null, Buffer.concat([assertion.data, hash(assertion.json)]), expected.publicKey,
     decode(assertion.value.response.signature)), true);
   assert.equal((await local.send({ type: 'status' })).changesSinceBackup, before.changesSinceBackup + (count > 0 ? 1 : 0));
+}
+
+async function verifyKeepassxc(local, page, source, site) {
+  const input = { format: 'keepass', bytes: [...source.bytes], password: source.filePassword };
+  const before = await local.send({ type: 'list' });
+  const preview = await local.send({ type: 'preview-migration', ...input });
+  assert.deepEqual([preview.ready, preview.passkeys, preview.ignoredPasskeys], [source.examples.length, source.examples.length, 0]);
+  assert.deepEqual(await local.send({ type: 'list' }), before);
+  const proof = { method: 'master', secret: local.password };
+  assert.equal(await local.send({ type: 'import-migration', ...input, proof, stamp: preview.stamp }), source.examples.length);
+  for (const entry of source.examples) {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await sign(local, page, { ...entry, alg: entry.algorithm ? -7 : -8 }, false, entry.alias ? 0x05 : 0x0d,
+      0, site.consumeChallenge(page.url()));
+  }
 }
 
 async function verifyCanceledCeremonies(local, page, credential, timeout = false) {
@@ -399,6 +423,16 @@ async function run() {
   const dav = await webdavFixture();
   const locals = [];
   try {
+    if (process.env.VAULT_KEEPASSXC_CLI) {
+      const source = await makeKeepassxcFixture(process.env.VAULT_KEEPASSXC_CLI, site.origin);
+      for (const browser of ['edge', 'helium']) {
+        const target = await open(browser);
+        try {
+          await verifyKeepassxc(target, await site.page(target, true), source, site);
+          console.log(JSON.stringify({ browser, kdbx: '4.1', nativeGenerator: 'KeePassXC CLI', rpAssertionsVerified: source.examples.length }));
+        } finally { await target.close(); }
+      }
+    }
     const first = await open('edge');
     locals.push(first);
     const proof = { method: 'master', secret: master };

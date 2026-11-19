@@ -380,15 +380,21 @@ fn restore_counters(current: &VaultSnapshot, restored: &mut VaultSnapshot, pack:
     }
     for item in &mut restored.items {
         let CredentialData::Login(login) = &mut item.data else { continue; };
-        let retained = passkeys.restore(&login.passkey_data, pack).map_err(|_| batch::invalid())?;
+        let retained = passkeys.restore(&login.passkey_data, pack && !item.trashed).map_err(|_| batch::invalid())?;
         drop(Zeroizing::new(std::mem::replace(&mut login.passkey_data, retained)));
         let Some(mut otp) = login.totp_uri.as_deref().and_then(|uri| vault_otp::parse(uri).ok()) else { continue; };
         if otp.kind != vault_otp::Kind::Hotp { continue; }
         if let Some(trusted) = trusted.get(&otp.identity()) {
-            otp.counter = otp.counter.max(*trusted);
+            otp.counter = if otp.counter_unverified { *trusted } else { otp.counter.max(*trusted) };
             otp.counter_unverified = false;
         } else { otp.counter_unverified = true; }
         drop(Zeroizing::new(login.totp_uri.replace(otp.canonical_uri().to_string())));
+    }
+    if !pack {
+        use crate::merge::CounterLedger;
+        let history = CounterLedger::collect(restored.items.iter())?;
+        let current = CounterLedger::collect_scoped(current.items.iter(), Some(&history), true)?;
+        history.apply(&mut restored.items, Some(&current))?;
     }
     Ok(())
 }
@@ -438,35 +444,36 @@ impl PackImport {
 }
 
 fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64) -> Result<PackImport, VaultError> {
+    use crate::merge::CounterLedger;
     restore_counters(current, &mut incoming, true)?;
+    // Preserve the original live owner, including when an imported row has a different item ID.
+    let live_ids: std::collections::BTreeSet<_> = current.items.iter().filter(|item| !item.trashed).map(|item| item.id.as_str()).collect();
+    let source = CounterLedger::collect(incoming.items.iter().filter(|item| !item.trashed || live_ids.contains(item.id.as_str())))?;
+    let ledger = CounterLedger::collect_scoped(current.items.iter().chain(&incoming.items), Some(&source), false)?;
+    let before: Vec<_> = current.items.iter().map(|item| match &item.data {
+        CredentialData::Login(login) => Some((Zeroizing::new(login.totp_uri.clone()), Zeroizing::new(login.passkey_data.clone()))),
+        _ => None,
+    }).collect();
+    let mut matched = std::collections::BTreeSet::new();
     let mut result = PackImport { head: Vec::new(), snap: Vec::new(), added: 0, updated: 0, skipped: 0 };
     for mut row in std::mem::take(&mut incoming.items) {
         row.normalize_derived_fields();
-        if let Some(existing) = current.items.iter_mut().find(|item| !row.id.is_empty() && item.id == row.id) {
-            let mut changed = false;
+        if let Some((index, existing)) = current.items.iter_mut().enumerate().find(|(_, item)| !row.id.is_empty() && item.id == row.id) {
+            matched.insert(index);
             if !existing.trashed && let (CredentialData::Login(old), CredentialData::Login(new)) = (&mut existing.data, &row.data) {
                 if old.totp_uri != new.totp_uri
                     && let Some(uri) = crate::merge::highest_hotp(old.totp_uri.as_deref(), new.totp_uri.as_deref())
                     && old.totp_uri.as_deref() != Some(uri.as_str())
                 {
                     drop(Zeroizing::new(old.totp_uri.replace(uri)));
-                    changed = true;
                 }
                 if !row.trashed && !new.passkey_data.is_empty() {
                     let merged = Zeroizing::new(vault_passkeys::bundle::merge(&old.passkey_data, [new.passkey_data.as_slice()])
                         .map_err(|_| batch::invalid())?);
                     if old.passkey_data.as_slice() != merged.as_slice() {
                         drop(Zeroizing::new(std::mem::replace(&mut old.passkey_data, merged.to_vec())));
-                        changed = true;
                     }
                 }
-            }
-            if changed {
-                existing.updated_at_ms = existing.updated_at_ms.max(now);
-                existing.revision = existing.revision.saturating_add(1);
-                result.updated += 1;
-            } else {
-                result.skipped += 1;
             }
         } else if row.trashed {
             result.skipped += 1;
@@ -475,6 +482,19 @@ fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64
             current.items.push(row);
             result.added += 1;
         }
+    }
+    ledger.apply(&mut current.items, Some(&ledger))?;
+    // Count only the final change; re-importing a paused duplicate does not create a write.
+    for (index, (before, item)) in before.into_iter().zip(&mut current.items).enumerate() {
+        let changed = match (before, &item.data) {
+            (Some((otp, keys)), CredentialData::Login(login)) => *otp != login.totp_uri || *keys != login.passkey_data,
+            _ => false,
+        };
+        if changed {
+            item.updated_at_ms = item.updated_at_ms.max(now);
+            item.revision = item.revision.saturating_add(1);
+            result.updated += 1;
+        } else if matched.contains(&index) { result.skipped += 1; }
     }
     Ok(result)
 }
@@ -586,6 +606,13 @@ mod tests {
         let otp = vault_otp::parse(row.totp_uri.as_deref().unwrap()).unwrap();
         assert_eq!(otp.counter, 49);
         assert!(!otp.counter_unverified);
+        let mut suspended = make(90, secret);
+        let CredentialData::Login(login) = &mut suspended.items[0].data else { panic!() };
+        login.totp_uri.as_mut().unwrap().push_str("&vaultCounterUnverified=1");
+        restore_counters(&make(49, secret), &mut suspended, false).unwrap();
+        let CredentialData::Login(row) = &suspended.items[0].data else { panic!() };
+        let otp = vault_otp::parse(row.totp_uri.as_deref().unwrap()).unwrap();
+        assert_eq!((otp.counter, otp.counter_unverified), (49, false));
         let mut old_only = make(2, secret);
         restore_counters(&make(500, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJR"), &mut old_only, false).unwrap();
         let CredentialData::Login(row) = &old_only.items[0].data else { panic!() };
@@ -611,5 +638,65 @@ mod tests {
         assert_eq!((otp.counter, otp.counter_unverified), (21, false));
         let repeated = merge_pack(&mut local, make("older-password", 200, 21), 700).unwrap();
         assert_eq!((repeated.updated, repeated.skipped), (0, 1));
+    }
+
+    #[test]
+    fn recovery_preserves_one_active_copy_of_each_incrementing_credential() {
+        use vault_core::model::VaultItem;
+        use vault_passkeys::{Passkey, bundle};
+        let mut der = vec![0x30, 0x2e, 0x02, 0x01, 0, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+        der.extend_from_slice(&[17; 32]);
+        let row = |id: &str, count: u32, paused: bool, trashed: bool| {
+            let suffix = if paused { "&vaultCounterUnverified=1" } else { "" };
+            let mut item = VaultItem::from_json_str(&format!(
+                r#"{{"id":"{id}","trashed":{trashed},"title":"Fixture","data":{{"kind":"login","totpUri":"otpauth://hotp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter={count}{suffix}"}}}}"#
+            )).unwrap();
+            let CredentialData::Login(login) = &mut item.data else { panic!() };
+            let mut key = Passkey::from_pkcs8(vec![3; 32], "example.com".into(), vec![5], "fixture".into(), &der, true, true, Some(count)).unwrap();
+            key.count_unverified = paused;
+            login.passkey_data = bundle::write(&[key]).unwrap();
+            item
+        };
+        let make = |items: Vec<VaultItem>| {
+            let mut snap = VaultSnapshot::new_empty("vault".into(), "snapshot".into(), 0);
+            snap.items = items;
+            snap
+        };
+        let local = make(vec![row("live", 49, false, false)]);
+        let backup = || make(vec![row("trash", 52, false, true), row("duplicate", u32::MAX, true, false), row("live", 51, false, false)]);
+        let check = |snap: &VaultSnapshot, max: u32| {
+            for item in &snap.items {
+                let CredentialData::Login(login) = &item.data else { panic!() };
+                let token = vault_otp::parse(login.totp_uri.as_deref().unwrap()).unwrap();
+                let key = bundle::read(&login.passkey_data).unwrap().pop().unwrap();
+                let paused = item.id != "live";
+                assert_eq!((token.counter, token.counter_unverified), (u64::from(max), paused), "{}", item.id);
+                assert_eq!((key.count, key.count_unverified), (max, paused), "{}", item.id);
+            }
+        };
+        let mut restored = backup();
+        restore_counters(&local, &mut restored, false).unwrap();
+        check(&restored, 52);
+        let mut merged = local;
+        let imported = merge_pack(&mut merged, backup(), 100).unwrap();
+        check(&merged, 52);
+        assert_eq!((imported.added, imported.updated), (1, 1));
+        let repeated = merge_pack(&mut merged, backup(), 200).unwrap();
+        assert_eq!((repeated.added, repeated.updated), (0, 0));
+
+        let mut unrelated = make(vec![row("live", 49, false, false), row("duplicate", u32::MAX, true, false)]);
+        let CredentialData::Login(variant) = &mut unrelated.items[1].data else { panic!() };
+        let mut variant_keys = bundle::read(&variant.passkey_data).unwrap();
+        variant_keys[0].eligible = false;
+        variant.passkey_data = bundle::write(&variant_keys).unwrap();
+        let before = unrelated.items.clone();
+        let unchanged = merge_pack(&mut unrelated, make(vec![]), 100).unwrap();
+        assert_eq!((unchanged.added, unchanged.updated), (0, 0));
+        assert_eq!(unrelated.items, before);
+
+        for item in &mut unrelated.items { item.trashed = true; }
+        let mut empty = make(vec![]);
+        let skipped = merge_pack(&mut empty, unrelated, 100).unwrap();
+        assert_eq!((skipped.added, skipped.updated, skipped.skipped), (0, 0, 2));
     }
 }

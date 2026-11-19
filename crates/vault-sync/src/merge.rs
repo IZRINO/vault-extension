@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use vault_core::error::VaultError;
 use vault_core::json_lite::JVal;
 use vault_core::model::{CredentialData, MAX_PASSWORD_HISTORY, PasswordHistoryEntry, VaultItem};
@@ -151,55 +151,119 @@ fn strongest_counter<T: Copy + Ord>(a: (T, bool), b: (T, bool)) -> (T, bool) {
     }
 }
 
-pub(crate) fn preserve_resolution_counters<'a>(chosen: &mut [VaultItem], versions: impl Iterator<Item = &'a VaultItem>) -> Result<(), VaultError> {
-    use vault_passkeys::{Passkey, bundle};
-    let hotp = |uri: Option<&str>| uri.and_then(|uri| vault_otp::parse(uri).ok()).filter(|otp| otp.kind == vault_otp::Kind::Hotp);
-    let mut otp_counts = BTreeMap::new();
-    let mut passkeys = BTreeMap::<_, Passkey>::new();
-    for item in versions {
-        let CredentialData::Login(login) = &item.data else { continue; };
-        if let Some(otp) = hotp(login.totp_uri.as_deref()) {
-            let counter = (otp.counter, otp.counter_unverified);
-            otp_counts.entry(otp.identity()).and_modify(|known| *known = strongest_counter(*known, counter)).or_insert(counter);
-        }
-        for key in bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())? {
-            let id = (key.rp_id.clone(), key.credential_id.clone());
-            if let Some(known) = passkeys.get_mut(&id) {
+type PasskeyId = (String, Vec<u8>);
+
+#[derive(Default)]
+pub(crate) struct CounterLedger {
+    hotp: BTreeMap<String, ((u64, bool), Option<String>)>,
+    passkeys: BTreeMap<PasskeyId, (vault_passkeys::Passkey, Option<String>)>,
+}
+
+fn hotp(uri: Option<&str>) -> Option<vault_otp::Otp> {
+    uri.and_then(|uri| vault_otp::parse(uri).ok()).filter(|otp| otp.kind == vault_otp::Kind::Hotp)
+}
+
+impl CounterLedger {
+    pub(crate) fn collect<'a>(versions: impl Iterator<Item = &'a VaultItem>) -> Result<Self, VaultError> {
+        Self::collect_scoped(versions, None, false)
+    }
+
+    pub(crate) fn collect_scoped<'a>(
+        versions: impl Iterator<Item = &'a VaultItem>, scope: Option<&Self>, match_key: bool,
+    ) -> Result<Self, VaultError> {
+        use vault_passkeys::bundle;
+        let mut ledger = Self::default();
+        for item in versions {
+            let CredentialData::Login(login) = &item.data else { continue; };
+            if let Some(otp) = hotp(login.totp_uri.as_deref()) {
+                let id = otp.identity();
+                if scope.is_none_or(|target| target.hotp.contains_key(&id)) {
+                    let counter = (otp.counter, otp.counter_unverified);
+                    let (known, owner) = ledger.hotp.entry(id).or_insert((counter, None));
+                    *known = strongest_counter(*known, counter);
+                    if !item.trashed && !otp.counter_unverified && owner.is_none() { *owner = Some(item.id.clone()); }
+                }
+            }
+            for key in bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())? {
+                let id = (key.rp_id.clone(), key.credential_id.clone());
+                if let Some(scope) = scope {
+                    let Some((target, _)) = scope.passkeys.get(&id) else { continue; };
+                    if match_key && (!key.same_key(target) || key.increment != target.increment) { continue; }
+                }
+                let active = !item.trashed && key.increment && !key.count_unverified;
+                let (known, owner) = ledger.passkeys.entry(id).or_insert_with(|| (key.clone(), None));
                 if !known.same_key(&key) || known.increment != key.increment { return Err(crate::batch::invalid()); }
                 known.pack_backup_verified |= key.pack_backup_verified;
                 (known.count, known.count_unverified) = strongest_counter(
                     (known.count, known.count_unverified), (key.count, key.count_unverified));
-            } else { passkeys.insert(id, key); }
-        }
-    }
-    let mut active_hotp = BTreeSet::new();
-    let mut active_passkeys = BTreeSet::new();
-    for item in chosen {
-        let CredentialData::Login(login) = &mut item.data else { continue; };
-        if let Some(mut otp) = hotp(login.totp_uri.as_deref()) {
-            let id = otp.identity();
-            let (count, unverified) = otp_counts[&id];
-            let paused = unverified || !active_hotp.insert(id);
-            if (otp.counter, otp.counter_unverified) != (count, paused) {
-                (otp.counter, otp.counter_unverified) = (count, paused);
-                drop(zeroize::Zeroizing::new(login.totp_uri.replace(otp.canonical_uri().to_string())));
+                if active && owner.is_none() { *owner = Some(item.id.clone()); }
             }
         }
-        if login.passkey_data.is_empty() { continue; }
-        let mut keys = bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())?;
-        for key in &mut keys {
-            let id = (key.rp_id.clone(), key.credential_id.clone());
-            let known = &passkeys[&id];
-            key.pack_backup_verified |= known.pack_backup_verified;
-            if key.increment {
-                key.count = known.count;
-                key.count_unverified = known.count_unverified || !active_passkeys.insert(id);
+        Ok(ledger)
+    }
+
+    pub(crate) fn apply(&self, chosen: &mut [VaultItem], preferred: Option<&Self>) -> Result<(), VaultError> {
+        use vault_passkeys::bundle;
+        // Keep at most one trusted copy, preferring live rows over the trash.
+        let mut hotp_owners = BTreeMap::new();
+        let mut passkey_owners = BTreeMap::new();
+        for (index, item) in chosen.iter().enumerate() {
+            let CredentialData::Login(login) = &item.data else { continue; };
+            if let Some(otp) = hotp(login.totp_uri.as_deref()) {
+                let id = otp.identity();
+                let original = preferred.and_then(|old| old.hotp.get(&id)).and_then(|(_, owner)| owner.as_ref());
+                let rank = (item.trashed, original != Some(&item.id), index);
+                let winner = hotp_owners.entry(id).or_insert(rank);
+                *winner = (*winner).min(rank);
+            }
+            if self.passkeys.is_empty() { continue; }
+            for (position, key) in bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())?.into_iter().enumerate().filter(|(_, key)| key.increment) {
+                let id = (key.rp_id.clone(), key.credential_id.clone());
+                let original = preferred.and_then(|old| old.passkeys.get(&id)).filter(|(known, _)| key.same_key(known))
+                    .and_then(|(_, owner)| owner.as_ref());
+                let rank = (item.trashed, original != Some(&item.id), index, position);
+                let winner = passkey_owners.entry(id).or_insert(rank);
+                *winner = (*winner).min(rank);
             }
         }
-        let bytes = bundle::write(&keys).map_err(|_| crate::batch::invalid())?;
-        drop(zeroize::Zeroizing::new(std::mem::replace(&mut login.passkey_data, bytes)));
+        for (index, item) in chosen.iter_mut().enumerate() {
+            let CredentialData::Login(login) = &mut item.data else { continue; };
+            if let Some(mut otp) = hotp(login.totp_uri.as_deref()) {
+                let id = otp.identity();
+                if let Some(&((count, unverified), _)) = self.hotp.get(&id) {
+                    let paused = unverified || hotp_owners[&id].2 != index;
+                    if (otp.counter, otp.counter_unverified) != (count, paused) {
+                        (otp.counter, otp.counter_unverified) = (count, paused);
+                        drop(zeroize::Zeroizing::new(login.totp_uri.replace(otp.canonical_uri().to_string())));
+                    }
+                }
+            }
+            if self.passkeys.is_empty() || login.passkey_data.is_empty() { continue; }
+            let mut keys = bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())?;
+            let mut changed = false;
+            for (position, key) in keys.iter_mut().enumerate() {
+                let id = (key.rp_id.clone(), key.credential_id.clone());
+                let Some((known, _)) = self.passkeys.get(&id) else { continue; };
+                let before = (key.pack_backup_verified, key.count, key.count_unverified);
+                key.pack_backup_verified |= known.pack_backup_verified;
+                if key.increment {
+                    let (_, _, owner, key_position) = passkey_owners[&id];
+                    key.count = known.count;
+                    key.count_unverified = known.count_unverified || (owner, key_position) != (index, position);
+                }
+                changed |= before != (key.pack_backup_verified, key.count, key.count_unverified);
+            }
+            if changed {
+                let bytes = bundle::write(&keys).map_err(|_| crate::batch::invalid())?;
+                drop(zeroize::Zeroizing::new(std::mem::replace(&mut login.passkey_data, bytes)));
+            }
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+pub(crate) fn preserve_resolution_counters<'a>(chosen: &mut [VaultItem], versions: impl Iterator<Item = &'a VaultItem>) -> Result<(), VaultError> {
+    CounterLedger::collect(versions)?.apply(chosen, None)
 }
 
 pub(crate) fn item(

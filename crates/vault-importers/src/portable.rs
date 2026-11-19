@@ -38,9 +38,17 @@ pub(crate) fn valid_web_url(url: &str) -> bool {
 }
 pub(crate) fn secret_bytes(raw: &str) -> Result<Zeroizing<Vec<u8>>> {
     if raw.len() > 4096 { return Err(INVALID); }
-    let pem = Zeroizing::new(raw.lines().filter(|s| !s.starts_with("-----")).collect::<String>());
-    let raw = raw.strip_prefix("b64.").unwrap_or(&pem);
-    B64.decode(raw).or_else(|_| STANDARD.decode(raw)).map(Zeroizing::new).map_err(|_| INVALID)
+    let raw = raw.trim_ascii();
+    let decoded = if let Some(body) = raw.strip_prefix("-----BEGIN PRIVATE KEY-----") {
+        let body = body.strip_suffix("-----END PRIVATE KEY-----").ok_or(INVALID)?;
+        let base64 = Zeroizing::new(body.split_ascii_whitespace().collect::<String>());
+        STANDARD.decode(base64.as_bytes())
+    } else {
+        let base64 = Zeroizing::new(raw.lines().collect::<String>());
+        let value = base64.strip_prefix("b64.").unwrap_or(&base64);
+        B64.decode(value).or_else(|_| STANDARD.decode(value))
+    };
+    decoded.map(Zeroizing::new).map_err(|_| INVALID)
 }
 pub(crate) fn id_bytes(value: &str) -> Result<Vec<u8>> {
     let compact = value.replace('-', "");

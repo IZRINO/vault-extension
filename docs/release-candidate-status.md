@@ -10,7 +10,7 @@
 | T08–T12、T19 | 坚果云/Koofr 预设、只读判库、条件写探测、加入/建库、零条目及批量删除保护、2.5 秒防抖的不可变加密 WAL、熔断、显式开启时差补偿。 | 故障注入覆盖假 ETag、旧 ETag、重启、重放、熔断、锁库零新请求、时钟偏差。同步是最终一致，不能保证两台离线设备的 HOTP 互斥。 |
 | T13–T18、T20 | 三方字段合并、加密待裁决区、全页裁决、落选密码历史、主密码旋转、设备认领和加密来源记录、滚动五份历史、历史预览/恢复、异库合入。 | 一个离线登录命中多个远端候选时一同展示；更晚的重叠草稿加密留在本机，无关项仍可同步。双份继承二次验证，同一递增凭证只保留一份可用计数。自动覆盖并发 WAL、条件提交、两处压实中断、30 天回收站边界、历史重放拒绝、计数恢复、不同身份合入。找不到祖先或不能保留新字段时停止写回；两家真实 WebDAV 尚未验收。 |
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
-| T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey、KeePass KDBX、1Password 1PUX、Proton JSON/ZIP。 | 合成样本验出码和登录签名；独立公开的 KDBX 3.1/4.0 样本通过口令导入，错密/截断/超预算拒绝。KeePassXC Passkey、历史/OTP 的原生样本及其他厂商官方应用互通不代签。 |
+| T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey、KeePass KDBX、1Password 1PUX、Proton JSON/ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。未代签 KeePassXC-Browser 或其他厂商应用与外部网站的真实互通。 |
 | T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。 | 独立算法生成的合成测试核对 TOTP/HOTP、批次、错密和重复，原生应用导出样本尚未齐备；不能等同厂家验收。 |
 | T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 冷开 `<50 ms` 未达，正式发布准出和真实站点/设备验收不能签收。 |
 
@@ -49,6 +49,14 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 [一期同机最小 MV3 对照](phase-1-status.md#t01-冷唤醒补测2026-11-19)的最快工具栏打开也约 430 ms，表明这台机器的冷 Worker 调度已占大头。没有把等待期间的骨架屏、预热 Worker 或修改起点计作通过。候选包未发布；未达性能门禁及需真实环境的验收项不关闭、不代签。
 
 [后续冷开补测](cold-wake-diagnostics.md)独立记录了新构建、原生首屏计时和无后台对照；两项门槛仍未达。
+
+### 恢复计数与 KeePassXC 候选（2026-11-20）
+
+- ZIP：`test-results/Vault-2026-11-20-9708b904a0a1-chrome.zip`（5,994,963 B），SHA-256 `9708b904a0a160d89f6ee814eb3ec53750d33cf314f994148358dbc6586adf0b`。解压目录：`test-results/release-unpacked-9708b904a0a1`，52 个文件，树摘要 `4242e4427327aa1ad5d39b10457ab321b270576d34ce8d69e88a5fc4e0262bf7`。生产 MV3 `0.0.0` 清单、CSP 检查通过，主 WASM 255,677 B。相对冷开补测包只变了 CSV、Ente、迁移和同步 Worker；本轮未重复千条冷开，不能视为性能通过。
+- Rust 57 项、Vitest 80 项、TypeScript 无错误。T18/T23 在已认证的历史快照和加密备份恢复链路采用同凭证可信最高计数：无证据暂停；有多份只保留一份可用，优先原本机条目。回收站可供证，不参与可用位置的优先级；重复导入按最终结果记账。纯 WASM 回归用真实加密历史复原 HOTP，并以原注册公钥验两种算法的计数和签名；默认零计数不写快照。这条测试不代表双端 WebDAV 历史发布已经签收。
+- Edge `157.0.4341.60`、Helium `157.0.8103.78` 从同一解压树通过安装冒烟、二期、迁移、备份防丢、自动填充、原生侧栏和 Passkey 回归。原生 Popup 亮码首扫候选完成绘制：Edge 229.8 ms，Helium **108.3 ms**（T03 只以 Helium 的 `<200 ms` 为门槛）；这份包未单独重测暗码，先前暗码数据见[冷开补测记录](cold-wake-diagnostics.md)。
+- T28 使用 Authenticode 验签有效的 KeePassXC CLI 2.8.0 写加密 4.1 文件，核对分组、密码历史、TOTP 和不透明用户句柄。两种 PKCS#8 PEM 写法及 StrongBox 字段优先级均已覆盖；Edge、Helium 从同一解压包导入后分别用原公钥通过 3 次本机 RP 验签，覆盖 ES256、Ed25519，不把源 `BS` 当目标备份证据。两种 AES-KDF 标识使用原 500 万轮上限，官方 128 MiB Argon2d Demo 在解密前按 96 MiB 预算拒绝。[样本来源和复现](agents/keepassxc-passkey-research.md#当前回归入口)。
+- 规范轴审查确认厂商字段按来源限长、备份只协调相关凭证、浏览器测试只用合成数据和回环服务。规格轴将本机验签和真实网站/设备验收分开；实体设备、真实网盘及其它应用互通仍按约定未签收。
 
 同步快照新增的来源记录在认证密文内，当前版可读没有来源的旧快照。旧客户端读不懂新字段时会停止同步写回；先升级各设备再试用新版同步。
 
