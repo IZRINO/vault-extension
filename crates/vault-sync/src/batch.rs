@@ -8,6 +8,7 @@ use vault_core::sync_codec::{
 };
 use zeroize::Zeroizing;
 use crate::conflict::{Conflict, Staged};
+use crate::device::{self, Provenance};
 use crate::reconcile::{different_secrets, login_scopes};
 
 const MAX_CHANGES: u32 = 16_384;
@@ -189,6 +190,16 @@ fn duplicate_proof(keys: &VaultKeyHierarchy, scope: &str, new: &VaultItem, known
     keys.compute_state_mac(&proof)
 }
 
+fn duplicate_group_proof(keys: &VaultKeyHierarchy, wal: &str, new: &VaultItem, known: &[&VaultItem]) -> [u8; 32] {
+    if let [only] = known { return duplicate_proof(keys, wal, new, only); }
+    let mut proof = Zeroizing::new(b"webdav:login-group:v1\0".to_vec());
+    mp_write_str(&mut proof, wal);
+    write_item(&mut proof, Some(new));
+    mp_write_array_len(&mut proof, known.len());
+    for &item in known { write_item(&mut proof, Some(item)); }
+    keys.compute_state_mac(&proof)
+}
+
 pub(crate) fn seal_batch(
     keys: &VaultKeyHierarchy, id: &str, device: &str, base: &VaultSnapshot, before: &VaultSnapshot, after: &VaultSnapshot,
     receipts: &[u8],
@@ -267,7 +278,7 @@ pub(crate) fn replay(
     let mut snapshot = base.clone();
     let mut items: BTreeMap<_, _> = indexed(base)?.into_iter().map(|(id, item)| (id.to_string(), item.clone())).collect();
     let mut consumed: BTreeSet<_> = base.included_wal_ids.iter().cloned().collect();
-    let mut writers = BTreeMap::<String, String>::new();
+    let mut provenance = Provenance::read(&snapshot.sync_provenance)?;
     let mut new_logins = LoginIndex::default();
     let base_ids: BTreeSet<_> = base.items.iter().map(|item| item.id.as_str()).collect();
     let mut blocked = BTreeMap::<String, Conflict>::new();
@@ -286,15 +297,16 @@ pub(crate) fn replay(
             let local: Vec<_> = snapshot.device_registry.extract_if(.., |device| &device.device_id == name).collect();
             snapshot.device_registry.extend(crate::device::merge(before.as_slice(), after.as_slice(), &local)?);
         }
+        if !batch.edits.is_empty() && snapshot.device_registry.iter().any(|row| row.device_id == batch.device) {
+            provenance.last_edits.insert(batch.device.clone(), batch.edits.len() as u32);
+        }
         let released: Vec<_> = blocked.iter().filter_map(|(id, conflict)| {
             conflict.receipt.filter(|receipt| batch.resolutions.contains(receipt)).map(|_| id.clone())
         }).collect();
         let mut approved = BTreeSet::new();
         for id in &released {
-            if let Some(row) = blocked.remove(id)
-                && let Some(other) = row.theirs.as_ref().filter(|other| other.id != *id)
-            {
-                approved.insert((id.clone(), other.id.clone()));
+            if let Some(row) = blocked.remove(id) {
+                approved.extend(row.matches().filter(|(other, _)| other.id != *id).map(|(other, _)| (id.clone(), other.id.clone())));
             }
         }
         if !released.is_empty() { waiting.retain(|_, owner| !released.contains(owner)); }
@@ -314,31 +326,28 @@ pub(crate) fn replay(
             }
             let current = items.get(&edit.id);
             if current == edit.after.as_ref() { continue; }
-            let source = |device: Option<&str>| -> String {
-                let Some(device) = device else { return "网盘快照".into(); };
-                snapshot.device_registry.iter().find(|row| row.device_id == device && !row.device_name.trim().is_empty())
-                    .map_or_else(|| format!("设备 {}", &device[..8]), |row| row.device_name.clone())
-            };
+            let source = |id| device::source(&snapshot.device_registry, id, "网盘快照（来源未知）");
             if current.is_none() && edit.before.is_none() && !base_ids.contains(edit.id.as_str()) && let Some(new) = &edit.after {
                 let candidates = new_logins.matches(new);
-                let other = candidates.into_iter().filter_map(|id| items.get(id)).find(|known| {
-                    writers.get(&known.id).is_some_and(|writer| *writer != device) && different_secrets(new, known) &&
+                let matches: Vec<_> = candidates.into_iter().filter_map(|id| items.get(id)).filter(|known| {
+                    provenance.writers.get(&known.id).is_some_and(|writer| *writer != device) && different_secrets(new, known) &&
                         !approved.contains(&(edit.id.clone(), known.id.clone())) &&
                         !batch.resolutions.contains(&duplicate_proof(keys, "previously-seen", new, known))
-                });
-                if let Some(other) = other {
-                    if let Some(owner) = waiting.get(&other.id).cloned() {
+                }).collect();
+                if let Some(&first) = matches.first() {
+                    if let Some(owner) = matches.iter().find_map(|other| waiting.get(&other.id)).cloned() {
                         deferred_count += 1;
                         if deferred_count > MAX_DEFERRED_EDITS { return Err(VaultError::CompactObjectTooLarge); }
                         waiting.insert(edit.id.clone(), owner.clone());
                         deferred.entry(owner).or_default().push((edit, wal, device));
                     } else {
                         waiting.insert(edit.id.clone(), edit.id.clone());
-                        waiting.insert(other.id.clone(), edit.id.clone());
+                        waiting.extend(matches.iter().map(|other| (other.id.clone(), edit.id.clone())));
+                        let remote_source = |item: &VaultItem| source(provenance.writers.get(&item.id).map(String::as_str));
                         blocked.insert(edit.id.clone(), Conflict { id: edit.id.clone(), base: None, fields: vec!["$duplicate".into()],
-                            receipt: Some(duplicate_proof(keys, &wal, new, other)), theirs: Some(other.clone()),
-                            sources: Some((source(Some(&device)), source(writers.get(&other.id).map(String::as_str)))),
-                            ours: edit.after });
+                            receipt: Some(duplicate_group_proof(keys, &wal, new, &matches)), theirs: Some(first.clone()),
+                            sources: Some((source(Some(&device)), remote_source(first))),
+                            additional: matches.iter().skip(1).map(|&item| (item.clone(), remote_source(item))).collect(), ours: edit.after });
                     }
                     continue;
                 }
@@ -355,7 +364,7 @@ pub(crate) fn replay(
                     waiting.insert(edit.id.clone(), edit.id.clone());
                     blocked.insert(edit.id.clone(), Conflict { id: edit.id.clone(), fields: merged.contested, base: edit.before,
                         ours: edit.after, theirs: merged.item.clone(), receipt: Some(keys.compute_state_mac(&proof)),
-                        sources: Some((source(Some(&device)), source(writers.get(&edit.id).map(String::as_str)))) });
+                        sources: Some((source(Some(&device)), source(provenance.writers.get(&edit.id).map(String::as_str)))), additional: Vec::new() });
                 }
                 merged.item
             };
@@ -363,9 +372,13 @@ pub(crate) fn replay(
                 if let Some(old) = current { new_logins.remove(old); }
                 if let Some(new) = &value { new_logins.add(new); }
             }
-            writers.insert(edit.id.clone(), device);
-            if let Some(item) = value { items.insert(edit.id, item); }
-            else { items.remove(&edit.id); }
+            if let Some(item) = value {
+                provenance.writers.insert(edit.id.clone(), device);
+                items.insert(edit.id, item);
+            } else {
+                provenance.writers.remove(&edit.id);
+                items.remove(&edit.id);
+            }
         }
         snapshot.hlc_timestamp = snapshot.hlc_timestamp.max(crate::journal::time_of_id(id)?);
         consumed.insert(id.to_string());
@@ -374,7 +387,8 @@ pub(crate) fn replay(
     snapshot.device_registry.sort_by(|a, b| a.device_id.cmp(&b.device_id));
     crate::device::indexed(&snapshot.device_registry)?;
     snapshot.included_wal_ids = consumed.into_iter().collect();
-    Ok((snapshot, Staged(blocked.into_values().collect())))
+    provenance.store(&mut snapshot);
+    Ok((snapshot, Staged { rows: blocked.into_values().collect(), drafts: BTreeMap::new() }))
 }
 
 #[cfg(test)]
@@ -398,7 +412,7 @@ mod tests {
         assert!(bytes.len() <= 600, "simple append {} B", bytes.len());
         let frame = [id.as_bytes(), &(bytes.len() as u32).to_le_bytes(), &bytes].concat();
         let (replayed, staged) = replay(&keys, &base, &frame, &[]).unwrap();
-        assert!(staged.0.is_empty());
+        assert!(staged.rows.is_empty());
         assert_eq!(replayed.items, next.items);
         assert_eq!(replayed.included_wal_ids, vec![id.to_string()]);
         assert_eq!(replay(&keys, &replayed, &frame, &[]).unwrap().0.items, next.items);
@@ -428,17 +442,17 @@ mod tests {
         b.items[0] = row("value B", "independent note");
         let mut packed = [frame(2, &base, &a, &[]), frame(3, &base, &b, &[])].concat();
         let (visible, staged) = replay(&keys, &base, &packed, &[]).unwrap();
-        assert_eq!(staged.0.len(), 1);
-        assert_eq!(staged.0[0].fields, ["data.password"]);
-        assert_eq!(staged.0[0].ours.as_ref().unwrap().to_json_value().get_field("data").unwrap().get_str("password"), "value B");
+        assert_eq!(staged.rows.len(), 1);
+        assert_eq!(staged.rows[0].fields, ["data.password"]);
+        assert_eq!(staged.rows[0].ours.as_ref().unwrap().to_json_value().get_field("data").unwrap().get_str("password"), "value B");
         assert_eq!(visible.items[0].note, "independent note");
         let mut chosen = visible.clone();
         chosen.items[0] = b.items[0].clone();
         packed.extend(frame(4, &visible, &visible, &[9; 32]));
-        assert_eq!(replay(&keys, &base, &packed, &[]).unwrap().1.0.len(), 1);
-        packed.extend(frame(5, &visible, &chosen, &staged.0[0].receipt.unwrap()));
+        assert_eq!(replay(&keys, &base, &packed, &[]).unwrap().1.rows.len(), 1);
+        packed.extend(frame(5, &visible, &chosen, &staged.rows[0].receipt.unwrap()));
         let (finished, resolved) = replay(&keys, &base, &packed, &[]).unwrap();
-        assert!(resolved.0.is_empty());
+        assert!(resolved.rows.is_empty());
         assert_eq!(finished.items, chosen.items);
         assert_eq!(finished.included_wal_ids.len(), 4);
     }
@@ -466,7 +480,7 @@ mod tests {
         let mut packed = [frame(2, a, &base, &left, &[]), frame(3, b, &base, &right, &[])].concat();
         let (visible, staged) = replay(&keys, &base, &packed, &[]).unwrap();
         assert_eq!(visible.items.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
-        let [pending] = &staged.0[..] else { panic!("Expected exactly one duplicate") };
+        let [pending] = &staged.rows[..] else { panic!("Expected exactly one duplicate") };
         assert_eq!(pending.fields, ["$duplicate"]);
         assert_eq!(pending.ours.as_ref().unwrap().id, "b");
         let mut both = visible.clone();
@@ -474,6 +488,6 @@ mod tests {
         packed.extend(frame(4, a, &visible, &both, &pending.receipt.unwrap()));
         let (chosen, remaining) = replay(&keys, &base, &packed, &[]).unwrap();
         assert_eq!(chosen.items.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
-        assert!(remaining.0.is_empty());
+        assert!(remaining.rows.is_empty());
     }
 }

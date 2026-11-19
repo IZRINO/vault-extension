@@ -2,12 +2,73 @@ use std::collections::{BTreeMap, BTreeSet};
 use vault_core::error::VaultError;
 use vault_core::json_lite::JVal;
 use vault_core::model::{DeviceMetadata, VaultSnapshot};
+use vault_core::sync_codec::{MpReader, mp_write_array_len, mp_write_str, mp_write_uint};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 use crate::{batch::invalid, journal::valid_device, remote};
 
 pub(crate) const MAX_DEVICES: usize = 256;
+
+#[derive(Default)]
+pub(crate) struct Provenance {
+    pub(crate) writers: BTreeMap<String, String>,
+    pub(crate) last_edits: BTreeMap<String, u32>,
+}
+
+impl Provenance {
+    pub(crate) fn read(bytes: &[u8]) -> Result<Self, VaultError> {
+        let mut out = Self::default();
+        if bytes.is_empty() { return Ok(out); }
+        let mut rd = MpReader::new(bytes);
+        if rd.read_array_len() != 2 { return Err(invalid()); }
+        let writers = rd.read_array_len();
+        for _ in 0..writers {
+            if rd.read_array_len() != 2 { return Err(invalid()); }
+            let (item, device) = (rd.read_string(), rd.read_string());
+            if item.is_empty() || !valid_device(&device) || out.writers.insert(item, device).is_some() { return Err(invalid()); }
+        }
+        let stats = rd.read_array_len();
+        if stats > MAX_DEVICES as u32 { return Err(invalid()); }
+        for _ in 0..stats {
+            if rd.read_array_len() != 2 { return Err(invalid()); }
+            let device = rd.read_string();
+            let edits = u32::try_from(rd.read_u64()).map_err(|_| invalid())?;
+            if !valid_device(&device) || out.last_edits.insert(device, edits).is_some() { return Err(invalid()); }
+        }
+        rd.finish()?;
+        Ok(out)
+    }
+
+    pub(crate) fn store(mut self, snapshot: &mut VaultSnapshot) {
+        let devices: BTreeSet<_> = snapshot.device_registry.iter().map(|device| device.device_id.as_str()).collect();
+        self.last_edits.retain(|id, _| devices.contains(id.as_str()));
+        let ids: BTreeSet<_> = snapshot.items.iter().map(|item| item.id.as_str()).collect();
+        self.writers.retain(|id, _| ids.contains(id.as_str()));
+        snapshot.sync_provenance.clear();
+        if self.last_edits.is_empty() && self.writers.is_empty() { return; }
+        let out = &mut snapshot.sync_provenance;
+        mp_write_array_len(out, 2);
+        mp_write_array_len(out, self.writers.len());
+        for (item, device) in self.writers {
+            mp_write_array_len(out, 2);
+            mp_write_str(out, &item);
+            mp_write_str(out, &device);
+        }
+        mp_write_array_len(out, self.last_edits.len());
+        for (device, count) in self.last_edits {
+            mp_write_array_len(out, 2);
+            mp_write_str(out, &device);
+            mp_write_uint(out, u64::from(count));
+        }
+    }
+}
+
+pub(crate) fn source(devices: &[DeviceMetadata], device_id: Option<&str>, fallback: &str) -> String {
+    let Some(id) = device_id.filter(|id| valid_device(id)) else { return fallback.into(); };
+    devices.iter().find(|row| row.device_id == id && !row.device_name.trim().is_empty())
+        .map_or_else(|| format!("设备 {}", &id[..8]), |row| row.device_name.clone())
+}
 
 pub(crate) fn indexed(devices: &[DeviceMetadata]) -> Result<BTreeMap<&str, &DeviceMetadata>, VaultError> {
     let map: BTreeMap<_, _> = devices.iter().map(|device| (device.device_id.as_str(), device)).collect();
@@ -35,11 +96,11 @@ pub(crate) fn merge(base: &[DeviceMetadata], ours: &[DeviceMetadata], theirs: &[
     Ok(out)
 }
 
-fn value(device: &DeviceMetadata) -> JVal {
+fn value(device: &DeviceMetadata, edits: Option<&u32>) -> JVal {
     JVal::Obj(vec![("id", JVal::Str(device.device_id.clone())), ("name", JVal::Str(device.device_name.clone())),
         ("system", JVal::Str(device.os_arch.clone())), ("browser", JVal::Str(device.browser.clone())),
         ("version", JVal::Str(device.ext_version.clone())), ("created", JVal::Uint(device.created_at_ms)),
-        ("lastSeen", JVal::Uint(device.last_seen_at_ms))])
+        ("lastSeen", JVal::Uint(device.last_seen_at_ms)), ("lastEditCount", edits.map_or(JVal::Null, |count| JVal::Uint(u64::from(*count))))])
 }
 
 fn update(snapshot: &mut VaultSnapshot, input: &JVal) -> Result<(), VaultError> {
@@ -87,7 +148,8 @@ pub fn wasm_sync_devices(key: Vec<u8>, wrap: Vec<u8>, head: &[u8], snap: &[u8]) 
     let (vault, epoch, keys) = super::keys(&key, &wrap)?;
     let snapshot = super::verified_snapshot(&keys, &vault, epoch, head, snap)?;
     indexed(&snapshot.device_registry)?;
-    Ok(JVal::Arr(snapshot.device_registry.iter().map(value).collect()).stringify())
+    let provenance = Provenance::read(&snapshot.sync_provenance)?;
+    Ok(JVal::Arr(snapshot.device_registry.iter().map(|device| value(device, provenance.last_edits.get(&device.device_id))).collect()).stringify())
 }
 
 #[wasm_bindgen]

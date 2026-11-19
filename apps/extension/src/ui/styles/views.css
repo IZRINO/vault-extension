@@ -438,6 +438,14 @@ details.fold[open] > summary > .icon {
   margin: 0;
 }
 
+.sync-review-page {
+  width: min(100%, 1040px);
+  min-height: 0;
+  margin-inline: auto;
+  padding: 20px clamp(12px, 4vw, 36px);
+  overflow: auto;
+}
+
 .sync-diff-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -450,6 +458,15 @@ details.fold[open] > summary > .icon {
   overflow-wrap: anywhere;
   padding: 4px;
   white-space: pre-wrap;
+}
+
+.sync-diff-row > [role='cell'] {
+  display: block;
+}
+
+.sync-diff + .sync-diff {
+  border-block-start: 1px solid var(--line);
+  padding-block-start: 8px;
 }
 
 .sync-diff-row time,

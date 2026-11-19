@@ -3,6 +3,10 @@ import { Lock, Maximize2, PanelRight } from 'lucide-react';
 import { Ico } from './components';
 import { isPopup } from './lib';
 
+export function openConflictReview() {
+  return browser.tabs.create({ url: browser.runtime.getURL('/sidepanel.html') + '?view=conflicts' });
+}
+
 /** 顶栏右侧的三个动作：侧栏、整页、锁定。 */
 export function ShellActions({ onLock, onError }: { onLock?(): void; onError(error: unknown): void }) {
   const windowId = useRef<number | undefined>(undefined);

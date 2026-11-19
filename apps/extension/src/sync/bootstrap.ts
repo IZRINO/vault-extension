@@ -12,7 +12,7 @@ export interface RemoteHeadInfo {
 }
 export interface RemoteWal { id: string; bytes: Uint8Array; etag?: string }
 export interface ReplayOutput { head: number[]; snap: number[]; hlc: number; count: number; included: string[];
-  conflicts: number[]; conflictCount: number; receipts: number[]; compacted: string[] }
+  conflicts: number[]; conflictCount: number; draftCount: number; receipts: number[]; compacted: string[] }
 export interface SnapshotOutput { head: number[]; snap: number[]; root: number[] }
 const notEmpty = () => new Error('目录已有文件或另一台设备正在建库。请重测并尝试读取已有密码库。');
 const incomplete = () => new Error('远端密码库缺少文件或在读取期间发生变化。未修改本机密码库，请重试。');

@@ -19,6 +19,7 @@ function decoded(head: wasm.RemoteHead) {
 function replayed(replay: wasm.Replayed) {
   try { return { head: Array.from(replay.head), snap: Array.from(replay.snap), hlc: replay.hlc, count: replay.count,
     included: replay.included ? replay.included.split('\n') : [], conflicts: Array.from(replay.conflicts), conflictCount: replay.conflict_count,
+    draftCount: replay.draft_count,
     receipts: Array.from(replay.receipts), compacted: replay.compacted ? replay.compacted.split('\n') : [] }; }
   finally { replay.free(); }
 }
@@ -182,7 +183,7 @@ async function setup() {
   const created = core.wasm_create_new_vault(master, 32768, 2, 1, key, 1000);
   const primary = session(key, created.session_wrap_bytes);
   const version = nextJournalVersion(undefined, 1000);
-  const output = wasm.wasm_sync_create_genesis(key, primary.wrap, created.head_bytes, created.snap_bytes, version.id);
+  const output = wasm.wasm_sync_create_genesis(key, primary.wrap, created.head_bytes, created.snap_bytes, version.id, version.state.deviceId);
   const genesis = await createRemoteVault(config, 'scratch', {}, async () => ({
     snapshotId: `snap_${version.id}`, head: new Uint8Array(output.head), snap: new Uint8Array(output.snap),
   }), dav.fetcher);
@@ -198,7 +199,7 @@ async function setup() {
     const { authenticated, head, snap, result, objects } = results;
     const anchor: RemoteAnchor = { vaultId: authenticated.vaultId, endpoint, head: head.bytes, snap: snap.bytes, etag: head.etag,
       objects, appliedHead: new Uint8Array(result.head), appliedSnap: new Uint8Array(result.snap), hasRecords: result.count > 0,
-      checkedAt: Date.now() };
+      checkedAt: Date.now(), conflicts: new Uint8Array(result.conflicts), conflictCount: result.conflictCount };
     return {
       files: files(new Uint8Array(result.head), new Uint8Array(result.snap), authenticated.vaultId, authenticated.keyEpoch),
       session: session(key, new Uint8Array(authenticated.wrap)),
@@ -210,7 +211,8 @@ async function setup() {
 }
 
 type Side = Awaited<ReturnType<Awaited<ReturnType<typeof setup>>['open']>>;
-type Edit = { id?: string; title: string; note?: string; data: { kind: 'login'; password: string; passwordHistory?: { password: string }[] } };
+type Edit = { id?: string; title: string; note?: string; requireReprompt?: boolean; data: { kind: 'login'; password: string; passwordHistory?: { password: string }[];
+  username?: string; uris?: { uri: string }[] } };
 function put(local: Side, item: Edit) {
   const engine = new core.WasmVaultEngine();
   try {
@@ -301,6 +303,9 @@ describe('WebDAV sync with the real Wasm codec', () => {
     const restarted = structuredClone(b);
     const { key, wrap } = restarted.session;
     const encrypted = restarted.anchor.conflicts!;
+    const stamp = wasm.wasm_sync_conflict_stamp(restarted.session.key, restarted.session.wrap, encrypted);
+    await expect(sync(restarted, dav.fetcher, { force: true })).resolves.toMatchObject({ kind: 'conflicts', count: 1 });
+    expect(wasm.wasm_sync_conflict_stamp(restarted.session.key, restarted.session.wrap, restarted.anchor.conflicts!)).toBe(stamp);
     const review = wasm.wasm_sync_conflicts(key, wrap, encrypted, false);
     expect(review).not.toContain('new-on-A');
     expect(review).not.toContain('new-on-B');
@@ -316,6 +321,176 @@ describe('WebDAV sync with the real Wasm codec', () => {
     const result = records(a).find(item => item.id === id)!;
     expect(result.data.password).toBe('new-on-B');
     expect(result.data.passwordHistory?.filter(entry => entry.password === 'new-on-A')).toHaveLength(1);
+  });
+
+  it('syncs unrelated edits with a third draft, then reopens the draft after the earlier conflict is settled', async () => {
+    const { dav, open } = await setup();
+    const a = await open();
+    add(a, 'Shared login');
+    await sync(a, dav.fetcher);
+    const b = await open(), c = await open();
+    const change = (side: Side, password: string) => {
+      const item = records(side).find(item => item.title === 'Shared login')!;
+      put(side, { ...item, data: { ...item.data, password } });
+    };
+    change(a, 'version on A');
+    change(b, 'version on B');
+    change(c, 'version on C');
+    add(c, 'Unrelated from C');
+
+    const ready = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let offered = 0;
+    const parallel: typeof fetch = async (url, init) => {
+      if (init?.method === 'PUT' && new URL(String(url)).pathname.startsWith('/dav/vault/wal/')) {
+        if (++offered === 2) ready.resolve();
+        await release.promise;
+      }
+      return dav.fetcher(url, init);
+    };
+    const concurrent = Promise.all([sync(a, parallel), sync(b, parallel)]);
+    await Promise.race([ready.promise, concurrent]);
+    release.resolve();
+    await concurrent;
+    const review = (side: Side, revealed = false) => JSON.parse(wasm.wasm_sync_conflicts(
+      side.session.key, side.session.wrap, side.anchor.conflicts ?? new Uint8Array(), revealed));
+    const resolve = (side: Side, id: string) => {
+      const out = replayed(wasm.wasm_sync_resolve(side.session.key, side.session.wrap, side.files.head, side.files.snap,
+        side.anchor.conflicts!, JSON.stringify([{ id, mode: 'ours' }]), Date.now()));
+      side.files = { ...side.files, head: new Uint8Array(out.head), snap: new Uint8Array(out.snap) };
+      side.anchor = { ...side.anchor, conflicts: new Uint8Array(out.conflicts), conflictCount: out.conflictCount,
+        pendingResolutions: new Uint8Array(out.receipts) };
+      side.pending = true;
+    };
+
+    await expect(sync(c, dav.fetcher)).resolves.toMatchObject({ kind: 'conflicts', count: 1 });
+    const restarted = structuredClone(c);
+    expect(restarted.anchor.draftCount).toBe(1);
+    expect(new TextDecoder().decode(restarted.anchor.conflicts)).not.toContain('version on C');
+    const original = await open();
+    expect(titles(original)).toContain('Unrelated from C');
+    expect(review(original)).toHaveLength(1);
+    resolve(original, review(original)[0].id);
+    await sync(original, dav.fetcher, { force: true });
+    const beforeReadOnly = dav.requests.length;
+    await expect(sync(restarted, dav.fetcher, { write: false, force: true })).resolves.toMatchObject({ kind: 'read-only', pending: true });
+    expect(dav.requests.slice(beforeReadOnly).every(row => row.method === 'GET' || row.method === 'PROPFIND')).toBe(true);
+    expect(restarted.anchor.draftCount).toBe(1);
+    await expect(sync(restarted, dav.fetcher, { write: false })).resolves.toMatchObject({ kind: 'read-only', pending: true });
+    await sync(restarted, dav.fetcher, { force: true });
+    expect(review(await open())).toHaveLength(0);
+    const next = review(restarted, true);
+    expect(next).toHaveLength(1);
+    expect(next[0].ours.values['data.password']).toBe('version on C');
+    resolve(restarted, next[0].id);
+    await sync(restarted, dav.fetcher);
+    const final = records(await open()).find(item => item.title === 'Shared login')!;
+    expect(final.data.password).toBe('version on C');
+    expect(final.data.passwordHistory?.map(row => row.password)).toEqual(expect.arrayContaining(['version on A', 'version on B']));
+  });
+
+  it('reviews every same-account draft in turn without blocking a different credential', async () => {
+    const { dav, open } = await setup();
+    const a = await open(), b = await open();
+    const login = (side: Side, title: string) => put(side, { title, data: { kind: 'login', username: 'fixture',
+      uris: [{ uri: 'https://login.example.net' }], password: `${title}-password` } });
+    login(a, 'Already on the server');
+    login(b, 'First offline login');
+    login(b, 'Second offline login');
+    add(b, 'Different credential');
+    await sync(a, dav.fetcher);
+    await expect(sync(b, dav.fetcher)).resolves.toMatchObject({ kind: 'conflicts', count: 1 });
+    expect(titles(await open())).toEqual(expect.arrayContaining(['Already on the server', 'Different credential']));
+    const pending = structuredClone(b);
+    const { key, wrap } = pending.session;
+    const review = () => JSON.parse(wasm.wasm_sync_conflicts(key, wrap, pending.anchor.conflicts!, true));
+    const [first] = review();
+    expect(first.fields).toEqual(['$duplicate']);
+    const resolved = replayed(wasm.wasm_sync_resolve(key, wrap, pending.files.head, pending.files.snap, pending.anchor.conflicts!,
+      JSON.stringify([{ id: first.id, mode: 'theirs' }]), Date.now()));
+    pending.files = { ...pending.files, head: new Uint8Array(resolved.head), snap: new Uint8Array(resolved.snap) };
+    pending.anchor = { ...pending.anchor, conflicts: new Uint8Array(resolved.conflicts), conflictCount: resolved.conflictCount };
+    pending.pending = true;
+    await expect(sync(pending, dav.fetcher)).resolves.toMatchObject({ kind: 'conflicts', count: 1 });
+    const [second] = review();
+    expect(second.fields).toEqual(['$duplicate']);
+    expect(second.ours.title).not.toBe(first.ours.title);
+    expect(titles(await open())).not.toContain(second.ours.title);
+  });
+
+  it.each(['ours', 'theirs', 'both'] as const)('presents all remote matches before resolving an offline login group (%s)', async mode => {
+    const { dav, open } = await setup();
+    const a = await open(), b = await open();
+    const login = (side: Side, title: string) => put(side, { title, data: { kind: 'login', username: 'fixture',
+      uris: [{ uri: 'https://login.example.net' }], password: `${title}-password` } });
+    login(a, 'Server version 1');
+    put(a, { title: 'Server version 2', requireReprompt: true, data: { kind: 'login', username: 'fixture',
+      uris: [{ uri: 'https://login.example.net' }], password: 'Server version 2-password' } });
+    login(b, 'Offline version');
+    add(b, 'Unrelated group fixture');
+    await sync(a, dav.fetcher);
+    await expect(sync(b, dav.fetcher)).resolves.toMatchObject({ kind: 'conflicts', count: 1 });
+    expect(titles(await open())).toContain('Unrelated group fixture');
+    const { key, wrap } = b.session;
+    const [review] = JSON.parse(wasm.wasm_sync_conflicts(key, wrap, b.anchor.conflicts!, false));
+    expect([review.theirs.title, ...review.otherMatches.map((row: { title: string }) => row.title)].sort())
+      .toEqual(['Server version 1', 'Server version 2']);
+    expect(review.protected).toBe(true);
+    expect(JSON.stringify(review)).not.toContain('Server version 2-password');
+    expect(titles(await open())).not.toContain('Offline version');
+    const output = replayed(wasm.wasm_sync_resolve(key, wrap, b.files.head, b.files.snap, b.anchor.conflicts!,
+      JSON.stringify([{ id: review.id, mode }]), Date.now()));
+    b.files = { ...b.files, head: new Uint8Array(output.head), snap: new Uint8Array(output.snap) };
+    b.anchor = { ...b.anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount };
+    b.pending = true;
+    await sync(b, dav.fetcher);
+    const final = records(await open());
+    expect(final).toHaveLength(mode === 'ours' ? 2 : mode === 'theirs' ? 3 : 4);
+    expect(final.every(row => row.title === 'Unrelated group fixture' || row.requireReprompt)).toBe(true);
+    if (mode !== 'theirs') expect(final.find(row => row.title === 'Offline version')!.data.passwordHistory?.map(row => row.password))
+      .toEqual(expect.arrayContaining(['Server version 1-password', 'Server version 2-password']));
+    if (mode !== 'ours') expect(final.filter(row => row.title.startsWith('Server version')).every(row =>
+      row.data.passwordHistory?.some(entry => entry.password === 'Offline version-password'))).toBe(true);
+  });
+
+  it('keeping both names the originating device even after compaction and protects both histories', async () => {
+    const { dav, open } = await setup();
+    const a = await open();
+    a.clock = nextJournalVersion(undefined, Date.now()).state;
+    const device = replayed(wasm.wasm_sync_device_change(a.session.key, a.session.wrap, a.files.head, a.files.snap,
+      JSON.stringify({ action: 'track', id: a.clock.deviceId, tag: a.clock.tag, name: 'Remote Laptop',
+        time: Date.now(), system: 'Fixture OS', browser: 'Edge', version: '0.0.0' })));
+    a.files = { ...a.files, head: new Uint8Array(device.head), snap: new Uint8Array(device.snap) };
+    add(a, 'Split fixture');
+    await sync(a, dav.fetcher);
+    const b = await open();
+    const item = records(a).find(row => row.title === 'Split fixture')!;
+    put(a, { ...item, data: { ...item.data, password: 'remote fixture' } });
+    put(b, { ...item, requireReprompt: true, data: { ...item.data, password: 'protected local fixture' } });
+    await sync(a, dav.fetcher);
+    await sync(a, dav.fetcher, { idle: true });
+    expect([...dav.objects.keys()].every(name => !name.startsWith('/dav/vault/wal/'))).toBe(true);
+    const compacted = await open();
+    expect(JSON.parse(wasm.wasm_sync_devices(compacted.session.key, compacted.session.wrap, compacted.files.head, compacted.files.snap)))
+      .toMatchObject([{ name: 'Remote Laptop', lastEditCount: 1 }]);
+    await expect(sync(b, dav.fetcher)).resolves.toMatchObject({ kind: 'conflicts', count: 1 });
+    const { key, wrap } = b.session;
+    const [review] = JSON.parse(wasm.wasm_sync_conflicts(key, wrap, b.anchor.conflicts!, false));
+    expect(review.theirs.source).toBe('Remote Laptop');
+    const result = replayed(wasm.wasm_sync_resolve(key, wrap, b.files.head, b.files.snap, b.anchor.conflicts!,
+      JSON.stringify([{ id: review.id, mode: 'both' }]), Date.now()));
+    b.files = { ...b.files, head: new Uint8Array(result.head), snap: new Uint8Array(result.snap) };
+    b.anchor = { ...b.anchor, conflicts: new Uint8Array(result.conflicts), conflictCount: result.conflictCount };
+    b.pending = true;
+    await sync(b, dav.fetcher);
+    const actual = records(await open());
+    expect(actual).toHaveLength(2);
+    const retained = actual.find(row => row.id === item.id)!;
+    const copy = actual.find(row => row.id !== item.id)!;
+    expect(retained).toMatchObject({ title: 'Split fixture', requireReprompt: true,
+      data: { password: 'protected local fixture', passwordHistory: expect.arrayContaining([expect.objectContaining({ password: 'remote fixture' })]) } });
+    expect(copy).toMatchObject({ title: `Split fixture（${review.theirs.source}）`, requireReprompt: true,
+      data: { password: 'remote fixture', passwordHistory: expect.arrayContaining([expect.objectContaining({ password: 'protected local fixture' })]) } });
   });
 
   it('compacts repeatedly, keeps five snapshots and refuses a replayed head', async () => {

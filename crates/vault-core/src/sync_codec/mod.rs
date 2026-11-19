@@ -775,7 +775,7 @@ impl MsgPackWire for DeviceMetadata {
 
 impl MsgPackWire for VaultSnapshot {
     fn encode_msgpack(&self, wr: &mut Vec<u8>) {
-        mp_write_array_len(wr, 8);
+        mp_write_array_len(wr, if self.sync_provenance.is_empty() { 8 } else { 9 });
         mp_write_str(wr, &self.vault_id);
         mp_write_str(wr, &self.snapshot_id);
         mp_write_uint(wr, self.snapshot_epoch);
@@ -792,12 +792,14 @@ impl MsgPackWire for VaultSnapshot {
         for wid in &self.included_wal_ids {
             mp_write_str(wr, wid);
         }
+        if !self.sync_provenance.is_empty() { mp_write_bin(wr, &self.sync_provenance); }
+        // open_snapshot authenticates the stored bytes and expects the MAC at the tail.
         mp_write_bin(wr, &self.state_mac);
     }
 
     fn decode_msgpack(rd: &mut MpReader<'_>) -> Result<Self, VaultError> {
         let len = rd.read_array_len();
-        if rd.err || len != 8 {
+        if rd.err || (len != 8 && len != 9) {
             return Err(mp_read_err());
         }
         let vault_id = rd.read_string();
@@ -828,6 +830,7 @@ impl MsgPackWire for VaultSnapshot {
             }
             included_wal_ids.push(rd.read_string());
         }
+        let sync_provenance = if len == 9 { rd.read_bin_vec() } else { Vec::new() };
         let mac_vec = rd.read_bin_vec();
         rd.finish()?;
         if mac_vec.len() != 32 {
@@ -843,6 +846,7 @@ impl MsgPackWire for VaultSnapshot {
             items,
             device_registry,
             included_wal_ids,
+            sync_provenance,
             state_mac,
         })
     }

@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import { RotateCw } from 'lucide-react';
 import type { DavConnectionStatus } from '../sync/connection';
+import { deviceProfile } from '../sync/device-profile';
 import type { SyncResult } from '../sync/run';
 import type { DavProbe, WebDavInput } from '../sync/webdav';
 import { request, type DavJoinPreview } from '../vault-messages';
 import { AreaField, ErrorBanner, Ico, SecretField, SelectField, SwitchRow, TextField } from './components';
 import { errorText } from './lib';
 import type { EmergencyKit } from './Welcome';
-import { SyncConflicts } from './SyncConflicts';
+import { openConflictReview } from './shell';
 import { SyncHistory } from './SyncHistory';
 import { SyncDevices } from './SyncDevices';
 
@@ -21,6 +22,7 @@ const syncText: Record<SyncResult['kind'], string> = {
   synced: '同步完成。',
   unchanged: '没有新变更。',
   'read-only': '网盘当前只读，未上传本机变更。',
+  deferred: '仍有本机草稿未上传。',
   unlinked: '尚未连接密码库。',
   locked: '先解锁密码库。',
   paused: '网盘连接已暂停。',
@@ -47,10 +49,10 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const [secret, setSecret] = useState('');
   const [confirm, setConfirm] = useState('');
   const [scratchFolder, setScratchFolder] = useState('');
+  const [deviceName, setDeviceName] = useState<string>();
   const [fromSaved, setFromSaved] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult>();
   const [verifyWrites, setVerifyWrites] = useState(false);
-  const [editingConflicts, setEditingConflicts] = useState(false);
   const [readingHistory, setReadingHistory] = useState(false);
   const [editingDevices, setEditingDevices] = useState(false);
   const [localMaster, setLocalMaster] = useState('');
@@ -63,6 +65,12 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     }).catch(e => { if (live) setError(errorText(e)); });
     return () => { live = false; };
   }, []);
+  useEffect(() => {
+    if (result?.kind !== 'empty' && result?.kind !== 'missing') return;
+    let live = true;
+    void deviceProfile().then(({ suggestedName }) => { if (live) setDeviceName(value => value ?? suggestedName); }).catch(() => undefined);
+    return () => { live = false; };
+  }, [result?.kind]);
   function clearResult() { setResult(undefined); setJoinReview(undefined); setLocalMaster(''); setError(''); setSecret(''); setConfirm(''); }
   async function run(action: () => Promise<void>) {
     setBusy(true); setError('');
@@ -99,7 +107,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const create = () => run(async () => {
     if (onboarding && secret !== confirm) throw new Error('两次主密码输入不一致。');
     const kit = await request<EmergencyKit | undefined>({ type: 'webdav-create', input: fromSaved ? undefined : input,
-      scratchFolder, masterPassword: secret });
+      scratchFolder, masterPassword: secret, deviceName });
     setSecret(''); setPassword(''); setConfirm(''); setResult(undefined);
     if (kit) onCreated?.(kit);
     else await refresh?.();
@@ -123,11 +131,6 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     } finally { setSecret(''); }
   });
   const offset = result?.offsetSeconds ?? status?.offsetSeconds;
-  if (editingConflicts) return <SyncConflicts close={() => setEditingConflicts(false)} changed={async () => {
-    await refresh?.();
-    setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
-    setSyncResult(undefined);
-  }} />;
   if (readingHistory) return <SyncHistory close={() => setReadingHistory(false)} changed={async () => {
     await refresh?.();
     setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
@@ -137,6 +140,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   return <div className="form">
     {status?.paused && <p className="banner banner-warn" role="status">网盘连接已暂停（HTTP {status.paused}）。修正设置并手动测试成功后恢复。</p>}
     {status?.localRestoreHeld && <p className="banner banner-warn" role="status">历史恢复仅保存在本机。启用网盘写入后，本机变更将参与同步。</p>}
+    {!!status?.drafts && <p className="banner banner-warn" role="status">有 {status.drafts} 份草稿仍保存在本机，尚未上传。</p>}
     {status?.saved && <div className="actions"><button type="button" className="btn" disabled={busy} onClick={() => void test(false)}>
       <Ico of={RotateCw} />重测已保存的连接</button></div>}
     {status?.linked && <div className="actions">
@@ -145,7 +149,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
       <button type="button" className="btn" disabled={busy || status.paused != null} onClick={() => setReadingHistory(true)}>查看历史版本</button>
       <button type="button" className="btn" disabled={busy} onClick={() => setEditingDevices(true)}>管理设备</button>
     </div>}
-    {!!status?.conflicts && <button className="btn" type="button" disabled={busy} onClick={() => setEditingConflicts(true)}>
+    {!!status?.conflicts && <button className="btn" type="button" disabled={busy} onClick={() => void openConflictReview().catch(e => setError(errorText(e)))}>
       处理 {status.conflicts} 项同步冲突</button>}
     {status?.linked && verifyWrites && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void enable(); }}>
       <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy} />
@@ -197,6 +201,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
       </div>
     </form>}
     {!status?.linked && (result?.kind === 'empty' || result?.kind === 'missing') && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void create(); }}>
+      <TextField label="本机名称" value={deviceName ?? ''} onChange={setDeviceName} maxLength={80} disabled={busy} />
       <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy}
         hint="与同步目录同级，必须已存在且为空。只在此目录读写随机测试文件。" />
       <SecretField label={onboarding ? '新主密码' : '当前主密码'} value={secret} onChange={setSecret} required

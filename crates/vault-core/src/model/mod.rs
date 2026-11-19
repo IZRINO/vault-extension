@@ -688,6 +688,8 @@ pub struct VaultSnapshot {
     pub items: Vec<VaultItem>,
     pub device_registry: Vec<DeviceMetadata>,
     pub included_wal_ids: Vec<String>,
+    /// Authenticated, opaque to the primary vault engine; only the sync worker interprets it.
+    pub sync_provenance: Vec<u8>,
     pub state_mac: [u8; 32],
 }
 
@@ -705,6 +707,7 @@ impl VaultSnapshot {
             items: Vec::new(),
             device_registry: Vec::new(),
             included_wal_ids: Vec::new(),
+            sync_provenance: Vec::new(),
             state_mac: [0u8; 32],
         }
     }

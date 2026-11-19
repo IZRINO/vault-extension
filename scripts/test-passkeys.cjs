@@ -218,6 +218,36 @@ async function sign(local, page, expected, conditional, flags, count = 0) {
   assert.equal((await local.send({ type: 'status' })).changesSinceBackup, before.changesSinceBackup + (count > 0 ? 1 : 0));
 }
 
+async function verifyCanceledCeremonies(local, page, credential, timeout = false) {
+  const before = (await local.send({ type: 'status' })).changesSinceBackup;
+  const settings = { kind: 'assert', allow: credential.id, uv: 'required' };
+  await page.bringToFront();
+  await set(page, settings);
+  await page.evaluate(() => { window.settings.abort = new AbortController(); });
+  await page.getByText('Start ceremony').click();
+  const aborted = await nextPanel(local);
+  await page.evaluate(() => window.settings.abort.abort());
+  assert.equal((await result(page)).error, 'AbortError');
+  await expect.poll(() => aborted.isClosed()).toBe(true);
+  await page.bringToFront();
+  await set(page, settings);
+  await page.getByText('Start ceremony').click();
+  const stale = await nextPanel(local);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await expect.poll(() => stale.isClosed()).toBe(true);
+  assert.equal(await page.evaluate(() => window.outcome), undefined);
+  if (timeout) {
+    await page.bringToFront();
+    await set(page, settings);
+    await page.getByText('Start ceremony').click();
+    const expiring = await nextPanel(local);
+    await page.waitForFunction(() => !!window.outcome, undefined, { timeout: 67_000 });
+    assert.equal((await result(page)).error, 'NotAllowedError');
+    await expect.poll(() => expiring.isClosed()).toBe(true);
+  }
+  assert.equal((await local.send({ type: 'status' })).changesSinceBackup, before);
+}
+
 async function verifyNativeFallback(local, page) {
   const cdp = await local.context.newCDPSession(page);
   try {
@@ -302,6 +332,53 @@ async function mergeIndependentVault(local, first, dav) {
   assert(dav.requests.slice(requestIndex).every(({ method }) => ['GET', 'PROPFIND'].includes(method)));
 }
 
+async function verifyConflictReview(first, second) {
+  await first.send({ type: 'unlock', password: master });
+  await second.send({ type: 'webdav-enable-write', scratchFolder: 'scratch', masterPassword: master });
+  const title = 'Conflict review fixture';
+  const update = (local, item) => local.send({ type: 'upsert', itemJson: JSON.stringify(item) });
+  await update(first, { id: '', title, data: { kind: 'login', username: 'fixture', password: 'fixture-base', uris: [] },
+    note: '', tags: [], customFields: [], pinned: false, requireReprompt: false, trashed: false });
+  await first.send({ type: 'webdav-sync' });
+  await second.send({ type: 'webdav-sync' });
+  const { id } = (await second.send({ type: 'list' })).find(row => row.title === title);
+  for (const [local, password] of [[first, 'fixture-A'], [second, 'fixture-B']]) {
+    const item = await local.send({ type: 'get-edit', id });
+    await update(local, { ...item, data: { ...item.data, password } });
+  }
+  await first.send({ type: 'webdav-sync' });
+  const result = await second.send({ type: 'webdav-sync' });
+  assert.equal(result.count, 1);
+  const original = await second.send({ type: 'webdav-conflicts' });
+  assert.equal(original.rows[0].theirs.source, 'Fixture Edge device');
+  await second.view.reload();
+  const opened = second.context.waitForEvent('page');
+  await second.view.getByRole('button', { name: '处理 1 项同步冲突' }).click();
+  const review = await opened;
+  await review.waitForURL('**/sidepanel.html?view=conflicts');
+  await review.getByRole('button', { name: '全部保留双份' }).click();
+  await review.getByRole('button', { name: '预览 1 项裁决' }).click();
+  const password = review.getByLabel('当前主密码', { exact: true });
+  const confirm = review.getByRole('button', { name: '确认裁决' });
+  await password.fill('fixture-wrong-master');
+  await confirm.click();
+  await expect(review.getByRole('alert')).toContainText('主密码验证失败');
+  assert.equal((await second.send({ type: 'webdav-conflicts' })).rows.length, 1);
+  assert.equal((await second.send({ type: 'webdav-sync' })).count, 1);
+  assert.equal((await second.send({ type: 'webdav-conflicts' })).stamp, original.stamp, 'Replaying the same conflict preserves the review stamp');
+  await password.fill(master);
+  await confirm.click();
+  await expect(review.getByRole('button', { name: '新建', exact: true })).toBeVisible();
+  await expect(review.getByText(`${title}（Fixture Edge device）`, { exact: true })).toBeVisible();
+  await second.send({ type: 'webdav-sync' });
+  await first.send({ type: 'webdav-sync' });
+  const copies = (await first.send({ type: 'list' })).filter(row => row.title.startsWith(title));
+  assert.equal(copies.length, 2);
+  const values = await Promise.all(copies.map(row => first.send({ type: 'get', id: row.id })));
+  assert.deepEqual(values.map(item => item.data.password).sort(), ['fixture-A', 'fixture-B']);
+  await review.close();
+}
+
 async function run() {
   const site = await fixture();
   const dav = await webdavFixture();
@@ -311,7 +388,10 @@ async function run() {
     locals.push(first);
     const proof = { method: 'master', secret: master };
     assert.equal((await first.send({ type: 'webdav-test', input: dav.config })).kind, 'missing');
-    await first.send({ type: 'webdav-create', input: dav.config, scratchFolder: 'scratch', masterPassword: master });
+    await first.send({ type: 'webdav-create', input: dav.config, scratchFolder: 'scratch', masterPassword: master,
+      deviceName: 'Fixture Edge device' });
+    const devices = await first.send({ type: 'webdav-devices' });
+    assert.equal(devices.rows.find(row => row.id === devices.active).name, 'Fixture Edge device');
     dav.state.failWal = true;
     const page = await site.page(first);
     const keys = [];
@@ -338,6 +418,7 @@ async function run() {
     await first.send({ type: 'lock' });
     assert.equal((await result(page)).error, 'NotAllowedError');
     await first.send({ type: 'unlock', password: master });
+    await verifyCanceledCeremonies(first, page, keys[0], true);
     dav.state.failWal = false;
     assert.equal((await first.send({ type: 'webdav-sync' })).pending, false);
     await sign(first, page, keys[0], false, 0x19);
@@ -353,6 +434,7 @@ async function run() {
     const other = await site.page(second);
     await sign(second, other, keys[0], true, 0x19);
     await sign(second, other, keys[1], false, 0x1d);
+    await verifyCanceledCeremonies(second, other, keys[0]);
     await verifyNativeFallback(second, other);
     assert.ok(dav.requests.slice(beforeJoin).every(({ method }) => ['GET', 'PROPFIND'].includes(method)));
 
@@ -377,10 +459,12 @@ async function run() {
     await second.send({ type: 'lock' });
     await second.send({ type: 'unlock', password: master });
     for (const key of incremental) await sign(second, other, key, false, 0x09, 2);
+    await verifyConflictReview(first, second);
     console.log(JSON.stringify({ edge: 'ES256/Ed25519 registration, assertion, UV, conditional, lock cancellation',
       helium: ['WebDAV sign-in using both original keys', 'authenticated .vaultpack restored both original keys'],
       failedUploadBS0: true, verifiedRecoveryBS1: true, defaultCountNoWrite: true, incrementalCountPersisted: true,
-      independentMergeKeptSourceAndTargetIdentity: true, nativeFallbackOnceWithVirtualAuthenticator: true }));
+      independentMergeKeptSourceAndTargetIdentity: true, nativeFallbackOnceWithVirtualAuthenticator: true,
+      abortAndNavigationCanceledOnBothBrowsers: true, promptTimeoutCanceledOnEdge: true, conflictReviewTabAndKeepBoth: true }));
   } finally {
     await Promise.all(locals.reverse().map(local => local.close()));
     await site.done();

@@ -21,7 +21,7 @@ export function SyncDevices({ close }: { close(): void }) {
     return () => { mounted = false; };
   }, []);
   function choose(next?: Operation) {
-    setOperation(next); setName(next?.device?.name ?? ''); setSecret(''); setError('');
+    setOperation(next); setName(next?.device?.name ?? (next?.action === 'register' ? devices?.suggestedName ?? '' : '')); setSecret(''); setError('');
   }
   async function submit() {
     if (!operation || busy) return;
@@ -47,7 +47,9 @@ export function SyncDevices({ close }: { close(): void }) {
         <div className="fold-body form">
           <p>{device.system} · {device.browser} · {device.version}</p>
           <time>最近同步：{new Date(device.lastSeen).toLocaleString()}</time>
-          {!devices.registered && device.system === devices.system && device.browser === devices.browser && <p className="hint">与本机的系统、浏览器相同</p>}
+          {device.lastEditCount != null && <p className="hint">最近变更的凭证：{device.lastEditCount} 条</p>}
+          {!devices.registered && (device.system === devices.system || device.browser === devices.browser || device.browser.startsWith(`${devices.browser} `)) &&
+            <p className="hint">与本机的系统或浏览器相同</p>}
           <div className="actions">
             {!devices.registered && <button className="btn" type="button" onClick={() => choose({ action: 'claim', device })}>认领</button>}
             <button className="btn" type="button" onClick={() => choose({ action: 'rename', device })}>改名</button>

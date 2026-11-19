@@ -7,6 +7,7 @@ const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 const root = path.resolve(__dirname, '..'), output = path.join(root, 'test-results');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const firstColor = process.env.VAULT_QR_FIRST || 'light';
+const nativeQr = process.env.VAULT_QR_NATIVE === '1';
 const browsers = { edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', helium: 'C:/Program Files/imput/Helium/Application/chrome.exe' };
 const master = 'Migration-Fixture-Master#2026', filePassword = 'Portable-File-Fixture#2026';
 const otp = 'otpauth://totp/QR-Fixture%3Aalice?secret=JBSWY3DPEHPK3PXP&issuer=QR-Fixture';
@@ -55,11 +56,151 @@ async function proof(page) {
   await dialog.getByLabel('主密码', { exact: true }).fill(master);
   await dialog.getByRole('button', { name: '验证', exact: true }).click();
 }
+async function verifyGoogleImages(page, send, reply) {
+  const seed = Buffer.from('12345678901234567890');
+  const field = (tag, body) => Buffer.concat([Buffer.from([tag << 3 | 2, body.length]), body]);
+  const part = (index, kind, batch = 24) => {
+    const payload = Buffer.concat([field(1, seed), field(2, Buffer.from(`Batch fixture:google-${index}`)),
+      field(3, Buffer.from('Batch fixture')), Buffer.from([0x20, 1, 0x28, 1, 0x30, kind, 0x38, 7])]);
+    const encoded = Buffer.concat([field(1, payload), Buffer.from([0x10, 1, 0x18, 2, 0x20, index, 0x28, batch])]);
+    return 'otpauth-migration://offline?data=' + encodeURIComponent(encoded.toString('base64'));
+  };
+  const [first, second, unrelated, damaged] = await Promise.all([
+    part(0, 2), part(1, 1), part(0, 2, 25), 'otpauth-migration://offline?data=AA%3D%3D',
+  ].map(value => QR.toDataURL(value, { width: 420 })));
+  const preview = images => ({ type: 'preview-auth-backup', format: 'google', images });
+  const ids = async () => (await send({ type: 'list' })).map(row => row.id).sort();
+  const original = await ids();
+  const missing = await send(preview([second]));
+  assert.equal(missing.missingParts, 1);
+  const incomplete = await reply({ ...preview([second]), type: 'import-auth-backup', stamp: missing.stamp, proof: { method: 'master', secret: master } });
+  assert(!incomplete.ok && incomplete.error.includes('缺少 1 张'));
+  const mixed = await reply(preview([second, unrelated]));
+  assert(!mixed.ok && mixed.error.includes('不同批次'));
+  assert.equal((await reply(preview([first, damaged]))).ok, false, 'A malformed protobuf must not be treated as a valid fragment');
+  assert.equal((await reply(preview(['data:image/png;base64,' + 'A'.repeat(6 * 1024 * 1024)]))).ok, false);
+  assert.deepEqual(await ids(), original);
+
+  const images = [second, first, second];
+  const complete = await send(preview(images));
+  assert.equal(complete.ready, 2); assert.equal(complete.missingParts, 0); assert.equal(complete.repeatedParts, 1);
+  assert.deepEqual(complete.sample, ['google-0', 'google-1'].map(account => ({ title: 'Batch fixture', kind: 'login', account })));
+  await page.reload();
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: /^导入其他验证器/ }).click();
+  await page.getByLabel('迁移二维码图片', { exact: true }).setInputFiles(images.map((data, index) => ({
+    name: `batch-synthetic-${index}.png`, mimeType: 'image/png', buffer: Buffer.from(data.split(',')[1], 'base64'),
+  })));
+  await page.getByRole('button', { name: '预览迁移内容', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '可导入 2 个验证码', exact: true })).toBeVisible();
+  await expect(page.getByText('忽略重复图片 1 张。', { exact: false })).toBeVisible();
+  const confirm = page.getByRole('button', { name: '确认导入', exact: true });
+  await confirm.click();
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  await expect(confirm).toBeEnabled();
+  assert.deepEqual(await ids(), original);
+  await confirm.click(); await proof(page);
+  await expect(page.getByText('已导入 2 个验证码。', { exact: true })).toBeVisible();
+
+  const imported = (await ids()).filter(id => !original.includes(id));
+  const rows = await Promise.all(imported.map(id => send({ type: 'get', id })));
+  assert.equal(rows.length, 2);
+  assert(rows.every(row => !Object.hasOwn(row.data, 'totpUri')));
+  const totp = rows.find(row => row.data.username === 'google-0');
+  const hotp = rows.find(row => row.data.username === 'google-1');
+  const timed = await send({ type: 'read-otp', id: totp.id, handle: totp.otp.handle });
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(timed.validTo / 30 - 1));
+  const hmac = createHmac('sha1', seed).update(counter).digest();
+  assert.equal(timed.value, String((hmac.readUInt32BE(hmac.at(-1) & 15) & 0x7fffffff) % 1_000_000).padStart(6, '0'));
+  assert.deepEqual(await send({ type: 'next-hotp', id: hotp.id }), { kind: 'hotp', value: '162583', counter: '7' });
+  assert.deepEqual(await send({ type: 'next-hotp', id: hotp.id }), { kind: 'hotp', value: '399871', counter: '8' });
+}
+async function nativePopupQr(cdp, id, existingTargets) {
+  let target;
+  await expect.poll(async () => {
+    const { targetInfos } = await cdp.send('Target.getTargets', { filter: [{ type: 'page' }] });
+    target = targetInfos.find(entry => entry.url === `chrome-extension://${id}/popup.html` && !existingTargets.has(entry.targetId));
+    return Boolean(target);
+  }, { message: 'Find the real toolbar Popup, not the extension setup tab' }).toBe(true);
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: false });
+  const pending = new Map();
+  let sequence = 0;
+  const receive = event => {
+    if (event.sessionId === sessionId) {
+      const message = JSON.parse(event.message);
+      pending.get(message.id)?.(message);
+    }
+  };
+  cdp.on('Target.receivedMessageFromTarget', receive);
+  async function evaluate(fn, ...args) {
+    const id = ++sequence;
+    let timer;
+    try {
+      const response = new Promise((resolve, reject) => {
+        pending.set(id, resolve);
+        timer = setTimeout(() => reject(new Error('Native QR Popup did not respond')), 4500);
+      });
+      const [, message] = await Promise.all([
+        cdp.send('Target.sendMessageToTarget', { sessionId, message: JSON.stringify({
+          id, method: 'Runtime.evaluate', params: { expression: `(${fn})(...${JSON.stringify(args)})`, returnByValue: true },
+        }) }),
+        response,
+      ]);
+      if (message.error || message.result.exceptionDetails) throw new Error('Cannot read native QR Popup');
+      return message.result.result.value;
+    } finally {
+      clearTimeout(timer);
+      pending.delete(id);
+    }
+  }
+  async function click(selector, label) {
+    await expect.poll(() => evaluate((selector, label) => {
+      const node = [...document.querySelectorAll(selector)].find(item => item.textContent.trim() === label && !item.disabled);
+      if (!node || !node.getClientRects().length) return false;
+      node.focus();
+      node.click();
+      return true;
+    }, selector, label), { message: `Click the native Popup control ${label}` }).toBe(true);
+  }
+  async function scan() {
+    await click('button', '扫描当前网页二维码');
+    let metrics;
+    await expect.poll(async () => {
+      metrics = await evaluate(() => {
+        const mark = name => performance.getEntriesByName(`vault:qr-${name}`, 'mark').at(-1);
+        const result = [...document.querySelectorAll('fieldset button')].find(node => node.textContent.trim() === 'QR-Fixture:alice');
+        if (!mark('presented') || !result || result.disabled) return null;
+        const rect = result.getBoundingClientRect();
+        if (!rect.width || !rect.height || !result.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2))) return null;
+        const start = mark('start').startTime;
+        return { replyMs: mark('preview').startTime - start, domMs: mark('dom').startTime - start,
+          presentedMs: mark('presented').startTime - start, timings: mark('preview').detail };
+      });
+      return Boolean(metrics);
+    }, { message: 'Wait for a presented and clickable QR choice in the Popup viewport' }).toBe(true);
+    return metrics;
+  }
+  try {
+    await click('button', '新建');
+    await click('[role=menuitem]', '登录');
+    await click('summary', '两步验证码（可选）');
+    const first = await scan();
+    await click('button', '取消选择');
+    // captureVisibleTab is rate limited. The second timing excludes the cooldown.
+    await new Promise(resolve => setTimeout(resolve, 650));
+    return { first, hot: await scan() };
+  } finally {
+    cdp.off('Target.receivedMessageFromTarget', receive);
+    await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => undefined);
+    await cdp.send('Target.closeTarget', { targetId: target.targetId }).catch(() => undefined);
+  }
+}
 async function run(name, server) {
   const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'vault-migration-'));
   let context;
   try {
-    context = await chromium.launchPersistentContext(profile, { executablePath: browsers[name], headless: process.env.VAULT_HEADED == null ? name !== 'helium' : process.env.VAULT_HEADED !== '1',
+    context = await chromium.launchPersistentContext(profile, { executablePath: browsers[name], headless: !nativeQr && (process.env.VAULT_HEADED == null ? name !== 'helium' : process.env.VAULT_HEADED !== '1'),
       args: ['--disable-extensions-except=' + extension, '--load-extension=' + extension, '--enable-unsafe-extension-debugging'],
       viewport: name === 'edge' ? { width: 400, height: 600 } : { width: 330, height: 760 } });
     const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
@@ -154,6 +295,10 @@ async function run(name, server) {
     await page.screenshot({ path: path.join(output, `migration-${name}-csv.png`) });
 
     const website = await context.newPage();
+    await page.getByRole('button', { name: '密码库', exact: true }).click();
+    await page.getByRole('button', { name: '新建', exact: true }).click();
+    await page.getByRole('menuitem', { name: '登录', exact: true }).click();
+    await page.getByText('两步验证码（可选）', { exact: true }).click();
     await website.bringToFront();
     await website.setViewportSize({ width: 1000, height: 800 });
     const base = `http://127.0.0.1:${server.address().port}`;
@@ -167,32 +312,68 @@ async function run(name, server) {
     const { targetInfos } = await browserCdp.send('Target.getTargets', { filter: [{ type: 'tab', exclude: false }] });
     const tabTarget = targetInfos.find(target => target.url === website.url());
     assert(tabTarget, 'Browser tab target must exist for the real extension action');
+    const pagesBefore = nativeQr ? (await browserCdp.send('Target.getTargets', { filter: [{ type: 'page' }] })).targetInfos : [];
     await browserCdp.send('Extensions.triggerAction', { id, targetId: tabTarget.targetId });
+    const popup = nativeQr ? await nativePopupQr(browserCdp, id, new Set(pagesBefore.map(entry => entry.targetId))) : undefined;
     await browserCdp.detach();
-    const scanStarted = performance.now();
-    const first = await send({ type: 'scan-otp' });
-    const scanned = first.values;
-    const qrEndToEndMs = Math.round(performance.now() - scanStarted);
-    assert.equal(scanned.length, 1); assert(scanned[0].includes('JBSWY3DPEHPK3PXP'));
+    const button = page.getByRole('button', { name: '扫描当前网页二维码', exact: true });
+    const choice = page.getByRole('button', { name: 'QR-Fixture:alice', exact: true });
+    const seed = page.getByLabel('验证码设置密钥', { exact: true });
+    const click = locator => locator.evaluate(node => node.click());
+    const scan = async () => {
+      await click(button);
+      await expect(choice).toBeVisible();
+      return page.evaluate(() => {
+        const last = name => performance.getEntriesByName(`vault:qr-${name}`, 'mark').at(-1);
+        const start = last('start'), preview = last('preview'), dom = last('dom');
+        return { replyMs: preview.startTime - start.startTime, domMs: dom.startTime - start.startTime, timings: preview.detail };
+      });
+    };
+    const first = await scan();
+    await page.evaluate(async sourceId => {
+      const own = await chrome.tabs.getCurrent();
+      await chrome.tabs.update(own.id, { active: true });
+      await chrome.tabs.update(sourceId, { active: true });
+    }, tab.id);
+    await expect(choice, 'Switching away and back must invalidate the unapplied QR choice').toHaveCount(0);
+    await expect(seed).toHaveValue('');
+    // Keep the next scan inside the capture cooldown so cancellation is deterministic.
+    await click(button);
+    const cancelScan = page.getByRole('button', { name: '取消扫描', exact: true });
+    await click(cancelScan);
+    await expect(choice).toHaveCount(0);
+    await expect(button).toBeEnabled();
     await website.screenshot({ path: path.join(output, `migration-${name}-qr.png`) });
     await website.goto(base + nextPath);
     await website.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await new Promise(resolve => setTimeout(resolve, 650));
-    const nextStarted = performance.now();
-    const following = await send({ type: 'scan-otp' }); assert.deepEqual(following.values, scanned);
-    const qrFollowupMs = Math.round(performance.now() - nextStarted);
+    const following = await scan();
+    await click(page.getByRole('button', { name: '取消选择', exact: true }));
+    await expect(seed).toHaveValue('');
+    await scan();
+    await click(choice);
+    await expect(seed).toHaveValue(/otpauth:\/\/totp\/.*JBSWY3DPEHPK3PXP/);
+    assert.equal((await send({ type: 'list' })).length, 5, 'Scanning and choosing do not save a new entry');
     await website.goto(base + '/empty');
     await website.getByText('No QR here', { exact: true }).waitFor();
     await website.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-    const empty = await reply({ type: 'scan-otp' }); assert(!empty.ok && empty.error.includes('没有找到'), JSON.stringify(empty));
+    await click(button);
+    await expect(page.getByRole('alert').filter({ hasText: '没有找到验证码二维码' })).toBeVisible();
+    await expect(choice).toHaveCount(0);
     await website.goto(`http://localhost:${server.address().port}/qr`);
-    const notGranted = await reply({ type: 'scan-otp' });
-    assert(!notGranted.ok && notGranted.error.includes('尚未授权'), JSON.stringify(notGranted));
+    await click(button);
+    await expect(page.getByRole('alert').filter({ hasText: '截图尚未授权' })).toBeVisible();
+    await expect(choice).toHaveCount(0);
+    await website.close();
+    await page.bringToFront();
+    await verifyGoogleImages(page, send, reply);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ browser: name, portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,
+    const result = { browser: name, version: context.browser().version(), portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,
       fourTypesAndPreservedFields: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrFirstColor: firstColor,
-      qrEndToEndMs, qrFollowupMs, qrFirstTimings: first.timings, qrFollowupTimings: following.timings,
-      noActiveTabRejected: true, canvasOverrideIgnored: true, errors }));
+      first, following, popup, switchedTabInvalidated: true, canceledScanAndChoice: true, noSaveUntilConfirmed: true,
+      noActiveTabRejected: true, canvasOverrideIgnored: true, googleBatchImages: true, errors };
+    console.log(JSON.stringify(result));
+    return result;
   } finally {
     await context?.close();
     assert(path.dirname(profile) === path.resolve(os.tmpdir()) && path.basename(profile).startsWith('vault-migration-'));
@@ -220,6 +401,16 @@ async function run(name, server) {
       <script>HTMLCanvasElement.prototype.getContext=()=>{throw new Error('Page canvas is intentionally blocked')};window.OffscreenCanvas=undefined;</script></body></html>`);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  try { for (const name of process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium']) await run(name, server); }
+  try {
+    const results = [];
+    for (const name of process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium']) results.push(await run(name, server));
+    if (nativeQr) {
+      await fs.writeFile(path.join(output, `qr-native-${firstColor}.json`), JSON.stringify({
+        extension: path.relative(root, extension), results,
+      }, null, 2) + '\n', 'utf8');
+      assert(results.every(result => result.browser !== 'helium' || result.popup.first.presentedMs < 200),
+        'First native Helium Popup QR presentation must be under 200 ms');
+    }
+  }
   finally { server.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

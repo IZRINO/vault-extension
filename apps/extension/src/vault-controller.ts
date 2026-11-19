@@ -14,8 +14,10 @@ import { adoptDevice, nextJournalVersion, type JournalClock } from './sync/journ
 import { createRemoteVault, endpointFingerprint, HEAD_LIMIT, packSyncFrames, readRemoteVault, type RemoteHeadInfo, type ReplayOutput } from './sync/bootstrap';
 import { proveConditionalWrites, WebDavClient, webDavConfig } from './sync/webdav';
 import { runDavSync, type SyncResult } from './sync/run';
+import { deviceProfile } from './sync/device-profile';
 import { listHistory, prepareRestore, restoreHistory, restoreHistoryLocally } from './sync/history';
 import type { PasskeyCandidate, PasskeyReply, PasskeySelection, TrustedRequest } from './passkeys/protocol';
+import { checkScanSource, type ScanSource, type ScanTicket } from './qr-scan';
 
 export const LOCK_ALARM = 'vault-lock';
 export const DAV_ALARM = 'vault-webdav';
@@ -96,6 +98,56 @@ export class VaultController {
     });
     this.tail = run.catch(() => undefined);
     return run;
+  }
+
+  scanOtp(source: ScanSource, signal: AbortSignal): Promise<ScanTicket> {
+    return this.enqueue(async check => {
+      signal.throwIfAborted();
+      if (!this.files || !this.session || !this.engine?.is_unlocked()) throw new Error('请先解锁密码库。');
+      const session = this.session;
+      const vaultId = this.files.vaultId;
+      const checkSession = () => {
+        check();
+        if (this.session !== session || this.files?.vaultId !== vaultId) throw new Error('密码库会话已改变，请重新扫描。');
+      };
+      webUrl(source.url);
+      await this.touch();
+      const wait = 600 - (performance.now() - this.lastCaptureMs);
+      if (wait > 0 && !signal.aborted) await new Promise<void>(resolve => {
+        const finish = () => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, wait);
+        signal.addEventListener('abort', finish, { once: true });
+      });
+      signal.throwIfAborted();
+      checkSession();
+      let captureMs = 0;
+      const scanned = await offscreen<Omit<QrScan, 'timings'> & { timings: Omit<QrScan['timings'], 'captureMs'> }>('scan-otp', async () => {
+        await checkScanSource(source, signal);
+        checkSession();
+        this.lastCaptureMs = performance.now();
+        let data: string;
+        try {
+          data = await browser.tabs.captureVisibleTab(source.windowId, { format: 'jpeg', quality: 95 });
+        } catch (error) {
+          if (/activeTab|all_urls|permission/i.test(error instanceof Error ? error.message : String(error))) {
+            throw new Error('截图尚未授权。请先点击浏览器工具栏的 Vault 图标，再扫描当前网站的二维码。');
+          }
+          throw new Error('浏览器暂时无法截图，请稍后重试。');
+        }
+        captureMs = performance.now() - this.lastCaptureMs;
+        signal.throwIfAborted();
+        checkSession();
+        return data;
+      });
+      await checkScanSource(source, signal);
+      checkSession();
+      if (!scanned.values.length) throw new Error('没有找到验证码二维码。请把完整二维码显示在当前页面，或手动粘贴密钥。');
+      return { scan: { values: scanned.values, timings: { ...scanned.timings, captureMs } }, checkSession };
+    });
   }
 
   passkeyAvailable(origin: string): Promise<boolean> {
@@ -338,6 +390,8 @@ export class VaultController {
   }
 
   private async createLinkedVault(message: Extract<VaultMessage, { type: 'webdav-create' }>, check: () => void) {
+    if (message.deviceName != null && (typeof message.deviceName !== 'string' || new TextEncoder().encode(message.deviceName).length > 240))
+      throw new Error('请填写有效的设备名称。');
     if (this.files) {
       if (!this.session || !this.engine?.is_unlocked()) throw new Error('请先解锁本机密码库。');
       await this.verifyMaster({ method: 'master', secret: message.masterPassword }, check);
@@ -351,6 +405,8 @@ export class VaultController {
     const config = message.input ? webDavConfig(message.input) : await openSavedDav(this.session!, existing!.vaultId);
     try {
       const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      const profile = await deviceProfile();
+      check();
       const initialized = await createRemoteVault(config, message.scratchFolder, context, async () => {
         check();
         const output = existing ? undefined : await derive<Created>('wasm_create_new_vault', [message.masterPassword, 65536, 3, 4, key, Date.now()]);
@@ -365,7 +421,13 @@ export class VaultController {
         const count = await derive<number>('sync:verify-snapshot', [key, wrap, localHead, localSnap]);
         if (count === 0 && existing && (existing.everHadRecords || (existing.backedUpChangeCount ?? 0) + existing.changesSinceBackup > 0))
           throw new Error('曾包含凭证的库目前为空，未向网盘发布。请先恢复本地数据。');
-        const genesis = await derive<{ head: number[]; snap: number[] }>('sync:genesis', [key, wrap, localHead, localSnap, version.id]);
+        const tracked = await derive<ReplayOutput>('sync:device-change', [key, wrap, localHead, localSnap, JSON.stringify({
+          action: 'track', id: version.state.deviceId, tag: version.state.tag, name: message.deviceName?.trim() || profile.suggestedName,
+          system: profile.system, browser: profile.browserLabel, version: browser.runtime.getManifest().version, time: Date.now(),
+        })]);
+        check();
+        const genesis = await derive<{ head: number[]; snap: number[] }>('sync:genesis', [key, wrap, new Uint8Array(tracked.head),
+          new Uint8Array(tracked.snap), version.id, version.state.deviceId]);
         check();
         return { head: new Uint8Array(genesis.head), snap: new Uint8Array(genesis.snap), snapshotId: `snap_${version.id}`, output, wrap, version, count };
       });
@@ -427,7 +489,7 @@ export class VaultController {
         snap: new Uint8Array(result.snap), updatedAtMs: Date.now(), changesSinceBackup: 0 };
       const anchor: store.RemoteAnchor = { vaultId: files.vaultId, endpoint: await endpointFingerprint(config.url), head: head.bytes, snap: snap.bytes,
         etag: head.etag, objects, appliedHead: files.head, appliedSnap: files.snap, hasRecords: result.count > 0, checkedAt: Date.now(),
-        conflicts: new Uint8Array(result.conflicts), conflictCount: result.conflictCount };
+        conflicts: new Uint8Array(result.conflicts), conflictCount: result.conflictCount, draftCount: result.draftCount };
       check();
       if (message.type === 'webdav-merge') {
         if (source!.vaultId === files.vaultId) throw new Error('两个库的身份相同。请使用新浏览器配置加入远端，或验证并导入 .vaultpack。');
@@ -455,7 +517,7 @@ export class VaultController {
         this.settings = settings;
         check();
         await store.adoptRemoteVault(source!, { ...anchor, conflicts: new Uint8Array(merged.conflicts),
-          conflictCount: merged.conflictCount }, next, { ...version, bytes: new Uint8Array(bytes), replaceLegacy: false });
+          conflictCount: merged.conflictCount, draftCount: merged.draftCount }, next, { ...version, bytes: new Uint8Array(bytes), replaceLegacy: false });
         this.files = next;
         await this.lock(false);
         await this.activate(key, Array.from(wrap!), check);
@@ -519,7 +581,7 @@ export class VaultController {
     if (!anchor) return { kind: 'unlinked', pending: false };
     const state = await davStatus(files.vaultId);
     if (!state.saved) return { kind: 'unlinked', pending: false };
-    if (state.paused) return { kind: 'paused', pending: await store.hasPendingWal(files.vaultId) };
+    if (state.paused) return { kind: 'paused', pending: !!anchor.draftCount || await store.hasPendingWal(files.vaultId) };
     check();
     const config = await openSavedDav(session, files.vaultId);
     const signal = this.davAbort.signal;
@@ -559,7 +621,7 @@ export class VaultController {
     const anchor = await store.loadRemoteAnchor(files.vaultId);
     check();
     const staged = anchor?.conflicts;
-    const stamp = staged?.length ? `${await digestHex(new Uint8Array(staged))}:${await digestHex(new Uint8Array(files.snap))}` : '';
+    const stamp = staged?.length ? await derive<string>('sync:conflict-stamp', [session.key, session.wrap, staged]) : '';
     check();
     if (message.type === 'webdav-conflicts') {
       if (message.reveal) await this.verifyMaster(message.reveal, check);
@@ -580,7 +642,7 @@ export class VaultController {
     const pendingResolutions = new Uint8Array((anchor.pendingResolutions?.length ?? 0) + output.receipts.length);
     if (anchor.pendingResolutions) pendingResolutions.set(anchor.pendingResolutions);
     pendingResolutions.set(output.receipts, anchor.pendingResolutions?.length ?? 0);
-    await this.persistMutation(updated, check, { ...anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount, pendingResolutions });
+    await this.persistMutation(updated, check, { ...anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount, draftCount: output.draftCount, pendingResolutions });
     this.engine!.restore_from_session(session.key, session.wrap, updated.head, updated.snap);
     await showConflictBadge(output.conflictCount).catch(() => undefined);
     void browser.runtime.sendMessage({ target: 'vault-event', type: 'sync-changed' }).catch(() => undefined);
@@ -633,14 +695,13 @@ export class VaultController {
     if (!anchor) throw new Error('请先连接远端密码库。');
     const { clock } = await store.loadJournal(files.vaultId);
     check();
-    const ua = navigator.userAgent;
-    const system = /Windows/.test(ua) ? 'Windows' : /Macintosh/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : '其他系统';
-    const browserName = /\bEdg\//.test(ua) ? 'Microsoft Edge' : /\bHelium\//.test(ua) ? 'Helium' : 'Chromium';
+    const profile = await deviceProfile();
     const args = [session.key, session.wrap, files.head, files.snap] as const;
     const rows = JSON.parse(await derive<string>('sync:devices', [...args])) as import('./vault-messages').SyncDevice[];
     check();
     const registered = rows.some(device => device.id === clock?.deviceId);
-    if (message.type === 'webdav-devices') return { active: clock?.deviceId, rows, system, browser: browserName, registered };
+    if (message.type === 'webdav-devices') return { active: clock?.deviceId, rows, system: profile.system,
+      browser: profile.browser, suggestedName: profile.suggestedName, registered };
     if (!['register', 'claim', 'rename', 'remove'].includes(message.action) ||
         (message.action !== 'remove' && (typeof message.name !== 'string' || !message.name.trim() || new TextEncoder().encode(message.name).length > 240)))
       throw new Error('请填写有效的设备名称。');
@@ -653,7 +714,7 @@ export class VaultController {
     const id = message.action === 'rename' || message.action === 'remove' ? message.id : next.deviceId;
     const action = message.action === 'register' ? 'track' : message.action;
     const output = await derive<ReplayOutput>('sync:device-change', [...args, JSON.stringify({ id, action, tag: next.tag,
-      name: message.name?.trim(), time: now, system, browser: browserName, version: browser.runtime.getManifest().version })]);
+      name: message.name?.trim(), time: now, system: profile.system, browser: profile.browserLabel, version: browser.runtime.getManifest().version })]);
     check();
     const updated = { ...files, head: new Uint8Array(output.head), snap: new Uint8Array(output.snap), updatedAtMs: now };
     await this.persistMutation(updated, check, anchor, next);
@@ -702,7 +763,7 @@ export class VaultController {
     if (message.type === 'webdav-status') {
       const state = await davStatus(this.files?.vaultId);
       const anchor = this.files && await store.loadRemoteAnchor(this.files.vaultId);
-      return anchor ? { ...state, linked: true, conflicts: anchor.conflictCount ?? 0, localRestoreHeld: !!anchor.localRestoreHeld } : state;
+      return anchor ? { ...state, linked: true, conflicts: anchor.conflictCount ?? 0, drafts: anchor.draftCount ?? 0, localRestoreHeld: !!anchor.localRestoreHeld } : state;
     }
     if (message.type === 'webdav-create') return this.createLinkedVault(message, check);
     if (message.type === 'webdav-join' || message.type === 'webdav-merge') return this.joinRemoteVault(message, check);
@@ -927,38 +988,6 @@ export class VaultController {
         ]);
         check();
         return JSON.parse(result) as MigrationExport;
-      }
-      case 'scan-otp': {
-        const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-        if (tab?.id == null || !tab.url) throw new Error('请先打开显示二维码的网站。');
-        webUrl(tab.url);
-        const wait = 600 - (performance.now() - this.lastCaptureMs);
-        if (wait > 0) { await new Promise(resolve => setTimeout(resolve, wait)); check(); }
-        const current = await browser.tabs.get(tab.id);
-        if (!current.active || current.url !== tab.url) throw new Error('网页已改变，请重新扫描。');
-        let captureMs = 0;
-        const scanned = await offscreen<Omit<QrScan, 'timings'> & { timings: Omit<QrScan['timings'], 'captureMs'> }>('scan-otp', async () => {
-          check();
-          const active = await browser.tabs.get(tab.id!);
-          if (!active.active || active.url !== tab.url) throw new Error('网页已改变，请重新扫描。');
-          this.lastCaptureMs = performance.now();
-          try {
-            const data = await browser.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 95 });
-            captureMs = performance.now() - this.lastCaptureMs;
-            return data;
-          }
-          catch (error) {
-            if (/activeTab|all_urls|permission/i.test(error instanceof Error ? error.message : String(error))) {
-              throw new Error('截图尚未授权。请先点击浏览器工具栏的 Vault 图标，再扫描当前网站的二维码。');
-            }
-            throw new Error('浏览器暂时无法截图，请稍后重试。');
-          }
-        });
-        check();
-        const after = await browser.tabs.get(tab.id);
-        if (!after.active || after.url !== tab.url) throw new Error('网页已改变，请重新扫描。');
-        if (!scanned.values.length) throw new Error('没有找到验证码二维码。请把完整二维码显示在当前页面，或手动粘贴密钥。');
-        return { values: scanned.values, timings: { ...scanned.timings, captureMs } } satisfies QrScan;
       }
       case 'set-equivalent-domains': {
         const groups = validateGroups(message.groups);

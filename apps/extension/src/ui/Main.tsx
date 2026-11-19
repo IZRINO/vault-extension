@@ -4,7 +4,7 @@ import { request, type ItemDetailData, type ItemSummary, type VaultItem, type Va
 import { ErrorBanner, Ico, MenuButton, type MenuEntry } from './components';
 import { DialogHost, useDialogs } from './dialogs';
 import { Cancelled, errorText, newItem, text } from './lib';
-import { ShellActions } from './shell';
+import { openConflictReview, ShellActions } from './shell';
 import VaultList from './VaultList';
 import type { SettingsPage } from './Settings';
 import SiteSettings from './SiteSettings';
@@ -57,6 +57,7 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [conflicts, setConflicts] = useState(0);
   const mounted = useRef(true);
   const running = useRef(0);
   const dirty = useRef(false);
@@ -103,6 +104,24 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
     browser.runtime.onMessage.addListener(syncChanged);
     return () => browser.runtime.onMessage.removeListener(syncChanged);
   }, [reload, fail]);
+  useEffect(() => {
+    let current = true;
+    let changed = false;
+    const update = (value: unknown) => {
+      if (current) setConflicts(typeof value === 'number' ? value : 0);
+    };
+    const onChanged = (changes: Record<string, { newValue?: unknown }>, area: string) => {
+      if (area === 'local' && changes.webDavConflicts) {
+        changed = true;
+        update(changes.webDavConflicts.newValue);
+      }
+    };
+    browser.storage.onChanged.addListener(onChanged);
+    void browser.storage.local.get<{ webDavConflicts?: number }>('webDavConflicts').then(value => {
+      if (!changed) update(value.webDavConflicts);
+    }).catch(() => undefined);
+    return () => { current = false; browser.storage.onChanged.removeListener(onChanged); };
+  }, []);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(''), 4200);
@@ -216,6 +235,9 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
         {busy && <div className="busy-bar" />}
         {error && <div className="stage-alert"><ErrorBanner text={error} onClose={() => setError('')} /></div>}
         <main className="content" ref={content}>
+          {onList && conflicts > 0 && <div className="banner banner-warn">
+            <button type="button" className="btn" onClick={() => void openConflictReview().catch(fail)}>处理 {conflicts} 项同步冲突</button>
+          </div>}
           {tab === 'vault' && screen.name === 'list' && <SiteSettings />}
           {tab === 'vault' && screen.name === 'list' && <VaultList items={items} query={query} filter={filter} changesSinceBackup={status.changesSinceBackup}
             setFilter={setFilter} clearQuery={() => setQuery('')} open={summary => void open(summary)} quickCopy={quickCopy}

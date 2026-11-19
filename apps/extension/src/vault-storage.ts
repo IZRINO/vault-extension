@@ -19,6 +19,7 @@ export interface RemoteAnchor {
   checkedAt?: number;
   conflicts?: Uint8Array;
   conflictCount?: number;
+  draftCount?: number;
   pendingResolutions?: Uint8Array;
   pendingCompaction?: { id: string; digest: string; priorHistory: string[] };
   localRestoreHeld?: boolean;

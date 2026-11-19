@@ -45,7 +45,7 @@ async function stableDirectory(client: WebDavClient, anchor: RemoteAnchor) {
 
 export async function prepareRestore(client: WebDavClient, anchor: RemoteAnchor, session: SessionState, files: VaultFiles, id: string) {
   const { object, info } = await requireCurrentHead(client, anchor, session, files);
-  if (!info.history.includes(id) || anchor.conflictCount || anchor.rotationFrom || anchor.outbox) throw changed();
+  if (!info.history.includes(id) || anchor.conflicts?.length || anchor.conflictCount || anchor.rotationFrom || anchor.outbox) throw changed();
   await stableDirectory(client, anchor);
   const history = await client.get(`${id}.bin`, SNAPSHOT_LIMIT);
   if (!history || history === 'unchanged') throw new Error('找不到要恢复的历史快照。');

@@ -7,6 +7,7 @@ import type { AutofillMessage } from '../src/autofill-messages';
 import { restoreDavBadge } from '../src/sync/connection';
 import { PasskeyController } from '../src/passkeys/controller';
 import { PASSKEY_PORT } from '../src/passkeys/protocol';
+import { connectQrScan, QR_SCAN_PORT } from '../src/qr-scan';
 
 export default defineBackground(() => {
   performance.mark('vault:background-entry');
@@ -20,6 +21,10 @@ export default defineBackground(() => {
   void ready.then(restoreDavBadge).catch(() => undefined);
   browser.runtime.onConnect.addListener(port => {
     if (port.name === PASSKEY_PORT) passkeys.connect(port);
+    if (port.name === QR_SCAN_PORT) {
+      if (!port.sender || !isVaultPage(port.sender, browser.runtime.id)) { port.disconnect(); return; }
+      connectQrScan(port, ready, (source, signal) => vault.scanOtp(source, signal));
+    }
   });
   browser.idle.setDetectionInterval(IDLE_DETECTION_SECONDS);
   browser.runtime.onMessage.addListener((message, sender, respond) => {

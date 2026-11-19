@@ -25,6 +25,8 @@ fn text(bytes: &[u8]) -> String {
 fn one_thousand_complete_records_and_one_changed_wal_size() {
     let keys = VaultKeyHierarchy::from_master_dek(SecretKey::from_bytes([167; 32])).unwrap();
     let mut snap = VaultSnapshot::new_empty("size-fixture".into(), "snap_00000000001000_09abcd11_00000000000001".into(), 0);
+    let device = "9bba890e-b0ca-4882-a562-4e86c9b66a15";
+    let mut provenance = crate::device::Provenance::default();
     for index in 0..1_000u32 {
         let pseudorandom = keys.compute_state_mac(&index.to_be_bytes());
         let old = keys.compute_state_mac(&[b"old:".as_slice(), &index.to_be_bytes()].concat());
@@ -34,17 +36,21 @@ fn one_thousand_complete_records_and_one_changed_wal_size() {
             text(&pseudorandom[..18]), index % 50, text(&old[..18])
         )).unwrap();
         item.custom_fields.push(CustomField { name: "fixture-key-32".into(), value: text(&old), hidden: true });
+        provenance.writers.insert(item.id.clone(), device.into());
         snap.items.push(item);
     }
+    provenance.store(&mut snap);
     let encrypted = seal_snapshot(&keys, &mut snap).unwrap();
     let mut edited = snap.clone();
     edited.items[593].note = "Local note changed on one fixture".into();
     edited.items[593].revision += 1;
     let id = "00000000002000_09abcd11_00000000000002";
-    let wal = batch::seal_batch(&keys, id, "9bba890e-b0ca-4882-a562-4e86c9b66a15", &snap, &snap, &edited, &[]).unwrap();
+    let wal = batch::seal_batch(&keys, id, device, &snap, &snap, &edited, &[]).unwrap();
     println!("1,000 credentials encrypted snapshot: {} B; 1 changed credential encrypted WAL: {} B", encrypted.len(), wal.len());
     assert!(encrypted.len() <= 240_000);
     assert!(wal.len() <= 600);
-    assert_eq!(open_snapshot(&keys, Some(&snap.snapshot_id), &encrypted).unwrap().items, snap.items);
+    let reopened = open_snapshot(&keys, Some(&snap.snapshot_id), &encrypted).unwrap();
+    assert_eq!(reopened.items, snap.items);
+    assert_eq!(reopened.sync_provenance, snap.sync_provenance);
     assert_eq!(batch::open_batch(&keys, &snap.vault_id, id, &wal).unwrap().edits[0].after, Some(edited.items[593].clone()));
 }

@@ -195,11 +195,17 @@ fn create_genesis(
 
 #[wasm_bindgen]
 pub fn wasm_sync_create_genesis(
-    session_key: Vec<u8>, wrap: Vec<u8>, local_head: &[u8], local_snap: &[u8], id: &str,
+    session_key: Vec<u8>, wrap: Vec<u8>, local_head: &[u8], local_snap: &[u8], id: &str, device: Option<String>,
 ) -> Result<Genesis, JsValue> {
     let (session_key, wrap) = (Zeroizing::new(session_key), Zeroizing::new(wrap));
     let (vault_id, epoch, keys) = super::keys(&session_key, &wrap)?;
-    let snapshot = super::verified_snapshot(&keys, &vault_id, epoch, local_head, local_snap)?;
+    let mut snapshot = super::verified_snapshot(&keys, &vault_id, epoch, local_head, local_snap)?;
+    if let Some(device) = device {
+        if !crate::journal::valid_device(&device) { return Err(batch::invalid().into()); }
+        let mut provenance = crate::device::Provenance::read(&snapshot.sync_provenance)?;
+        for item in &snapshot.items { provenance.writers.entry(item.id.clone()).or_insert_with(|| device.clone()); }
+        provenance.store(&mut snapshot);
+    }
     let time = crate::journal::time_of_id(id)?;
     create_genesis(&keys, local_head, snapshot, id, time).map_err(Into::into)
 }
@@ -232,14 +238,17 @@ pub struct Replayed {
     count: u32,
     conflicts: Vec<u8>,
     conflict_count: u32,
+    draft_count: u32,
     receipts: Vec<u8>,
     compacted: Vec<String>,
 }
 
 impl Replayed {
-    pub(crate) fn set_conflicts(&mut self, bytes: Vec<u8>, count: usize) {
-        self.conflicts = bytes;
-        self.conflict_count = count as u32;
+    pub(crate) fn set_conflicts(&mut self, staged: &crate::conflict::Staged, keys: &VaultKeyHierarchy, vault: &str) -> Result<(), VaultError> {
+        self.conflicts = staged.seal(keys, vault)?;
+        self.conflict_count = staged.rows.len() as u32;
+        self.draft_count = staged.draft_count() as u32;
+        Ok(())
     }
     pub(crate) fn set_receipts(&mut self, bytes: Vec<u8>) { self.receipts = bytes; }
 }
@@ -261,6 +270,8 @@ impl Replayed {
     #[wasm_bindgen(getter)]
     pub fn conflict_count(&self) -> u32 { self.conflict_count }
     #[wasm_bindgen(getter)]
+    pub fn draft_count(&self) -> u32 { self.draft_count }
+    #[wasm_bindgen(getter)]
     pub fn receipts(&self) -> Vec<u8> { self.receipts.clone() }
     #[wasm_bindgen(getter)]
     pub fn compacted(&self) -> String { self.compacted.join("\n") }
@@ -274,7 +285,7 @@ pub(crate) fn materialize(keys: &VaultKeyHierarchy, template: &[u8], mut snapsho
     head.update_pointer(keys, &HeadEncryptedPointer { latest_snapshot_id: snapshot.snapshot_id.clone(),
         recent_snapshot_ids: old.recent_snapshot_ids, snapshot_epoch: snapshot.snapshot_epoch, state_root_mac: snapshot.state_mac,
         updated_at_ms: snapshot.hlc_timestamp })?;
-    Ok(Replayed { head: head.to_bytes()?, snap, included: snapshot.included_wal_ids.clone(), hlc: snapshot.hlc_timestamp, conflicts: Vec::new(), conflict_count: 0, receipts: Vec::new(), compacted: Vec::new(),
+    Ok(Replayed { head: head.to_bytes()?, snap, included: snapshot.included_wal_ids.clone(), hlc: snapshot.hlc_timestamp, conflicts: Vec::new(), conflict_count: 0, draft_count: 0, receipts: Vec::new(), compacted: Vec::new(),
         count: snapshot.items.iter().filter(|item| !item.trashed).count() as u32 })
 }
 
@@ -298,8 +309,8 @@ pub fn wasm_sync_replay(
     let (applied, staged) = batch::replay(&keys, &snap, frames, &ancestors)?;
     let mut result = materialize(&keys, remote_head, applied)?;
     result.compacted = std::mem::take(&mut snap.included_wal_ids);
-    result.set_conflicts(staged.seal(&keys, &vault)?, staged.0.len());
-    result.set_receipts(staged.0.iter().filter_map(|row| row.receipt).flatten().collect());
+    result.set_conflicts(&staged, &keys, &vault)?;
+    result.set_receipts(staged.rows.iter().filter_map(|row| row.receipt).flatten().collect());
     Ok(result)
 }
 
@@ -352,6 +363,7 @@ pub fn wasm_sync_compact(
         let cutoff = time as u64;
         current.items.retain(|item| !item.trashed || !item.trashed_at_ms.is_some_and(|deleted| deleted > 0 && deleted <= cutoff));
     }
+    crate::device::Provenance::read(&current.sync_provenance)?.store(&mut current);
     next_remote_snapshot(&keys, head, old, current, id).map_err(Into::into)
 }
 
@@ -396,6 +408,9 @@ pub fn wasm_sync_restore_content(
     if restored.snapshot_epoch > current.snapshot_epoch { return Err(batch::invalid().into()); }
     restore_counters(&current, &mut restored, false)?;
     std::mem::swap(&mut current.items, &mut restored.items);
+    let mut provenance = crate::device::Provenance::read(&restored.sync_provenance)?;
+    provenance.last_edits = crate::device::Provenance::read(&current.sync_provenance)?.last_edits;
+    provenance.store(&mut current);
     materialize(&keys, current_head, current).map_err(Into::into)
 }
 

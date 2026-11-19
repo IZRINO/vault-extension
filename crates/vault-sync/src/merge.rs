@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use vault_core::error::VaultError;
 use vault_core::json_lite::JVal;
 use vault_core::model::{CredentialData, MAX_PASSWORD_HISTORY, PasswordHistoryEntry, VaultItem};
@@ -88,8 +88,7 @@ pub(crate) fn highest_hotp(a: Option<&str>, b: Option<&str>) -> Option<String> {
     let mut a = vault_otp::parse(a?).ok()?;
     let b = vault_otp::parse(b?).ok()?;
     if a.kind != vault_otp::Kind::Hotp || b.kind != vault_otp::Kind::Hotp || a.identity() != b.identity() { return None; }
-    a.counter = a.counter.max(b.counter);
-    a.counter_unverified &= b.counter_unverified;
+    (a.counter, a.counter_unverified) = strongest_counter((a.counter, a.counter_unverified), (b.counter, b.counter_unverified));
     Some(a.canonical_uri().to_string())
 }
 
@@ -114,19 +113,20 @@ fn preserve_counters(item: &mut VaultItem, versions: &[&VaultItem]) -> Result<()
     Ok(())
 }
 
-fn history(item: &mut VaultItem, versions: &[&VaultItem], losing: Option<(&VaultItem, &str)>) {
+fn history(item: &mut VaultItem, versions: &[&VaultItem], losing: &[(&VaultItem, &str)]) {
     let CredentialData::Login(login) = &mut item.data else { return; };
     let mut entries: Vec<PasswordHistoryEntry> = Vec::new();
     let mut add = |entry: PasswordHistoryEntry| {
         if !entries.iter().any(|old| old.password == entry.password && old.changed_at_ms == entry.changed_at_ms) { entries.push(entry); }
     };
-    if let Some((old, label)) = losing {
+    for &(old, label) in losing {
         if let CredentialData::Login(data) = &old.data {
             if !data.password.is_empty() && data.password != login.password {
                 add(PasswordHistoryEntry { password: data.password.clone(), changed_at_ms: old.updated_at_ms, source_device: Some(label.into()) });
             }
         }
     }
+    for entry in login.password_history.iter().take(MAX_PASSWORD_HISTORY) { add(entry.clone()); }
     for version in versions {
         if let CredentialData::Login(data) = &version.data {
             for entry in data.password_history.iter().take(MAX_PASSWORD_HISTORY) { add(entry.clone()); }
@@ -138,9 +138,68 @@ fn history(item: &mut VaultItem, versions: &[&VaultItem], losing: Option<(&Vault
     login.password_history = entries;
 }
 
-pub(crate) fn archive_losing(ours: &mut VaultItem, theirs: &mut VaultItem, sources: (&str, &str)) {
-    history(ours, &[theirs], Some((theirs, sources.1)));
-    history(theirs, &[ours], Some((ours, sources.0)));
+pub(crate) fn archive_resolution(item: &mut VaultItem, losing: &[(&VaultItem, &str)]) {
+    item.require_reprompt |= losing.iter().any(|(old, _)| old.require_reprompt);
+    history(item, &losing.iter().map(|(old, _)| *old).collect::<Vec<_>>(), losing);
+}
+
+fn strongest_counter<T: Copy + Ord>(a: (T, bool), b: (T, bool)) -> (T, bool) {
+    match (a.1, b.1) {
+        (false, true) => a,
+        (true, false) => b,
+        _ => (a.0.max(b.0), a.1),
+    }
+}
+
+pub(crate) fn preserve_resolution_counters<'a>(chosen: &mut [VaultItem], versions: impl Iterator<Item = &'a VaultItem>) -> Result<(), VaultError> {
+    use vault_passkeys::{Passkey, bundle};
+    let hotp = |uri: Option<&str>| uri.and_then(|uri| vault_otp::parse(uri).ok()).filter(|otp| otp.kind == vault_otp::Kind::Hotp);
+    let mut otp_counts = BTreeMap::new();
+    let mut passkeys = BTreeMap::<_, Passkey>::new();
+    for item in versions {
+        let CredentialData::Login(login) = &item.data else { continue; };
+        if let Some(otp) = hotp(login.totp_uri.as_deref()) {
+            let counter = (otp.counter, otp.counter_unverified);
+            otp_counts.entry(otp.identity()).and_modify(|known| *known = strongest_counter(*known, counter)).or_insert(counter);
+        }
+        for key in bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())? {
+            let id = (key.rp_id.clone(), key.credential_id.clone());
+            if let Some(known) = passkeys.get_mut(&id) {
+                if !known.same_key(&key) || known.increment != key.increment { return Err(crate::batch::invalid()); }
+                known.pack_backup_verified |= key.pack_backup_verified;
+                (known.count, known.count_unverified) = strongest_counter(
+                    (known.count, known.count_unverified), (key.count, key.count_unverified));
+            } else { passkeys.insert(id, key); }
+        }
+    }
+    let mut active_hotp = BTreeSet::new();
+    let mut active_passkeys = BTreeSet::new();
+    for item in chosen {
+        let CredentialData::Login(login) = &mut item.data else { continue; };
+        if let Some(mut otp) = hotp(login.totp_uri.as_deref()) {
+            let id = otp.identity();
+            let (count, unverified) = otp_counts[&id];
+            let paused = unverified || !active_hotp.insert(id);
+            if (otp.counter, otp.counter_unverified) != (count, paused) {
+                (otp.counter, otp.counter_unverified) = (count, paused);
+                drop(zeroize::Zeroizing::new(login.totp_uri.replace(otp.canonical_uri().to_string())));
+            }
+        }
+        if login.passkey_data.is_empty() { continue; }
+        let mut keys = bundle::read(&login.passkey_data).map_err(|_| crate::batch::invalid())?;
+        for key in &mut keys {
+            let id = (key.rp_id.clone(), key.credential_id.clone());
+            let known = &passkeys[&id];
+            key.pack_backup_verified |= known.pack_backup_verified;
+            if key.increment {
+                key.count = known.count;
+                key.count_unverified = known.count_unverified || !active_passkeys.insert(id);
+            }
+        }
+        let bytes = bundle::write(&keys).map_err(|_| crate::batch::invalid())?;
+        drop(zeroize::Zeroizing::new(std::mem::replace(&mut login.passkey_data, bytes)));
+    }
+    Ok(())
 }
 
 pub(crate) fn item(
@@ -174,7 +233,10 @@ pub(crate) fn item(
             let selected = if let CredentialData::Login(data) = &item.data { Some(&data.password) } else { None };
             if selected == our_password { theirs.map(|row| (row, sources.1)) } else { ours.map(|row| (row, sources.0)) }
         } else { None };
-        history(item, &versions, losing);
+        if !choices.is_empty() && versions.iter().any(|version| version.require_reprompt) {
+            item.require_reprompt = true;
+        }
+        history(item, &versions, losing.as_slice());
         preserve_counters(item, &versions)?;
     }
     Ok(Merge { item: selected, contested: fields.contested })

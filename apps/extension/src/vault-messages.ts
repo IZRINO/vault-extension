@@ -47,6 +47,7 @@ export interface ConflictVersion { title: string; time: number; source?: string;
 export interface VaultConflict {
   id: string; fields: string[]; protected: boolean;
   base: ConflictVersion | null; ours: ConflictVersion | null; theirs: ConflictVersion | null;
+  otherMatches: ConflictVersion[];
 }
 export interface ConflictReview { stamp: string; rows: VaultConflict[] }
 export interface DavJoinPreview { stamp: string; sourceCount: number; targetCount: number; mergedCount: number; conflicts: number }
@@ -57,8 +58,8 @@ export interface ConflictRule {
 export interface SyncHistoryEntry { id: string; time: number; epoch: number; count: number; current: boolean }
 export interface SyncRestorePreview { id: string; before: number; after: number; removed: number; blocked: boolean; bulk: boolean; stamp: string; readOnly?: boolean }
 export interface VaultPackPreview { added: number; updated: number; skipped: number; stamp: string }
-export interface SyncDevice { id: string; name: string; system: string; browser: string; version: string; created: number; lastSeen: number }
-export interface SyncDevices { active?: string; rows: SyncDevice[]; system: string; browser: string; registered: boolean }
+export interface SyncDevice { id: string; name: string; system: string; browser: string; version: string; created: number; lastSeen: number; lastEditCount: number | null }
+export interface SyncDevices { active?: string; rows: SyncDevice[]; system: string; browser: string; suggestedName: string; registered: boolean }
 export function capacityErrorText(error: unknown): string | undefined {
   if (typeof error !== 'string') return;
   const prefix = ['COMPACT_OBJECT_TOO_LARGE: ', 'VAULTPACK_TOO_LARGE: '].find(value => error.startsWith(value));
@@ -68,7 +69,7 @@ export type VaultMessage =
   | { type: 'webdav-status' }
   | { type: 'webdav-test'; input?: import('./sync/webdav').WebDavInput; remember?: boolean }
   | { type: 'webdav-clock'; enabled: boolean }
-  | { type: 'webdav-create'; input?: import('./sync/webdav').WebDavInput; scratchFolder: string; masterPassword: string }
+  | { type: 'webdav-create'; input?: import('./sync/webdav').WebDavInput; scratchFolder: string; masterPassword: string; deviceName?: string }
   | { type: 'webdav-join'; input: import('./sync/webdav').WebDavInput; method: 'master' | 'recovery'; secret: string }
   | { type: 'webdav-merge'; input: import('./sync/webdav').WebDavInput; method: 'master' | 'recovery'; secret: string; proof: Proof; stamp?: string }
   | { type: 'webdav-enable-write'; scratchFolder: string; masterPassword: string }
@@ -88,7 +89,6 @@ export type VaultMessage =
   | { type: 'preview-migration'; format: MigrationFormat; bytes: number[]; password?: string; mapping?: CsvMapping }
   | { type: 'import-migration'; format: MigrationFormat; bytes: number[]; password?: string; mapping?: CsvMapping; stamp: string; proof: Proof }
   | { type: 'export-migration'; format: MigrationFormat; proof: Proof; encrypted?: boolean; password?: string; confirmPlaintext: boolean }
-  | { type: 'scan-otp' }
   | { type: 'autofill-candidates'; url: string; kind: import('./autofill-messages').FillKind; groups: string[][] }
   | { type: 'autofill-current'; url: string; username: string; password: string; groups: string[][] }
   | { type: 'autofill-copy-otp'; id: string; url: string; groups: string[][]; proof?: Proof }

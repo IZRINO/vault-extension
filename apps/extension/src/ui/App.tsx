@@ -6,6 +6,7 @@ import Main from './Main';
 import type { EmergencyKit } from './Welcome';
 const Welcome = lazy(() => import('./Welcome'));
 const KitScreen = lazy(async () => ({ default: (await import('./Welcome')).KitScreen }));
+const SyncConflicts = lazy(async () => ({ default: (await import('./SyncConflicts')).SyncConflicts }));
 
 export default function App({ readOpening }: { readOpening?: () => Promise<VaultOpening | undefined> }) {
   const [status, setStatus] = useState<VaultStatus>();
@@ -13,6 +14,7 @@ export default function App({ readOpening }: { readOpening?: () => Promise<Vault
   const [error, setError] = useState('');
   const [kit, setKit] = useState<EmergencyKit>();
   const [shutter, setShutter] = useState(0);
+  const [showConflicts, setShowConflicts] = useState(() => !readOpening && new URLSearchParams(location.search).get('view') === 'conflicts');
   const wasUnlocked = useRef<boolean | undefined>(undefined);
   const lockVersion = useRef(0);
   const refresh = useCallback(async () => {
@@ -80,7 +82,16 @@ export default function App({ readOpening }: { readOpening?: () => Promise<Vault
         <button type="button" className="btn btn-primary btn-wide" onClick={() => { setError(''); void refresh().catch(e => setError(errorText(e))); }}>重试</button>
       </div>}
     </div>
-      : status.unlocked && !kit ? <Main status={status} refresh={refresh} initialItems={initialItems} />
+      : status.unlocked && !kit ? showConflicts ?
+        <main className="sync-review-page">
+          <Suspense fallback={<p role="status">正在读取同步冲突…</p>}>
+            <SyncConflicts close={() => {
+              history.replaceState(null, '', location.pathname);
+              setInitialItems(undefined);
+              setShowConflicts(false);
+            }} changed={refresh} />
+          </Suspense>
+        </main> : <Main status={status} refresh={refresh} initialItems={initialItems} />
         : <Suspense fallback={<div className="door" role="status">正在打开密码库…</div>}>
           {kit ? <KitScreen kit={kit} onDone={() => { setKit(undefined); void refresh().catch(e => setError(errorText(e))); }} />
             : <Welcome key={String(status.configured)} status={status} refresh={refresh} onCreated={setKit} />}

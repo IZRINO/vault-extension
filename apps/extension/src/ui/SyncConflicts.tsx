@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ArrowLeft, Eye, GitCompareArrows } from 'lucide-react';
-import { request, type ConflictReview, type ConflictRule, type ConflictVersion } from '../vault-messages';
+import { request, type ConflictReview, type ConflictRule, type ConflictVersion, type VaultConflict } from '../vault-messages';
 import { AreaField, ErrorBanner, Ico, SecretField, SelectField, TextField } from './components';
 import { errorText } from './lib';
 
@@ -33,6 +33,42 @@ function versionTitle(version: ConflictVersion | null) {
   return `${version.title || '未命名'}${version.trashed ? ' · 在回收站' : ''}`;
 }
 
+function modesFor(row: VaultConflict, mode: ConflictRule['mode']) {
+  const extra = row.otherMatches?.length ?? 0;
+  if (extra && mode === 'theirs') return `保留网盘的 ${extra + 1} 条`;
+  if (extra && mode === 'both') return `保留全部 ${extra + 2} 条`;
+  const chosen = mode === 'ours' ? row.ours : mode === 'theirs' ? row.theirs : undefined;
+  const other = mode === 'ours' ? row.theirs : mode === 'theirs' ? row.ours : undefined;
+  if (!chosen && other) return '确认永久删除';
+  if (chosen?.trashed && other && !other.trashed) return '确认移入回收站';
+  if (chosen && !chosen.trashed && (!other || other.trashed) && row.base) return '恢复并保留修改';
+  return modeText[mode];
+}
+
+function VersionDiff({ row, compared, heading }: { row: VaultConflict; compared: ConflictVersion | null; heading: string }) {
+  const columns = [
+    { heading: '共同版本', version: row.base },
+    { heading: '版本 A', version: row.ours },
+    { heading, version: compared },
+  ];
+  const fields = row.fields.includes('$duplicate') ? ['data.username', 'data.uris', 'data.password', 'data.totpUri'] : row.fields;
+  return <div className="sync-diff" role="table" aria-label={`冲突版本差异：${heading}`}>
+    <div className="sync-diff-row" role="row">
+      {columns.map(({ heading, version }) => <div role="columnheader" key={heading}>
+        <b>{heading}</b><span>{version?.source || versionTitle(version)}</span>
+        {version?.source && <span>{versionTitle(version)}</span>}
+        {version && version.time > 0 && <time>{new Date(version.time).toLocaleString()}</time>}
+      </div>)}
+    </div>
+    {fields.map(field => <div role="rowgroup" key={field}>
+      <span className="sync-diff-field">{label[field] ?? field.replace(/^data\./, '')}</span>
+      <div role="row" className="sync-diff-row">{columns.map(({ heading, version }) => <span key={heading} role="cell">
+        <Diff base={show(row.base?.values[field])} value={show(version?.values[field])} />
+      </span>)}</div>
+    </div>)}
+  </div>;
+}
+
 export function SyncConflicts({ close, changed }: { close(): void; changed(): Promise<void> }) {
   const [review, setReview] = useState<ConflictReview>();
   const [rules, setRules] = useState<Record<string, ConflictRule>>({});
@@ -47,6 +83,8 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
     return () => { active = false; };
   }, []);
   const rows = review?.rows ?? [];
+  const splittable = rows.filter(row => row.ours && row.theirs);
+  const grouped = rows.some(row => row.otherMatches?.length);
   const selected = rows.map(row => rules[row.id]).filter((rule): rule is ConflictRule => !!rule);
   const ready = selected.length > 0 && selected.every(rule => rule.mode !== 'fields' ||
     rows.find(row => row.id === rule.id)?.fields.every(field => !!rule.fields?.[field]));
@@ -78,7 +116,14 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
           setRules({}); setStage('select');
         }
       }
-    } catch (e) { setError(errorText(e)); }
+    } catch (e) {
+      const message = errorText(e);
+      if (message.includes('重新预览')) {
+        const next = await request<ConflictReview>({ type: 'webdav-conflicts' }).catch(() => undefined);
+        if (next) { setReview(next); setRules({}); setStage('select'); }
+      }
+      setError(message);
+    }
     finally { setBusy(false); setSecret(''); }
   }
   return <div className="form sync-conflicts">
@@ -93,40 +138,31 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
     {stage === 'select' && rows.length > 0 && <>
       <div className="actions">
         <button className="btn" type="button" onClick={() => setRules(Object.fromEntries(rows.map(row => [row.id, { id: row.id, mode: 'ours' }])))}>全部选版本 A</button>
-        <button className="btn" type="button" onClick={() => setRules(Object.fromEntries(rows.map(row => [row.id, { id: row.id, mode: 'theirs' }])))}>全部选版本 B</button>
+        <button className="btn" type="button" onClick={() => setRules(Object.fromEntries(rows.map(row => [row.id, { id: row.id, mode: 'theirs' }])))}>{grouped ? '全部采用网盘版本' : '全部选版本 B'}</button>
+        {splittable.length > 0 && <button className="btn" type="button"
+          onClick={() => setRules(Object.fromEntries(splittable.map(row => [row.id, { id: row.id, mode: 'both' }])))}>
+          {grouped ? `保留 ${splittable.length} 项的所有版本` : splittable.length === rows.length ? '全部保留双份' : `为 ${splittable.length} 项保留双份`}
+        </button>}
         <button className="btn" type="button" onClick={() => setStage('reveal')}><Ico of={Eye} />验证后显示受保护的差异</button>
       </div>
       {rows.map(row => {
         const rule = rules[row.id];
+        const extra = row.otherMatches ?? [];
         return <details className="fold" key={row.id}>
-          <summary>{row.ours?.title || row.theirs?.title || row.base?.title || '已删除凭证'}{rule && ` · ${modeText[rule.mode]}`}</summary>
+          <summary>{row.ours?.title || row.theirs?.title || row.base?.title || '已删除凭证'}{extra.length > 0 && ` · ${extra.length + 1} 个网盘版本`}{rule && ` · ${modesFor(row, rule.mode)}`}</summary>
           <div className="fold-body form">
-            <div className="sync-diff" role="table" aria-label="冲突版本差异">
-              <div className="sync-diff-row" role="row">
-                {[['共同版本', row.base], ['版本 A', row.ours], ['版本 B', row.theirs]].map(([heading, value]) => {
-                  const version = value as ConflictVersion | null;
-                  return <div role="columnheader" key={String(heading)}><b>{String(heading)}</b><span>{version?.source || versionTitle(version)}</span>
-                    {version?.source && <span>{versionTitle(version)}</span>}
-                    {version && version.time > 0 && <time>{new Date(version.time).toLocaleString()}</time>}</div>;
-                })}
-              </div>
-              {row.fields.map(field => <div role="rowgroup" key={field}>
-                <span className="sync-diff-field">{label[field] ?? field.replace(/^data\./, '')}</span>
-                <div role="row" className="sync-diff-row">{[row.base, row.ours, row.theirs].map((version, index) => <span key={index} role="cell">
-                  <Diff base={show(row.base?.values[field])} value={show(version?.values[field])} />
-                </span>)}</div>
-              </div>)}
-            </div>
+            <VersionDiff row={row} compared={row.theirs} heading={extra.length ? '网盘版本 1' : '版本 B'} />
+            {extra.map((candidate, index) => <VersionDiff key={index} row={row} compared={candidate} heading={`网盘版本 ${index + 2}`} />)}
             <SelectField label="裁决" value={rule?.mode ?? ''} onChange={value => choose(row.id, value as ConflictRule['mode'] | '')}>
-              <option value="">暂不处理</option><option value="ours">选版本 A</option><option value="theirs">选版本 B</option>
-              {row.ours && row.theirs && <option value="both">保留双份</option>}
+              <option value="">暂不处理</option><option value="ours">{modesFor(row, 'ours')}</option><option value="theirs">{modesFor(row, 'theirs')}</option>
+              {row.ours && row.theirs && <option value="both">{modesFor(row, 'both')}</option>}
               {!row.fields.some(field => field.startsWith('$')) && <option value="fields">逐字段选择</option>}
             </SelectField>
             {rule?.mode === 'fields' && row.fields.map(field => <SelectField key={field} label={label[field] ?? field} value={rule.fields?.[field] ?? ''}
               onChange={value => update(row.id, { fields: { ...rule.fields, [field]: value as 'ours' | 'theirs' } })}>
               <option value="">请选择</option><option value="ours">版本 A</option><option value="theirs">版本 B</option>
             </SelectField>)}
-            {rule && rule.mode !== 'both' && <details className="fold fold-plain">
+            {rule && rule.mode !== 'both' && !(rule.mode === 'theirs' && extra.length) && <details className="fold fold-plain">
               <summary>调整名称或备注</summary><div className="fold-body form">
                 <TextField label="新名称（可选）" value={rule.title ?? ''} maxLength={1024} onChange={title => update(row.id, { title: title || undefined })} />
                 <AreaField label="新备注（可选）" value={rule.note ?? ''} maxLength={16384} onChange={note => update(row.id, { note: note || undefined })} />
@@ -140,7 +176,9 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
     {stage !== 'select' && <form className="form" onSubmit={e => { e.preventDefault(); void submit(); }}>
       {stage === 'preview' && <ul className="sync-preview">{selected.map(rule => {
         const row = rows.find(item => item.id === rule.id);
-        return <li key={rule.id}><b>{rule.title ?? row?.ours?.title ?? row?.theirs?.title ?? '凭证'}</b> · {modeText[rule.mode]}
+        const keptRemote = [row?.theirs, ...(row?.otherMatches ?? [])].flatMap(version => version ? [versionTitle(version)] : []);
+        return <li key={rule.id}><b>{rule.title ?? row?.ours?.title ?? row?.theirs?.title ?? '凭证'}</b> · {row ? modesFor(row, rule.mode) : modeText[rule.mode]}
+          {keptRemote.length > 1 && rule.mode !== 'ours' && <span>保留：{[...(rule.mode === 'both' ? [versionTitle(row?.ours ?? null)] : []), ...keptRemote].join('、')}</span>}
           {rule.mode === 'fields' && <span>{Object.entries(rule.fields ?? {}).map(([field, side]) => `${label[field] ?? field}：${side === 'ours' ? '版本 A' : '版本 B'}`).join('、')}</span>}
         </li>;
       })}</ul>}

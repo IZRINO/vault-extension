@@ -16,7 +16,7 @@ const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.e
 type CipherState = Pick<VaultFiles, 'head' | 'snap'>;
 type Verification = { before: number; after: number; removed: number; stamp: string; blocked: boolean };
 export type SyncResult =
-  | { kind: 'synced' | 'unchanged' | 'read-only' | 'unlinked' | 'locked' | 'paused' | 'empty'; pending: boolean }
+  | { kind: 'synced' | 'unchanged' | 'read-only' | 'deferred' | 'unlinked' | 'locked' | 'paused' | 'empty'; pending: boolean }
   | { kind: 'conflicts'; pending: boolean; count: number }
   | { kind: 'key-update'; pending: boolean; epoch: number }
   | { kind: 'confirm-deletion'; pending: true; before: number; after: number; removed: number; stamp: string };
@@ -67,13 +67,14 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   const directoryChanged = listing.length !== cached.size || listing.some(({ id, etag }) =>
     !cached.has(id) || (etag && anchor.objects.find(object => object.id === id)?.etag !== etag));
   const headDue = !anchor.checkedAt || Date.now() < anchor.checkedAt || Date.now() - anchor.checkedAt >= VERIFY_HEAD_EVERY_MS;
-  const shouldCompact = !!(options.compactWhenIdle && writeVerified && !anchor.conflictCount && (
+  const shouldCompact = !!(options.compactWhenIdle && writeVerified && !anchor.conflicts?.length && (
     listing.length >= 20 || (listing.length > 0 && anchor.objects.reduce((size, object) => size + object.bytes.length, 0) > anchor.snap.length / 4)));
   if (!directoryChanged && !headDue && !shouldCompact && !forceHead && !anchor.outbox &&
       !(writeVerified && anchor.pendingCompaction) && anchor.rotationFrom == null &&
-      (!pending || !writeVerified)) {
-    if (anchor.conflictCount) return { kind: 'conflicts', pending, count: anchor.conflictCount };
-    return { kind: pending ? 'read-only' : 'unchanged', pending };
+      (!(pending || anchor.draftCount) || !writeVerified)) {
+    const left = pending || !!anchor.draftCount;
+    if (anchor.conflictCount) return { kind: 'conflicts', pending: left, count: anchor.conflictCount };
+    return { kind: left ? 'read-only' : 'unchanged', pending: left };
   }
   const { key, wrap } = session;
   const oldHead = await derive<RemoteHeadInfo>('sync:authenticate-head', [anchor.head, key, wrap]);
@@ -168,11 +169,12 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
     return { ...anchor, head: head.bytes, snap: remoteSnap, etag: head.etag, objects: observed,
       appliedHead: view.head, appliedSnap: view.snap, hasRecords: anchor.hasRecords || remote.count > 0,
       outbox: undefined, pendingResolutions: undefined, checkedAt: Date.now(), conflicts: new Uint8Array(conflicts.conflicts), conflictCount: conflicts.conflictCount,
+      draftCount: conflicts.draftCount,
       rotationFrom: undefined, observedKeyEpoch: undefined, observedHead: undefined };
   };
   const nextFiles = (view: CipherState, count: number): VaultFiles => ({ ...files, ...view, updatedAtMs: Date.now(),
     everHadRecords: files.everHadRecords || count > 0 });
-  if (!pending && !outbox && !anchor.conflictCount) {
+  if (!pending && !outbox && !anchor.conflicts?.length) {
     if (!remote.conflictCount && writeVerified && head.etag && options.compactWhenIdle && uncompacted.length > 0 &&
         (uncompacted.length >= 20 || uncompacted.reduce((size, object) => size + object.bytes.length, 0) > remoteSnap.length / 4) &&
         (remote.count > 0 || !anchor.hasRecords)) {
@@ -210,7 +212,8 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   }
   const merged = await derive<ReplayOutput>('sync:reconcile', [key, wrap, common.head, common.snap,
     files.head, files.snap, remoteView.head, remoteView.snap, anchor.conflicts ?? new Uint8Array(),
-    new Uint8Array(remote.conflicts), resolutions]);
+    // Without an upload path or an existing durable WAL, leave deferred edits staged.
+    new Uint8Array(remote.conflicts), resolutions, pending || (writeVerified && !!head.etag), clock?.deviceId]);
   check();
   let mergedView = fromOutput(merged);
   const version = nextJournalVersion(clock, Date.now(), Math.max(remote.hlc, merged.hlc));
@@ -228,8 +231,12 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
     [key, wrap, localHead, remoteSnap, remoteView.head, remoteView.snap, mergedView.head, mergedView.snap, id, version.state.deviceId, resolutions]));
   check();
   if (!delta.length) {
-    await options.commit(ready(remoteView, merged), nextFiles(mergedView, merged.count), true);
-    return merged.conflictCount ? { kind: 'conflicts', pending: false, count: merged.conflictCount } : { kind: 'synced', pending: false };
+    const staged = ready(remoteView, merged);
+    if (merged.draftCount && writeVerified && head.etag && !merged.conflictCount) staged.checkedAt = undefined;
+    await options.commit(staged, nextFiles(mergedView, merged.count), true);
+    if (merged.conflictCount) return { kind: 'conflicts', pending: !!merged.draftCount, count: merged.conflictCount };
+    if (merged.draftCount) return { kind: writeVerified && head.etag ? 'deferred' : 'read-only', pending: true };
+    return { kind: writeVerified && head.etag ? 'synced' : 'read-only', pending: false };
   }
   if (!writeVerified || !head.etag) {
     // Pull and merge while retaining unsent edits. An outstanding PUT with unknown
@@ -271,9 +278,14 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   check();
   const view = fromOutput(final);
   const review = final.conflictCount ? await derive<ReplayOutput>('sync:reconcile', [key, wrap, mergedView.head, mergedView.snap,
-    mergedView.head, mergedView.snap, view.head, view.snap, new Uint8Array(merged.conflicts), new Uint8Array(final.conflicts)]) : merged;
+    mergedView.head, mergedView.snap, view.head, view.snap, new Uint8Array(merged.conflicts), new Uint8Array(final.conflicts), undefined, false, version.state.deviceId]) : merged;
   check();
-  await options.commit({ ...ready(view, review, appended), hasRecords: anchor.hasRecords || final.count > 0 },
+  // Reopen any draft behind a just-acknowledged resolution on the next poll.
+  // Replaying without a pending write must not treat it as already uploaded.
+  const recheck = review.conflicts.length && (resolutions.length || !review.conflictCount);
+  await options.commit({ ...ready(view, review, appended), ...(recheck ? { checkedAt: undefined } : {}),
+    hasRecords: anchor.hasRecords || final.count > 0 },
     nextFiles(final.conflictCount ? fromOutput(review) : view, final.conflictCount ? review.count : final.count), true);
-  return review.conflictCount ? { kind: 'conflicts', pending: false, count: review.conflictCount } : { kind: 'synced', pending: false };
+  if (review.conflictCount) return { kind: 'conflicts', pending: !!review.draftCount, count: review.conflictCount };
+  return review.draftCount ? { kind: 'deferred', pending: true } : { kind: 'synced', pending: false };
 }
