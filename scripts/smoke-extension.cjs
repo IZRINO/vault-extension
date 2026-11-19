@@ -11,6 +11,13 @@ const candidates = {
   edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   helium: 'C:/Program Files/imput/Helium/Application/chrome.exe',
 };
+async function fillDavInputs(page, config) {
+  await page.getByLabel('服务商', { exact: true }).selectOption('custom');
+  await page.getByLabel('WebDAV 根地址', { exact: true }).fill(config.base);
+  await page.getByLabel('网盘账号', { exact: true }).fill(config.username);
+  await page.getByLabel('应用专用密码', { exact: true }).fill(config.password);
+  await page.getByRole('checkbox', { name: /允许本机 HTTP 调试/ }).check();
+}
 async function verifyReadOnlySetup(page) {
   const dav = await webdavFixture();
   const storedConnection = () => page.evaluate(async () => {
@@ -22,11 +29,7 @@ async function verifyReadOnlySetup(page) {
     assert.deepEqual(dav.requests, [], 'The installation tab must not contact WebDAV before a test');
     const folder = page.getByLabel('同步目录名', { exact: true });
     const test = page.getByRole('button', { name: '测试连接', exact: true });
-    await page.getByLabel('服务商', { exact: true }).selectOption('custom');
-    await page.getByLabel('WebDAV 根地址', { exact: true }).fill(dav.config.base);
-    await page.getByLabel('网盘账号', { exact: true }).fill(dav.config.username);
-    await page.getByLabel('应用专用密码', { exact: true }).fill(dav.config.password);
-    await page.getByRole('checkbox', { name: /允许本机 HTTP 调试/ }).check();
+    await fillDavInputs(page, dav.config);
     const probe = async (directory, outcome, expectedPath) => {
       const start = dav.requests.length;
       const prior = [...dav.objects];
@@ -54,6 +57,48 @@ async function verifyReadOnlySetup(page) {
   await page.getByRole('button', { name: '测试连接', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('无法连接 WebDAV');
   assert.deepEqual(await storedConnection(), [{}, {}]);
+}
+
+async function verifyCircuitRecovery(page, send) {
+  const dav = await webdavFixture();
+  const retest = page.getByRole('button', { name: '重测已保存的连接', exact: true });
+  const save = page.getByRole('button', { name: '测试并保存连接', exact: true });
+  const password = page.getByLabel('应用专用密码', { exact: true });
+  const paused = page.getByRole('status').filter({ hasText: '网盘连接已暂停' });
+  const sealed = () => page.evaluate(async () => (await chrome.storage.local.get('webDavSealed')).webDavSealed);
+  try {
+    await page.getByRole('button', { name: '设置', exact: true }).click();
+    await page.getByRole('button', { name: /^网盘连接/ }).click();
+    await fillDavInputs(page, dav.config);
+    await page.getByLabel('同步目录名', { exact: true }).fill('scratch');
+    await save.click();
+    await expect(retest).toBeEnabled();
+    const before = await sealed();
+    dav.state.stopNextProbe = 401;
+    await retest.click();
+    await expect(paused).toContainText('修正连接设置');
+    await expect(retest).toBeDisabled();
+    assert.equal((await send({ type: 'webdav-status' })).paused, 401);
+    const start = dav.requests.length;
+
+    await password.fill(dav.config.password);
+    await save.click();
+    await expect(page.getByRole('alert')).toContainText('修正连接设置');
+    assert.deepEqual(dav.requests.slice(start), []);
+    assert.deepEqual(await sealed(), before);
+
+    dav.state.password = 'fixture-replaced-app-password';
+    await password.fill(dav.state.password);
+    await save.click();
+    await expect(retest).toBeEnabled();
+    await expect(paused).toHaveCount(0);
+    assert.deepEqual(dav.requests.slice(start), [{ method: 'PROPFIND', path: '/dav/scratch/', ifMatch: undefined }]);
+    assert.notDeepEqual(await sealed(), before);
+    assert(!JSON.stringify(await sealed()).includes(dav.state.password));
+    assert.equal((await send({ type: 'webdav-status' })).paused, undefined);
+    assert.deepEqual([...dav.objects], []);
+    assert.deepEqual([...dav.folders], ['/dav/', '/dav/scratch/']);
+  } finally { await dav.close(); }
 }
 
 async function run(name) {
@@ -130,6 +175,8 @@ async function run(name) {
     assert((await send({ type: 'status' })).unlocked);
     result.wakeMs = Math.round(performance.now() - start);
     assert.equal((await send({ type: 'list' })).length, 1);
+    await verifyCircuitRecovery(page, send);
+    result.davCircuitRecoveryReadOnly = true;
     const proof = { method: 'master', secret: 'Browser-Test-Master#2026' };
     await send({ type: 'create-pin', pin: '734928', proof });
     await send({ type: 'lock' });

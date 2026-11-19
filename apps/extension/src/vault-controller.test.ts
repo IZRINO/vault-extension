@@ -9,22 +9,25 @@ import initPreferences, { wasm_open_preferences, wasm_seal_preferences, wasm_ope
 import initSync, { wasm_make_local_wal, wasm_sync_import_pack, wasm_sync_verify_recovery, wasm_verify_local_wal } from '../../../crates/vault-sync/pkg/vault_sync.js';
 import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
+import { endpointFingerprint } from './sync/bootstrap';
+import { webDavConfig } from './sync/webdav';
 import { VaultController } from './vault-controller';
 import { offscreen } from './bridge';
 import type { BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
-import type { JournalCommit, LocalSettings, SessionState, VaultFiles } from './vault-storage';
+import type { JournalCommit, LocalSettings, RemoteAnchor, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
   failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown>,
   observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined,
-  remoteVaultId: undefined as string | undefined }));
+  remoteVaultId: undefined as string | undefined, remotePoll: undefined as Pick<RemoteAnchor, 'endpoint' | 'objects' | 'checkedAt'> | undefined }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
   loadRemoteAnchor: async (vaultId: string) => structuredClone(state.observedKeyUpdate ??
-    (state.remoteVaultId === vaultId ? { vaultId } : undefined)),
+    (state.remoteVaultId === vaultId ? { vaultId, ...state.remotePoll } : undefined)),
   loadJournal: async () => ({ clock: structuredClone(state.pendingWal.at(-1)?.state), legacy: state.legacy }),
+  hasPendingWal: async () => state.pendingWal.length > 0,
   saveVaultFiles: async (files: VaultFiles, change?: JournalCommit) => {
     if (state.failSave) throw new Error('Test disk write failed');
     state.files = structuredClone(files);
@@ -122,6 +125,7 @@ beforeEach(() => {
   state.local = {};
   state.observedKeyUpdate = undefined;
   state.remoteVaultId = undefined;
+  state.remotePoll = undefined;
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
     idle: { queryState: async () => state.idleState },
@@ -133,6 +137,99 @@ beforeEach(() => {
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
 describe('real WASM + background session integration', () => {
+  it.each([401, 403, 429])('requires a corrected saved application password and a successful probe after HTTP %s', async status => {
+    const input = { provider: 'koofr', base: '', folder: 'fixture', username: 'fixture-account', password: 'retired-app-password' } as const;
+    const corrected = { ...input, password: 'replacement-app-password' };
+    const listed = () => new Response('<multistatus xmlns="DAV:"><response><href>/dav/Koofr/fixture/</href><propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>',
+      { status: 207 });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => listed());
+    const setBadgeText = vi.fn();
+    vi.stubGlobal('browser', { ...browser, action: { setBadgeText, setBadgeBackgroundColor: vi.fn() } });
+    const controller = await unlocked();
+    let restarted: VaultController | undefined;
+    try {
+      await expect(controller.handle({ type: 'webdav-test', input, remember: true })).resolves.toMatchObject({ kind: 'empty' });
+      const before = structuredClone(state.local.webDavSealed);
+      fetchMock.mockResolvedValueOnce(new Response(null, { status }));
+      await expect(controller.handle({ type: 'webdav-test' })).rejects.toThrow();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(setBadgeText).toHaveBeenLastCalledWith({ text: '!' });
+
+      state.remoteVaultId = fixture.vaultId;
+      restarted = new VaultController();
+      await expect(restarted.handle({ type: 'webdav-scheduled' })).resolves.toMatchObject({ kind: 'paused' });
+      await expect(restarted.handle({ type: 'webdav-test' })).rejects.toThrow('修正连接设置');
+      await expect(restarted.handle({ type: 'webdav-test', input, remember: true })).rejects.toThrow('更换应用专用密码');
+      await expect(restarted.handle({ type: 'webdav-test', input: corrected })).rejects.toThrow('修正连接设置');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
+      await expect(restarted.handle({ type: 'webdav-test', input: corrected, remember: true })).resolves.toMatchObject({ kind: 'missing' });
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: true, paused: status });
+      expect(state.local.webDavSealed).toEqual(before);
+      expect(setBadgeText).toHaveBeenLastCalledWith({ text: '!' });
+
+      await expect(restarted.handle({ type: 'webdav-test', input: corrected, remember: true })).resolves.toMatchObject({ kind: 'empty', writeAllowed: false });
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: true, paused: undefined });
+      expect(state.local.webDavSealed).not.toEqual(before);
+      expect(setBadgeText).toHaveBeenLastCalledWith({ text: '' });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock.mock.calls.every(call => call[1]?.method === 'PROPFIND')).toBe(true);
+      expect(JSON.stringify(state.local)).not.toContain(corrected.password);
+    } finally {
+      await restarted?.lock();
+      await controller.lock();
+      fetchMock.mockRestore();
+    }
+  });
+
+  it.each([403, 429])('restarts linked polling after a non-Koofr HTTP %s without replacing a valid password', async status => {
+    const input = { provider: 'custom', base: 'https://dav.example.test/', folder: 'fixture', username: 'unprivileged', password: 'app-fixture-password' } as const;
+    const correctAccount = status === 403 ? { ...input, username: 'authorized' } : input;
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async url => {
+      const name = new URL(String(url)).pathname;
+      return new Response(`<multistatus xmlns="DAV:"><response><href>${name}</href><propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>`,
+        { status: 207 });
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let controller: VaultController | undefined, restarted: VaultController | undefined;
+    try {
+      controller = await unlocked();
+      await controller.handle({ type: 'webdav-test', input, remember: true });
+      fetchMock.mockResolvedValueOnce(new Response(null, { status }));
+      await expect(controller.handle({ type: 'webdav-test' })).rejects.toThrow();
+      await controller.lock();
+      state.remoteVaultId = fixture.vaultId;
+      state.remotePoll = { endpoint: await endpointFingerprint(webDavConfig(input).url), objects: [], checkedAt: Date.now() };
+      restarted = await unlocked();
+      const handle = vi.spyOn(restarted, 'handle');
+      const scheduled = () => handle.mock.results[handle.mock.calls.map(([message]) => message.type).lastIndexOf('webdav-scheduled')]?.value;
+      await vi.advanceTimersByTimeAsync(1200);
+      await expect(scheduled()).resolves.toMatchObject({ kind: 'paused' });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      await expect(restarted.handle({ type: 'webdav-test', input: { ...correctAccount, folder: 'different' }, remember: true }))
+        .rejects.toThrow('不同');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      await expect(restarted.handle({ type: 'webdav-test', input: correctAccount, remember: true })).resolves.toMatchObject({ kind: 'empty' });
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ linked: true, writeVerified: false });
+      handle.mockClear();
+      await vi.advanceTimersByTimeAsync(1200);
+      await expect(scheduled()).resolves.toEqual({ kind: 'unchanged', pending: false });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock.mock.lastCall?.[0]).toBe('https://dav.example.test/fixture/wal/');
+      const last = fetchMock.mock.lastCall?.[1];
+      expect(last?.method).toBe('PROPFIND');
+      expect(new Headers(last?.headers).get('Authorization')).toBe('Basic ' + btoa(`${correctAccount.username}:${correctAccount.password}`));
+    } finally {
+      await restarted?.lock();
+      await controller?.lock();
+      vi.useRealTimers();
+      fetchMock.mockRestore();
+    }
+  });
+
   it('tests new WebDAV settings read-only, persists a circuit break and applies opt-in HTTPS time to codes', async () => {
     const time = Math.floor(Date.now() / 30_000) * 30_000 + 95_000;
     const input = { provider: 'nutstore', base: '', folder: 'test', username: 'private-fixture-account', password: 'fixture-secret-for-this-test' } as const;

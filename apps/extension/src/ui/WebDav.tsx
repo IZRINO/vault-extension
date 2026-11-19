@@ -138,10 +138,14 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   }} />;
   if (editingDevices) return <SyncDevices close={() => setEditingDevices(false)} />;
   return <div className="form">
-    {status?.paused && <p className="banner banner-warn" role="status">网盘连接已暂停（HTTP {status.paused}）。修正设置并手动测试成功后恢复。</p>}
+    {status?.paused && <p className="banner banner-warn" role="status">网盘连接已暂停（HTTP {status.paused}）。{status.saved
+      ? `${status.paused === 401 ? '请修正连接设置，再测试并保存。' : '请手动测试并保存连接。'}Koofr 需更换应用专用密码。`
+      : '请核对设置后手动测试。'}</p>}
+    {status?.saved && status.linked && status.writeVerified === false && !status.paused && !status.localRestoreHeld &&
+      <p className="banner banner-warn" role="status">网盘当前只读。上传本机变更前需验证写入。</p>}
     {status?.localRestoreHeld && <p className="banner banner-warn" role="status">历史恢复仅保存在本机。启用网盘写入后，本机变更将参与同步。</p>}
     {!!status?.drafts && <p className="banner banner-warn" role="status">有 {status.drafts} 份草稿仍保存在本机，尚未上传。</p>}
-    {status?.saved && <div className="actions"><button type="button" className="btn" disabled={busy} onClick={() => void test(false)}>
+    {status?.saved && <div className="actions"><button type="button" className="btn" disabled={busy || status.paused != null} onClick={() => void test(false)}>
       <Ico of={RotateCw} />重测已保存的连接</button></div>}
     {status?.linked && <div className="actions">
       <button type="button" className="btn btn-primary" disabled={busy || status.paused != null} onClick={() => void sync(false)}><Ico of={RotateCw} />立即同步</button>
@@ -200,7 +204,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
         {joinReview && <button type="button" className="btn" disabled={busy} onClick={() => { setJoinReview(undefined); setSecret(''); setLocalMaster(''); }}>取消合并</button>}
       </div>
     </form>}
-    {!status?.linked && (result?.kind === 'empty' || result?.kind === 'missing') && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void create(); }}>
+    {!status?.linked && !status?.paused && (result?.kind === 'empty' || result?.kind === 'missing') && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void create(); }}>
       <TextField label="本机名称" value={deviceName ?? ''} onChange={setDeviceName} maxLength={80} disabled={busy} />
       <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy}
         hint="与同步目录同级，必须已存在且为空。只在此目录读写随机测试文件。" />
@@ -212,8 +216,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     </form>}
     {offset != null && <p className="hint">网盘时间与本机相差 {Math.abs(offset)} 秒，本机时钟{offset > 0 ? '偏慢' : '偏快'}。</p>}
     {status?.saved && <SwitchRow label="补偿时间验证码偏差" checked={status.compensation} disabled={busy || (!status.compensation && (status.paused != null || status.offsetSeconds == null))}
-      onChange={enabled => void run(async () => setStatus({ ...await request<DavConnectionStatus>({ type: 'webdav-clock', enabled }),
-        linked: status.linked, conflicts: status.conflicts }))} />}
+      onChange={enabled => void run(async () => setStatus(await request<DavConnectionStatus>({ type: 'webdav-clock', enabled })))} />}
     {stayLocal && <>
       <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => stayLocal('create')}>暂不配置，创建本地密码库</button>
       <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => stayLocal('restore')}>从本地备份恢复</button>

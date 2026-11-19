@@ -355,13 +355,26 @@ async function verifyBackupImport(edge, receiver, dav, resources, kit) {
   const after = await status(receiver);
   assert.equal(after.vaultId, target.vaultId);
   assert.equal(after.keyEpoch, target.keyEpoch);
+  const openDavSettings = async () => {
+    await view.reload();
+    await view.getByRole('button', { name: '设置', exact: true }).click();
+    await view.getByRole('button', { name: /^网盘连接/ }).click();
+    await expect(view.getByRole('button', { name: '重测已保存的连接', exact: true })).toBeEnabled();
+  };
+  const readOnly = view.getByRole('status').filter({ hasText: '网盘当前只读' });
+  await openDavSettings();
+  await expect(readOnly).toBeVisible();
+  assert.equal((await receiver.send({ type: 'webdav-status' })).writeVerified, false);
   await enableWrites(receiver, originalMaster);
+  await openDavSettings();
+  await expect(readOnly).toHaveCount(0);
+  assert.equal((await receiver.send({ type: 'webdav-status' })).writeVerified, true);
   assert.equal((await sync(receiver)).pending, false);
   await edge.send({ type: 'unlock', password: originalMaster });
   await sync(edge);
   assert.deepEqual(await titles(edge), await titles(receiver));
   console.log(JSON.stringify({ joinedWithTargetRecovery: true, filePasswordDidNotGrantRemoteIdentity: true, sourceRecoveryRejected: true,
-    wrongFilePasswordAndCancelDidNotImport: true, retainedTargetIdentity: true, initiallyReadOnly: true, syncedAfterWriteProof: true }));
+    wrongFilePasswordAndCancelDidNotImport: true, retainedTargetIdentity: true, initiallyReadOnly: true, readOnlyStatusSurvivesReload: true, syncedAfterWriteProof: true }));
 }
 
 async function run() {

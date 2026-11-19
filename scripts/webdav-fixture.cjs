@@ -6,7 +6,7 @@ async function webdavFixture() {
   const folders = new Set(['/dav/', '/dav/scratch/']);
   const requests = [];
   let generation = 0;
-  const state = { failWal: false, rejectNextHeadWrite: false };
+  const state = { failWal: false, rejectNextHeadWrite: false, password: 'fixture-app-password', stopNextProbe: undefined };
   const row = (path, folder, obj = objects.get(path)) => `<D:response><D:href>${path}</D:href><D:propstat>` +
     `<D:prop><D:resourcetype>${folder ? '<D:collection/>' : ''}</D:resourcetype>` +
     (obj ? `<D:getetag>${obj.tag}</D:getetag><D:getcontentlength>${obj.bytes.length}</D:getcontentlength>` : '') +
@@ -15,11 +15,17 @@ async function webdavFixture() {
     const url = new URL(req.url, 'http://127.0.0.1');
     const path = url.pathname;
     if (!/^\/dav\/[a-zA-Z0-9_./-]*$/.test(path) || url.search) { res.writeHead(404).end(); return; }
-    const auth = 'Basic ' + Buffer.from('fixture-user:fixture-app-password').toString('base64');
-    if (req.headers.authorization !== auth) { res.writeHead(401).end(); return; }
     requests.push({ method: req.method, path, ifMatch: req.headers['if-match'] });
+    const auth = 'Basic ' + Buffer.from('fixture-user:' + state.password).toString('base64');
+    if (req.headers.authorization !== auth) { res.writeHead(401).end(); return; }
     if (req.method === 'PROPFIND') {
       req.resume();
+      if (state.stopNextProbe) {
+        const status = state.stopNextProbe;
+        state.stopNextProbe = undefined;
+        res.writeHead(status).end();
+        return;
+      }
       if (req.headers.depth !== '1' || !folders.has(path)) { res.writeHead(404).end(); return; }
       const child = key => key.startsWith(path) && key !== path && !key.slice(path.length).replace(/\/$/, '').includes('/');
       const rows = [row(path, true), ...[...folders].filter(child).map(key => row(key, true)),
@@ -58,7 +64,7 @@ async function webdavFixture() {
   return {
     state, requests, objects, folders,
     config: { provider: 'custom', base: `http://127.0.0.1:${server.address().port}/dav/`, folder: 'vault',
-      username: 'fixture-user', password: 'fixture-app-password', confirmHttp: true },
+      username: 'fixture-user', password: state.password, confirmHttp: true },
     close: () => new Promise(resolve => server.close(resolve)),
   };
 }

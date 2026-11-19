@@ -559,6 +559,23 @@ export class VaultController {
     }, wait);
   }
 
+  private async davConnectionStatus(check: () => void) {
+    const { files, session } = this;
+    const state = await davStatus(files?.vaultId);
+    if (!files) return state;
+    const anchor = await store.loadRemoteAnchor(files.vaultId);
+    if (!anchor) return state;
+    let writeVerified = false;
+    if (session && state.saved && !state.paused && !anchor.localRestoreHeld) {
+      check();
+      const config = await openSavedDav(session, files.vaultId);
+      try { writeVerified = config.writeVerified === true && anchor.endpoint === await endpointFingerprint(config.url); }
+      finally { config.password = ''; config.username = ''; }
+    }
+    return { ...state, linked: true, writeVerified, conflicts: anchor.conflictCount ?? 0, drafts: anchor.draftCount ?? 0,
+      localRestoreHeld: !!anchor.localRestoreHeld };
+  }
+
   private async remoteKeyUpdate(password: string, check: () => void) {
     const files = this.files;
     if (!files || typeof password !== 'string' || !password || password.length > 1024) throw new Error('请输入远端库的新主密码。');
@@ -778,11 +795,7 @@ export class VaultController {
       return status;
     }
     if (message.type === 'webdav-update-key') return this.remoteKeyUpdate(message.password, check);
-    if (message.type === 'webdav-status') {
-      const state = await davStatus(this.files?.vaultId);
-      const anchor = this.files && await store.loadRemoteAnchor(this.files.vaultId);
-      return anchor ? { ...state, linked: true, conflicts: anchor.conflictCount ?? 0, drafts: anchor.draftCount ?? 0, localRestoreHeld: !!anchor.localRestoreHeld } : state;
-    }
+    if (message.type === 'webdav-status') return this.davConnectionStatus(check);
     if (message.type === 'webdav-create') return this.createLinkedVault(message, check);
     if (message.type === 'webdav-join' || message.type === 'webdav-merge') return this.joinRemoteVault(message, check);
     if (message.type === 'webdav-sync' || message.type === 'webdav-scheduled') return this.syncWebDav(message, check);
@@ -791,7 +804,12 @@ export class VaultController {
       if (this.files && (!engine.is_unlocked() || !this.session)) throw new Error('请先解锁密码库，再测试网盘连接。');
       const operation = this.davAbort.signal;
       try {
-        return await testDav(message.input, message.remember === true, this.session, this.files?.vaultId, { check, signal: operation });
+        const anchor = message.remember === true && this.files && await store.loadRemoteAnchor(this.files.vaultId);
+        check();
+        const { probe, resumed } = await testDav(message.input, message.remember === true, this.session, this.files?.vaultId,
+          { check, signal: operation }, anchor ? anchor.endpoint : undefined);
+        if (resumed && anchor) this.scheduleDav();
+        return probe;
       } finally { this.davClock = undefined; }
     }
     if (message.type === 'open') {
@@ -900,7 +918,7 @@ export class VaultController {
       case 'webdav-clock':
         await setDavCompensation(this.files.vaultId, message.enabled, check);
         this.davClock = undefined;
-        return davStatus(this.files.vaultId);
+        return this.davConnectionStatus(check);
       case 'preview-auth-backup':
       case 'import-auth-backup': {
         const { format, images, bytes: raw, password } = message;
