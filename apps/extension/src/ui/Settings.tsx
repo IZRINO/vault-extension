@@ -182,34 +182,89 @@ function Backup({ refresh }: { refresh(): Promise<void> }) {
   </>;
 }
 
+const browserSettingsPermission = { permissions: ['privacy' as const] };
+type NativeSavingState = 'ungranted' | 'available' | 'disabled' | 'policy' | 'other-extension' | 'unsupported';
+const nativeSavingMessages: Partial<Record<NativeSavingState, string>> = {
+  policy: '浏览器策略限制了原生保存提示设置。',
+  'other-extension': '另一个扩展正在控制原生保存提示。',
+  unsupported: '此浏览器未提供原生保存提示的设置接口。',
+};
+
+const nativePasswordSaving = () => browser.privacy?.services?.passwordSavingEnabled;
+async function readNativeSaving(): Promise<NativeSavingState> {
+  const preference = nativePasswordSaving();
+  if (!preference) return 'unsupported';
+  const { levelOfControl, value } = await preference.get({});
+  if (levelOfControl === 'controlled_by_this_extension') return value ? 'available' : 'disabled';
+  if (levelOfControl === 'controllable_by_this_extension') return 'available';
+  if (levelOfControl === 'controlled_by_other_extensions') return 'other-extension';
+  return 'policy';
+}
+
 function BrowserSettings() {
   const { busy, work, fail, notify } = useOps();
-  const [nativeDisabled, setNativeDisabled] = useState(false);
-  const [loaded, setLoaded] = useState(false);
+  const [state, setState] = useState<NativeSavingState>();
   useEffect(() => {
     let live = true;
-    void browser.permissions.contains({ permissions: ['privacy'] }).then(async granted => {
-      if (granted) {
-        const setting = await browser.privacy.services.passwordSavingEnabled.get({});
-        if (live) setNativeDisabled(setting.levelOfControl === 'controlled_by_this_extension' && !setting.value);
+    let revoked = false;
+    const onRemoved: Parameters<typeof browser.permissions.onRemoved.addListener>[0] = ({ permissions }) => {
+      if (permissions?.includes('privacy')) {
+        revoked = true;
+        setState('ungranted');
       }
-    }).catch(fail).finally(() => { if (live) setLoaded(true); });
-    return () => { live = false; };
+    };
+    browser.permissions.onRemoved.addListener(onRemoved);
+    void browser.permissions.contains(browserSettingsPermission).then(async granted => {
+      const latest = granted ? await readNativeSaving() : 'ungranted';
+      if (live && !revoked) setState(latest);
+    }).catch(error => { if (live && !revoked) fail(error); });
+    return () => {
+      live = false;
+      browser.permissions.onRemoved.removeListener(onRemoved);
+    };
   }, [fail]);
+  const disable = () => void work(async () => {
+    if (!await browser.permissions.request(browserSettingsPermission)) {
+      setState('ungranted');
+      notify('未授权，浏览器设置没有改变。');
+      return;
+    }
+    const before = await readNativeSaving();
+    if (before !== 'available') {
+      setState(before);
+      return;
+    }
+    await nativePasswordSaving()!.set({ value: false });
+    const actual = await readNativeSaving();
+    setState(actual);
+    if (actual === 'disabled') notify('已关闭浏览器的保存密码提示。');
+    if (actual === 'available') throw new Error('浏览器未应用保存提示设置。');
+  });
+  const revoke = () => void work(async () => {
+    if (!await browser.permissions.contains(browserSettingsPermission)) {
+      setState('ungranted');
+      return;
+    }
+    // Clear our override while we still have permission to use the setting API.
+    await nativePasswordSaving()?.clear({});
+    const actual = await readNativeSaving();
+    setState(actual);
+    if (actual === 'disabled') throw new Error('浏览器未恢复保存提示设置。');
+    await browser.permissions.remove(browserSettingsPermission);
+    if (await browser.permissions.contains(browserSettingsPermission)) throw new Error('浏览器未撤回设置权限。');
+    setState('ungranted');
+    notify('已撤回浏览器设置权限。');
+  });
+  const message = state && nativeSavingMessages[state];
   return <section className="section">
     <h2>浏览器的保存密码提示</h2>
-    <p className="lede">如果浏览器自带的保存提示让你困扰，可以在这里关闭。浏览器会先询问权限。</p>
-    <button type="button" className="btn" disabled={busy || !loaded} onClick={() => {
-      void browser.permissions.request({ permissions: ['privacy'] }).then(granted => {
-        if (!granted) { notify('未授权，浏览器设置没有改变。'); return; }
-        return work(async () => {
-          if (nativeDisabled) await browser.privacy.services.passwordSavingEnabled.clear({});
-          else await browser.privacy.services.passwordSavingEnabled.set({ value: false });
-          const setting = await browser.privacy.services.passwordSavingEnabled.get({});
-          setNativeDisabled(setting.levelOfControl === 'controlled_by_this_extension' && !setting.value);
-          notify(nativeDisabled ? '已交还浏览器控制。' : '已关闭浏览器的保存密码提示。');
-        });
-      }).catch(fail);
-    }}><Ico of={ArrowRightLeft} />{nativeDisabled ? '恢复浏览器设置' : '关闭原生保存提示'}</button>
+    {state === 'ungranted' && <p className="lede">关闭原生保存提示需要浏览器授权。</p>}
+    {message && <p className="hint" role="status">{message}</p>}
+    {(state === 'ungranted' || state === 'available') && <button type="button" className="btn" disabled={busy} onClick={disable}>
+      <Ico of={ArrowRightLeft} />关闭原生保存提示
+    </button>}
+    {state && state !== 'ungranted' && <button type="button" className="btn" disabled={busy} onClick={revoke}>
+      <Ico of={ArrowRightLeft} />{state === 'disabled' ? '恢复浏览器设置并撤回权限' : '撤回浏览器设置权限'}
+    </button>}
   </section>;
 }

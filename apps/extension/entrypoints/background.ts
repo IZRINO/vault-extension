@@ -1,6 +1,6 @@
-import { VaultController, LOCK_ALARM, CLIPBOARD_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
+import { VaultController, LOCK_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
 import { isVaultPage } from '../src/sender-policy';
-import { offscreen } from '../src/bridge';
+import { CLIPBOARD_ALARM, clearExpiredClipboard } from '../src/clipboard';
 import type { VaultMessage } from '../src/vault-messages';
 import { AutofillController } from '../src/autofill-controller';
 import type { AutofillMessage } from '../src/autofill-messages';
@@ -61,19 +61,7 @@ export default defineBackground(() => {
     if (alarm.name === LOCK_ALARM) void vault.handle({ type: 'status' }).then(status => {
       if (!(status as { unlocked: boolean }).unlocked) autofill.clear();
     });
-    if (alarm.name === CLIPBOARD_ALARM) void clearClipboard();
+    if (alarm.name === CLIPBOARD_ALARM) void clearExpiredClipboard().catch(() => undefined);
   });
-  async function clearClipboard() {
-    const { clipboard } = await browser.storage.session.get<{ clipboard: { hash: string; expiresAt: number } }>('clipboard');
-    if (!clipboard) return;
-    if (clipboard.expiresAt > Date.now()) {
-      await browser.alarms.create(CLIPBOARD_ALARM, { when: clipboard.expiresAt });
-      return;
-    }
-    try {
-      await offscreen('clear-clipboard', clipboard.hash);
-      await browser.storage.session.remove('clipboard');
-    } catch { await browser.alarms.create(CLIPBOARD_ALARM, { when: Date.now() + 30000 }); }
-  }
   browser.runtime.onStartup.addListener(() => { registerMenu(); void vault.lock(); });
 });

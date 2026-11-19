@@ -1,5 +1,6 @@
 import { loadVaultCore, randomBytes } from './vault-core';
 import { derive, offscreen } from './bridge';
+import { copyWithExpiry } from './clipboard';
 import * as store from './vault-storage';
 import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type EntePreview, type ItemSummary, type OtpCode, type Proof, type VaultItem, type VaultMessage, type VaultOpening, type VaultStatus } from './vault-messages';
 import { planEnteImport, type EnteBatch } from './ente-auth';
@@ -9,7 +10,6 @@ import { planMigration, type MigrationBatch } from './migration';
 import { MAX_MIGRATION_BYTES, type MigrationExport } from './vault-messages';
 
 export const LOCK_ALARM = 'vault-lock';
-export const CLIPBOARD_ALARM = 'vault-clipboard';
 export const IDLE_DETECTION_SECONDS = 60;
 type Core = Awaited<ReturnType<typeof loadVaultCore>>;
 type Engine = InstanceType<Core['WasmVaultEngine']>;
@@ -435,10 +435,7 @@ export class VaultController {
         check();
         if (code.kind === 'hotp') return null;
         const value = code.validTo != null && code.validTo - Math.floor(Date.now() / 1000) < 2 && code.nextValue ? code.nextValue : code.value;
-        const hash = await offscreen<string>('copy', value);
-        check();
-        await browser.storage.session.set({ clipboard: { hash, expiresAt: Date.now() + 30000 } });
-        await browser.alarms.create(CLIPBOARD_ALARM, { when: Date.now() + 30000 });
+        await copyWithExpiry(value, check);
         return true;
       }
       case 'list': return JSON.parse(engine.list_summaries_json());
@@ -500,11 +497,7 @@ export class VaultController {
         if (!Number.isInteger(message.minutes) || message.minutes < 1 || message.minutes > 240) throw new Error('锁定时间需为 1–240 分钟。');
         settings.autoLockMinutes = message.minutes; await store.saveSettings(settings); await this.touch(); return this.status();
       case 'copy-sensitive': {
-        // Install the alarm before copying; a worker restart retains the cleanup deadline.
-        await browser.alarms.create(CLIPBOARD_ALARM, { when: Date.now() + 30000 });
-        const hash = await offscreen<string>('copy', message.value);
-        await browser.storage.session.set({ clipboard: { hash, expiresAt: Date.now() + 30000 } });
-        await browser.alarms.create(CLIPBOARD_ALARM, { when: Date.now() + 30000 });
+        await copyWithExpiry(message.value, check);
         return null;
       }
       case 'export': {

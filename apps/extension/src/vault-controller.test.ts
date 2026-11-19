@@ -102,6 +102,76 @@ beforeEach(() => {
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
 describe('real WASM + background session integration', () => {
+  it('cleans the next copy even if the previous alarm was still removing its record', async () => {
+    await unlocked();
+    const clipboardAlarm = 'vault-clipboard';
+    const id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    let listenMessage!: (message: unknown, sender: unknown, respond: (reply: { ok: boolean; error?: string }) => void) => void;
+    let listenAlarm!: (alarm: { name: string }) => void;
+    let pending: unknown;
+    let clipboardText = '';
+    let allowRemoval!: () => void;
+    let markRemoval!: () => void;
+    const removalRequested = new Promise<void>(resolve => { markRemoval = resolve; });
+    const pauseRemoval = new Promise<void>(resolve => { allowRemoval = resolve; });
+    vi.stubGlobal('browser', {
+      storage: {
+        session: {
+          setAccessLevel: async () => undefined,
+          get: async () => ({ clipboard: structuredClone(pending) }),
+          set: async (entry: { clipboard: unknown }) => { pending = structuredClone(entry.clipboard); },
+          remove: async () => { markRemoval(); await pauseRemoval; pending = undefined; },
+        },
+        local: { setAccessLevel: async () => undefined },
+      },
+      idle: { queryState: async () => 'active', setDetectionInterval() {}, onStateChanged: { addListener() {} } },
+      runtime: {
+        id, onMessage: { addListener: (listener: typeof listenMessage) => { listenMessage = listener; } },
+        onInstalled: { addListener() {} }, onStartup: { addListener() {} },
+      },
+      tabs: { onRemoved: { addListener() {} } },
+      commands: { onCommand: { addListener() {} } },
+      contextMenus: { onClicked: { addListener() {} } },
+      alarms: { create: async () => undefined, onAlarm: { addListener: (listener: typeof listenAlarm) => { listenAlarm = listener; } } },
+    });
+    vi.stubGlobal('defineBackground', (main: () => void) => main);
+    const { default: startBackground } = await import('../entrypoints/background');
+    (startBackground as unknown as () => void)();
+    const sendCopy = (value: string) => new Promise<void>((resolve, reject) => {
+      listenMessage({ target: 'vault', type: 'copy-sensitive', value }, { id, url: `chrome-extension://${id}/sidepanel.html` },
+        reply => reply.ok ? resolve() : reject(new Error(reply.error)));
+    });
+    vi.mocked(offscreen).mockImplementation(async (operation, payload) => {
+      if (operation === 'copy') {
+        clipboardText = String(payload);
+        return 'digest:' + clipboardText;
+      }
+      if (operation === 'clear-clipboard' && payload === 'digest:' + clipboardText) clipboardText = '';
+      return null;
+    });
+    const clock = vi.spyOn(Date, 'now');
+    let stamp = Date.now();
+    clock.mockImplementation(() => stamp);
+    try {
+      await sendCopy('first clipboard fixture');
+      stamp += 30001;
+      listenAlarm({ name: clipboardAlarm });
+      await removalRequested;
+      const laterCopy = sendCopy('second clipboard fixture');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      allowRemoval();
+      await laterCopy;
+      expect(clipboardText).toBe('second clipboard fixture');
+      stamp += 30001;
+      listenAlarm({ name: clipboardAlarm });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(clipboardText).toBe('');
+    } finally {
+      allowRemoval();
+      clock.mockRestore();
+      vi.mocked(offscreen).mockReset();
+    }
+  });
   it('keeps website preferences encrypted, preserves them across password rotation and rejects tampering', async () => {
     const flags = { inlineDisabled: true, saveDisabled: true, passkeyDisabled: false };
     const controller = await unlocked();

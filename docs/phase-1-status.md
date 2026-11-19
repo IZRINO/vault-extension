@@ -93,11 +93,24 @@ Popup 打开时并行加载界面和库数据，用一次受信消息读取状�
 
 生产构建、主 WASM 大小门禁、Rust 33 项、TypeScript、后台 38 项及 Edge/Helium 安装冒烟通过。真实 WASM 集成测试覆盖会话过期、会话损坏、清理期间收到请求以及模拟系统已锁定四种情况。
 
+## T02 原生侧栏补验（2026-11-19）
+
+在 `ad45298` 的生产包上运行 `pnpm run test:sidepanel`。Edge 157.0.4341.60 和 Helium 157.0.8103.78 分别使用独立配置，点击扩展的「打开浏览器侧栏」进入。脚本通过 `runtime.getContexts()` 确认浏览器将面板登记为 `SIDE_PANEL`，再向面板发送鼠标和键盘事件。[侧栏 API](https://developer.chrome.com/docs/extensions/reference/api/sidePanel) · [扩展上下文类型](https://developer.chrome.com/docs/extensions/reference/api/runtime#type-ContextType)
+
+初次双浏览器回归通过新增、搜索、编辑合成登录项、取消二次验证、拒绝错误主密码、正确验证后查看和保存。取消受保护条目的复制时没有创建剪贴板清理任务。浏览器设置可在未取得 `privacy` 时打开，手动锁库后侧栏回到解锁界面。两端均无侧栏脚本错误。脚本每次成功时将结果写入 `test-results/sidepanel.json`。
+
+密码和网页取码共用剪贴板清理流程。复制、登记清理任务和闹钟清理按顺序执行，旧任务无法删除新复制的清理记录。后台回归先复现了新值到期后仍残留的问题，修复后通过。
+
+浏览器设置在写入前检查控制权，写入后复读实际状态。策略或其他扩展阻止写入时会显示原因。撤回 `privacy` 前先清除 Vault 自己的覆盖设置。用同一生产包的设置页接入模拟浏览器接口，验证了拒绝授权、策略限制、正常关闭、恢复并撤回，未发现页面错误或请求失败。[设置控制权](https://developer.chrome.com/docs/extensions/reference/api/types) · [可选权限](https://developer.chrome.com/docs/extensions/reference/api/permissions)
+
+当前生产构建、主 WASM 体积（255,548 字节）、Rust 33 项、TypeScript 和 Vitest 39 项通过。`pnpm run test:sidepanel` 在创建测试库前检查锁屏状态。桌面解锁后，Edge 和 Helium 在当前构建上均通过原生侧栏新增、搜索、编辑、二次验证、取消复制、手动锁库和模拟权限流程，侧栏控制台均无错误。
+
 ## 尚待人工验收
 
-- 用实际 Windows Hello 注册并解锁，确认当前系统是否能提供 PRF。虚拟认证器已验证支持与不支持两条分支，但不能证明本机物理认证器的能力。
-- 实际锁定 Windows，解锁系统后确认密码库仍处于锁定状态。
-- 在交互式 Edge 与 Helium 中使用浏览器原生侧栏及可选 privacy 权限开关，确认权限提示与浏览器策略行为。
-- HIBP 在线请求未访问真实服务；本地 SHA-1 前缀和响应匹配逻辑有测试，网络失败分支由后台处理。
+- 在测试库注册 Windows Hello，手动锁库后用「系统解锁」验证断言。记录系统和设备是否提供 PRF。遇到不支持 PRF 的设备时检查 PIN 引导及系统解锁状态。
+- 在库解锁时用 `Win+L` 锁定 Windows。重新登录后打开原生侧栏，确认密码库仍处于锁定状态。
+- 在 Edge 和 Helium 原生侧栏通过二次验证复制合成密码，等待约 30 秒检查清理。再复制一次，在等待期间把剪贴板换成普通测试文本，确认文本在清理后仍存在。
+- 用隔离配置操作「设置 → 浏览器设置」，验收拒绝及授予 `privacy`。关闭提示后选择「恢复浏览器设置并撤回权限」，确认浏览器恢复此前的设置且权限已撤回。有受管理的测试配置时，记录策略限制和界面反馈。
+- 真实 HIBP 请求待验。实测需要用合成凭证逐次同意联网。本地 SHA-1 前缀和响应匹配已有测试。
 
 加载目录：apps/extension/.output/chrome-mv3。首次正式使用前保存应急恢复包及独立加密备份。恢复码用于解密仍存在的密码库，不能替代已删除数据的备份。
