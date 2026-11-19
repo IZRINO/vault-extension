@@ -1,6 +1,6 @@
 # 验证器备份的公开测试样本
 
-用于 T32（2FAS）、T33（Aegis）和 T34（andOTP、Stratum）的离线兼容核验。下列文件是上游测试夹具，不是实际账号。只读使用，不复制进仓库，也不输出验证码种子。
+用于 T32（2FAS）、T33（Aegis）和 T34（Raivo、andOTP、Stratum）的离线兼容核验。只加载公开测试夹具或生成的合成数据，不复制个人备份进仓库，也不输出验证码种子。
 
 ## 2FAS
 
@@ -31,3 +31,9 @@ node scripts/test-migration.cjs
 ## Aegis、andOTP 和 Stratum
 
 同一上游目录中的 `aegis_plain.json`、`aegis_encrypted.json`、`andotp_plain.json`、`stratum_plain.json` 分别恢复 7 条，涵盖 TOTP、HOTP、Steam，无解析跳过。[Aegis 的分组样本](https://github.com/beemdevelopment/Aegis/blob/d6f4e5925a97e4e91593f1542085eae03432a759/app/src/test/resources/com/beemdevelopment/aegis/vault/aegis_plain_grouped_v2.json)同样恢复 7 条，其中三条有标签。这里验证的是公开夹具和当前解析器，不是最新移动应用的人工迁移；也不包含 Raivo 原生导出、andOTP/Stratum 的加密变体或其它未实测格式。
+
+## Raivo
+
+[Raivo iOS 导出实现](https://github.com/raivo-otp/ios-application/blob/8ea4901b49996b9237d8e937aa2fa14890f2d43d/Raivo/Features/DataExportFeature.swift)会把 `raivo-otp-export.json` 和 `.html` 打进不压缩的 AES ZIP。[导出字段定义](https://github.com/raivo-otp/ios-application/blob/8ea4901b49996b9237d8e937aa2fa14890f2d43d/Raivo/Models/Password.swift)将 `digits`、`timer`、`counter`、`pinned` 等写为字符串。旧解析器读出参数但丢弃 `pinned`；现保留置顶。
+
+`node scripts/test-authenticator-fixtures.cjs --raivo` 用本机 `7z`（或 `VAULT_7ZIP_PATH`）在临时目录生成含同名两份成员的 AES-256 ZIP，核对封装类型，再调用发布用 WASM 恢复两条 OTP。账号、签发方、位数、置顶和步长／计数按生成数据核对，实际生成值另以 Node HMAC 对照；错密或截断整个拒绝。另有 Vitest 覆盖原始 JSON 和未加密 ZIP。此处没有运行来源 iOS 应用，不算原生样本验收；HTML 与外部图标不导入、不联网读取。

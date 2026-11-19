@@ -158,6 +158,21 @@ describe('authenticator migration with independently generated fixtures', () => 
     expect(() => parseAuth('andotp', Buffer.from('Encrypted fixture'))).toThrow();
     expect(() => parseAuth('raivo', Buffer.alloc(4 * 1024 * 1024 + 1))).toThrow();
   });
+
+  it('preserves Raivo native string pins, parameters and HOTP counters', () => {
+    const raivo = bin([
+      { kind: 'totp', account: 'time-fixture', issuer: 'Example', secret: base32, algorithm: 'SHA512', timer: '45', digits: '8', pinned: 'true' },
+      { kind: 'hotp', account: 'counter-fixture', issuer: 'Example', secret: base32, algorithm: 'SHA1', counter: '13', digits: '6', pinned: 'false' },
+    ]);
+    for (const bytes of [raivo, zip({ 'raivo-otp-export.json': raivo })]) {
+      const { rows, invalid, unsupported } = parseAuth('raivo', bytes);
+      expect(invalid + unsupported).toBe(0);
+      expect(rows).toMatchObject([
+        { pinned: true, data: { username: 'time-fixture' } }, { pinned: false, data: { username: 'counter-fixture' } },
+      ]);
+      expect(rows.map(codeAt)).toEqual([independentCode('sha512', Math.floor(now / 45), 8), independentCode('sha1', 13, 6)]);
+    }
+  });
 });
 
 const origin = 'https://login.example.com', rpId = 'example.com', master = 'Synthetic-Only-Master#311';

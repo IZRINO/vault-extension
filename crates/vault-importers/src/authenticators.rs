@@ -290,7 +290,7 @@ fn raivo_or_andotp(bytes: &[u8], password: &str, raivo: bool) -> Result<Batch> {
             secret: str_at(row, "secret"), algorithm: str_at(row, "algorithm"), digits: number(row, "digits"),
             period: number(row, if raivo { "timer" } else { "period" }), counter: number(row, "counter"),
             tags: row["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).take(32).collect(),
-            note: "", pinned: false });
+            note: "", pinned: raivo && (str_at(row, "pinned") == "true" || row["pinned"].as_bool() == Some(true)) });
     }
     Ok(batch)
 }

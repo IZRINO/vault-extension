@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
 const { createDecipheriv, createHash, createHmac, pbkdf2Sync } = require('node:crypto');
 const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 
 // Public Aegis test vectors, pinned in docs/agents/authenticator-backup-fixtures.md.
@@ -66,9 +68,61 @@ function independentCode(secret, algorithm, steps, digits, steam) {
   }).join('');
 }
 
+async function raivoArchive() {
+  const [imports, otp] = await Promise.all(['vault-importers', 'vault-otp'].map(wasm));
+  const temp = path.resolve(os.tmpdir());
+  const dir = await fs.mkdtemp(path.join(temp, 'vault-raivo-fixture-'));
+  const filePassword = 'Raivo-Synthetic-ZIP-Only#27';
+  const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+  const json = 'raivo-otp-export.json', html = 'raivo-otp-export.html', filename = 'raivo-otp-export.zip';
+  const samples = [
+    { issuer: 'Example', account: 'time-fixture', secret, algorithm: 'SHA512', digits: '8', kind: 'totp', timer: '45', pinned: 'true', counter: '0', iconType: '', iconValue: '' },
+    { issuer: 'Example', account: 'counter-fixture', secret, algorithm: 'SHA1', digits: '6', kind: 'hotp', timer: '30', pinned: 'false', counter: '13', iconType: '', iconValue: '' },
+  ];
+  try {
+    await fs.writeFile(path.join(dir, json), JSON.stringify(samples), 'utf8');
+    await fs.writeFile(path.join(dir, html), '<!doctype html><title>Synthetic fixture</title>', 'utf8');
+    const archive = ['a', '-tzip', '-mm=Copy', '-mem=AES256', '-mx=0', `-p${filePassword}`, filename, json, html];
+    execFileSync(process.env.VAULT_7ZIP_PATH || '7z', archive, { cwd: dir, windowsHide: true });
+    const listing = execFileSync(process.env.VAULT_7ZIP_PATH || '7z', ['l', '-slt', filename], { cwd: dir, windowsHide: true, encoding: 'utf8' });
+    const files = listing.split(/\r?\n\r?\n/);
+    for (const name of [json, html]) {
+      const entry = files.find(file => file.split(/\r?\n/).includes(`Path = ${name}`));
+      assert.match(entry ?? '', /^Method = AES-256 Store\r?$/m, `${name} must be encrypted`);
+    }
+    const bytes = await fs.readFile(path.join(dir, filename));
+    const parse = (input, password) => JSON.parse(imports.wasm_parse_authenticator_backup('raivo', input, password));
+    const result = parse(bytes, filePassword);
+    assert.equal(result.rows.length, 2);
+    assert.equal(result.invalid + result.unsupported, 0);
+    for (const [i, row] of result.rows.entries()) {
+      const source = samples[i];
+      const uri = new URL(row.data.totpUri);
+      assert.equal(uri.hostname, source.kind);
+      assert.equal(uri.searchParams.get('digits'), source.digits);
+      assert.equal(uri.searchParams.get('issuer'), source.issuer);
+      assert.equal(row.data.username, source.account);
+      assert.equal(row.pinned, source.pinned === 'true');
+      const steps = source.kind === 'hotp' ? Number(source.counter) : Math.floor(now / Number(source.timer));
+      assert.equal(uri.searchParams.get(source.kind === 'hotp' ? 'counter' : 'period'), source.kind === 'hotp' ? source.counter : source.timer);
+      const code = JSON.parse(otp.wasm_otp_at(row.data.totpUri, now, 0)).value;
+      assert.equal(code, independentCode(secret, source.algorithm.toLowerCase(), steps, Number(source.digits), false));
+    }
+    assert.throws(() => parse(bytes, 'Wrong test password'));
+    assert.throws(() => parse(bytes.subarray(0, -32), filePassword));
+    console.log(JSON.stringify({ fixture: 'Raivo format generated with 7-Zip', aes256: true, restored: 2, pinAndOtpVerified: true,
+      wrongPasswordAndTruncationRejected: true }));
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), temp);
+    assert(path.basename(dir).startsWith('vault-raivo-fixture-'));
+    await fs.rm(dir, { recursive: true, maxRetries: 3, retryDelay: 200 });
+  }
+}
+
 async function run() {
   const dir = process.argv[2];
   assert(dir && process.argv.length === 3, 'Usage: node scripts/test-authenticator-fixtures.cjs <public fixture directory>');
+  if (dir === '--raivo') return raivoArchive();
   const [imports, otp] = await Promise.all(['vault-importers', 'vault-otp'].map(wasm));
   const read = async (name, hash) => {
     const bytes = await fs.readFile(path.join(dir, name));
