@@ -48,7 +48,7 @@
 
 ### 3. Passkey 软认证器与原生无缝回退
 - 采用 `MAIN` World（`document_start`）桥接 `navigator.credentials` 的行业成熟方案（避免 `chrome.webAuthenticationProxy` 全局挂起系统生物识别与物理硬件密钥）：
-  - 用户确认使用扩展 Passkey → 由 Rust/WASM 软认证器完成 RP ID 防钓鱼校验与签名，返回原型链对齐的 `PublicKeyCredential`（默认 `fmt: "none"` 无硬件追踪指纹，置位 `BE=1 / BS=1` 多端同步标记，默认 `signCount = 0` 防多端离线计数器回退误封）；
+  - 用户选择扩展 Passkey 后，软认证器校验 RP ID 并返回 `PublicKeyCredential`（默认 `fmt: "none"`、`signCount = 0`）。网站要求验证用户时，不能用库已解锁或点击凭证代替本次验证。备份资格 `BE` 在创建时确定；只有确认已有可恢复副本才报告 `BS=1`；
   - 用户选择「使用系统 / 硬件密钥」→ 直接透传原生 WebAuthn 接口，无缝唤起 **Windows Hello 或物理 YubiKey**。
 - 支持 `Conditional UI`（`autocomplete="username webauthn"`）输入框内联一键无密登录。
 
@@ -138,7 +138,7 @@
 - **网盘开箱预设与专项保护**：
   - **坚果云（Nutstore）**：自动拼接独立子目录并按序执行 `MKCOL` 建库，单次轮询仅 1 次 `PROPFIND`（`< 2 KB`），远低于免费版限流阈值。
   - **Koofr**：固化区分大小写的 `/dav/Koofr/` 标准路径；内置 **`401/403/429` 鉴权防锁号熔断器**，避免后台重试触发 Koofr 1 小时封禁；全程采用不可变追加写，不发 `LOCK` 请求，彻底规避 `423 Locked` 锁残留。
-  - **自定义 WebDAV**：支持 Nextcloud、群晖 NAS、OpenList 等任意标准 HTTPS WebDAV 服务。
+  - **自定义 WebDAV**：可配置 Nextcloud、群晖 NAS、OpenList 等 HTTPS 服务。不能证明服务会拒绝过期条件写时，只支持读取恢复，不建库、不上传、不清理。
 - **防丢库与多端冲突治理**：
   - **首屏 WebDAV 优先引导 & 空库熔断**：首次连接先探测远端，有数据则直接进入拉取恢复；本地有效条目归零或单次骤减 `>= 50%` 时硬拦截静默推送。
   - **端到端加密设备溯源（`DeviceMetadata`）**：精准识别本机历史包防幂等自冲突，支持重装系统后认领旧电脑身份。
@@ -162,7 +162,7 @@
 | **二步验证（一等公民）** | **Ente Auth** | **纯文本 `.txt`**、加密 `.json` | **双向无损互通**：TOTP + HOTP + Steam + `codeDisplay`（置顶/标签/备注/回收站）+ 智能合并入已有密码项 |
 | **二步验证** | **Google Authenticator / 2FAS / Aegis / Raivo / andOTP / Stratum** | `otpauth-migration://` 二维码、`.2fas`、加密 `.json`、`.txt` | 批量 TOTP / HOTP / Steam（支持本地直解 2FAS 与 Aegis 加密备份） |
 
-**支持导出格式**：原生强加密完整备份包（`.vaultpack`）、FIDO CXF 1.0（`.cxf`）、Bitwarden 兼容 JSON、Ente Auth 纯文本（`.txt`）及通用 CSV（强制主密码二次验证）。
+**规划的导出格式**：原生加密备份（`.vaultpack`）、FIDO CXF 1.0（`.cxf`）、Bitwarden JSON、Ente Auth 文本及通用 CSV。所有整库导出均须重新验证当前库主密码，PIN 和独立文件密码不可替代；明文另需风险确认。原生备份尚需按 [#37](https://github.com/IZRINO/vault-extension/issues/37) 对齐此规则；日常看码、填码不交付种子的修正见 [#38](https://github.com/IZRINO/vault-extension/issues/38)。
 
 ---
 
@@ -186,7 +186,7 @@ vault-extension/
 ├── Cargo.toml                                # Rust Workspace 根配置
 ├── package.json                              # Monorepo 脚本入口
 ├── pnpm-workspace.yaml                       # pnpm 工作区定义
-├── 密码管理器浏览器插件-技术架构与选型文档.md # 完整技术架构与协议设计规范 (v1.3)
+├── 密码管理器浏览器插件-技术架构与选型文档.md # 完整技术架构与协议设计规范 (v1.4)
 ├── 分期开发与验证计划.md                     # Phase 1–4 研发任务拆解与测试验收清单
 ├── crates/
 │   ├── vault-core/                           # 常驻核心安全引擎 WASM 包 (密码学/Passkey/2FA/同步编解码/三路合并)
