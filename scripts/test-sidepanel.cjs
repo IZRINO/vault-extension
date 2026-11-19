@@ -126,6 +126,7 @@ async function exercise(panel) {
   await expect.poll(() => text('.identity h2')).toBe(title);
 
   await button('编辑');
+  await verify(master);
   const edited = title + ' edited';
   await panel.fill('input', '名称', edited);
   await button('保存凭证');

@@ -26,9 +26,17 @@ pub struct Otp {
     period: u64,
     pub kind: Kind,
     pub counter: u64,
+    pub counter_unverified: bool,
     pub label: String,
     pub issuer: String,
     pub code_display: Zeroizing<String>,
+}
+
+impl Otp {
+    pub fn metadata_for_export(&self) -> (Zeroizing<String>, &'static str, u32, u64) {
+        let hash = match self.algorithm { Algorithm::Sha1 => "sha1", Algorithm::Sha256 => "sha256", Algorithm::Sha512 => "sha512" };
+        (encode_base32(&self.secret), hash, self.digits, self.period)
+    }
 }
 
 impl Drop for Otp {
@@ -96,7 +104,7 @@ fn base32(value: &[u8]) -> Result<Zeroizing<Vec<u8>>, &'static str> {
     Ok(secret)
 }
 
-fn encode_base32(secret: &[u8]) -> Zeroizing<String> {
+pub fn encode_base32(secret: &[u8]) -> Zeroizing<String> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut encoded = Zeroizing::new(String::new());
     let (mut acc, mut bits) = (0u16, 0);
@@ -118,7 +126,7 @@ pub fn parse(value: &str) -> Result<Otp, &'static str> {
     if value.len() > MAX_SETUP_BYTES { return Err(invalid()); }
     let mut result = Otp {
         secret: Zeroizing::new(Vec::new()), algorithm: Algorithm::Sha1, digits: 6, period: 30,
-        kind: Kind::Totp, counter: 0, label: String::new(), issuer: String::new(),
+        kind: Kind::Totp, counter: 0, counter_unverified: false, label: String::new(), issuer: String::new(),
         code_display: Zeroizing::new(String::new()),
     };
     if let Some(uri) = value.strip_prefix("otpauth://") {
@@ -132,7 +140,7 @@ pub fn parse(value: &str) -> Result<Otp, &'static str> {
             let (key, value) = param.split_once('=').ok_or_else(invalid)?;
             let flag = match key {
                 "secret" => 1, "algorithm" => 2, "digits" => 4, "period" => 8, "counter" => 16,
-                "issuer" => 32, "codeDisplay" => 64, _ => continue,
+                "issuer" => 32, "codeDisplay" => 64, "vaultCounterUnverified" => 128, _ => continue,
             };
             if seen & flag != 0 { return Err(invalid()); }
             seen |= flag;
@@ -147,6 +155,8 @@ pub fn parse(value: &str) -> Result<Otp, &'static str> {
                 8 => result.period = decoded.parse::<u64>().ok().filter(|p| (1..=86400).contains(p)).ok_or_else(invalid)?,
                 16 => result.counter = decoded.parse::<u64>().map_err(|_| invalid())?,
                 32 => result.issuer = decoded.to_string(),
+                128 if decoded.as_str() == "1" && result.kind == Kind::Hotp => result.counter_unverified = true,
+                128 => return Err(invalid()),
                 _ => result.code_display = decoded,
             }
         }
@@ -177,7 +187,10 @@ impl Otp {
         let label = if self.label.is_empty() { "Account" } else { &self.label };
         let mut uri = Zeroizing::new(format!("otpauth://{}/{}?secret={}&algorithm={algorithm}&digits={}&period={}&issuer={}",
             self.kind.as_str(), uri_encode(label), &*encode_base32(&self.secret), self.digits, self.period, uri_encode(&self.issuer)));
-        if self.kind == Kind::Hotp { uri.push_str(&format!("&counter={}", self.counter)); }
+        if self.kind == Kind::Hotp {
+            uri.push_str(&format!("&counter={}", self.counter));
+            if self.counter_unverified { uri.push_str("&vaultCounterUnverified=1"); }
+        }
         if !self.code_display.is_empty() { uri.push_str(&format!("&codeDisplay={}", uri_encode(&self.code_display))); }
         uri
     }
@@ -269,6 +282,7 @@ struct Code {
 fn generate(setup: &str, timestamp_secs: f64, offset_secs: i32) -> Result<String, &'static str> {
     let mut otp = parse(setup)?;
     let code = if otp.kind == Kind::Hotp {
+        if otp.counter_unverified { return Err("无法确认此计数验证码的最新计数。请先同步可信副本，或在网站重新登记。"); }
         let counter = otp.counter;
         otp.counter = counter.checked_add(1).ok_or("计数器已用尽，请重新设置网站的两步验证。")?;
         Code { kind: "hotp", value: otp.code_for_counter(counter), valid_to: None, next_value: None,
@@ -291,6 +305,14 @@ pub fn wasm_otp_at(setup: String, timestamp_secs: f64, offset_secs: i32) -> Resu
 mod tests {
     use super::*;
     const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    #[test]
+    fn restored_unknown_hotp_counter_is_not_used() {
+        let setup = format!("otpauth://hotp/Example?secret={SECRET}&counter=5&vaultCounterUnverified=1");
+        let otp = parse(&setup).unwrap();
+        assert!(otp.counter_unverified && otp.canonical_uri().contains("vaultCounterUnverified=1"));
+        assert!(generate(&setup, 0.0, 0).unwrap_err().contains("无法确认"));
+    }
 
     #[test]
     fn rfc_6238_appendix_b() {

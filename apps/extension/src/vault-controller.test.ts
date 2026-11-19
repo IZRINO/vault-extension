@@ -1,26 +1,34 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
-import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente_auth, wasm_parse_bitwarden, wasm_export_bitwarden, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente_auth, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv,
+  wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
 import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
-import initPreferences, { wasm_open_preferences, wasm_seal_preferences } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
+import initPreferences, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav,
+  wasm_sign_authorization, wasm_verify_authorization } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
+import initSync, { wasm_make_local_wal, wasm_sync_import_pack, wasm_verify_local_wal } from '../../../crates/vault-sync/pkg/vault_sync.js';
 import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
 import { VaultController } from './vault-controller';
 import { offscreen } from './bridge';
-import type { BackupExport, BrowserCsvPreview, EntePreview, OtpCode, VaultStatus, VaultItem, ItemSummary } from './vault-messages';
-import type { LocalSettings, SessionState, VaultFiles } from './vault-storage';
+import type { BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
+import type { JournalCommit, LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
-  failSave: false, pendingHotp: undefined as Uint8Array | undefined, local: {} as Record<string, unknown> }));
+  failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown> }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
-  saveVaultFiles: async (files: VaultFiles, queueHotpChange = false) => {
+  loadRemoteAnchor: async () => undefined,
+  loadJournal: async () => ({ clock: structuredClone(state.pendingWal.at(-1)?.state), legacy: state.legacy }),
+  saveVaultFiles: async (files: VaultFiles, change?: JournalCommit) => {
     if (state.failSave) throw new Error('Test disk write failed');
     state.files = structuredClone(files);
-    if (queueHotpChange) state.pendingHotp = new Uint8Array(files.snap);
+    if (change) {
+      state.pendingWal.push(structuredClone(change));
+      if (change.replaceLegacy) state.legacy = false;
+    }
   },
   loadSessionState: async () => structuredClone(state.session),
   saveSessionState: async (session: SessionState) => { state.session = structuredClone(session); },
@@ -35,17 +43,32 @@ vi.mock('./vault-core', () => ({ loadVaultCore: async () => wasm, randomBytes: (
 vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
   derive: async (operation: string, args: unknown[]) => {
+    if (operation === 'sync:local-wal') return Array.from(wasm_make_local_wal(...args as Parameters<typeof wasm_make_local_wal>));
+    if (operation === 'sync:import-pack') {
+      const result = wasm_sync_import_pack(...args as Parameters<typeof wasm_sync_import_pack>);
+      try { return { head: Array.from(result.head), snap: Array.from(result.snap), added: result.added, updated: result.updated, skipped: result.skipped }; }
+      finally { result.free(); }
+    }
+    if (operation === 'sign-authorization') return Array.from(wasm_sign_authorization(...args as Parameters<typeof wasm_sign_authorization>));
+    if (operation === 'verify-authorization') return wasm_verify_authorization(...args as Parameters<typeof wasm_verify_authorization>);
     if (operation === 'seal-preferences') return Array.from(wasm_seal_preferences(args[0] as Uint8Array, args[1] as Uint8Array, args[2] as string));
     if (operation === 'open-preferences') return wasm_open_preferences(args[0] as Uint8Array, args[1] as Uint8Array, args[2] as Uint8Array);
-    if (operation === 'parse-bitwarden') return wasm_parse_bitwarden(args[0] as Uint8Array, args[1] as string);
-    if (operation === 'export-bitwarden') return wasm_export_bitwarden(args[0] as string, args[1] as string, args[2] as Uint8Array);
+    if (operation === 'seal-webdav') return Array.from(wasm_seal_webdav(args[0] as Uint8Array, args[1] as Uint8Array, args[2] as string));
+    if (operation === 'open-webdav') return wasm_open_webdav(args[0] as Uint8Array, args[1] as Uint8Array, args[2] as Uint8Array);
+    if (operation === 'parse-authenticator-backup') return wasm_parse_authenticator_backup(...args as Parameters<typeof wasm_parse_authenticator_backup>);
+    if (operation === 'portable-import') {
+      const result = wasm_portable_import(...args as Parameters<typeof wasm_portable_import>);
+      try { return { report: result.report, head: Array.from(result.head), snap: Array.from(result.snap), count: result.count }; }
+      finally { result.free(); }
+    }
+    if (operation === 'portable-export') return wasm_portable_export(...args as Parameters<typeof wasm_portable_export>);
     if (operation === 'csv-headers') return wasm_csv_headers(args[0] as Uint8Array);
     if (operation === 'parse-mapped-csv') return wasm_parse_mapped_csv(args[0] as Uint8Array, args[1] as string);
     if (operation === 'export-login-csv') return wasm_export_login_csv(args[0] as string);
     if (operation === 'parse-browser-csv') return prepareBrowserCsv(wasm_parse_browser_csv(args[0] as Uint8Array));
     if (operation === 'parse-ente') return wasm_parse_ente_auth(args[0] as Uint8Array, args[1] as string);
     if (operation === 'export-ente') return wasm_export_ente_auth(args[0] as string);
-    if (operation === 'generate-hotp' || operation === 'generate-otp') return wasm_otp_at(args[0] as string, args[1] as number ?? 0, 0);
+    if (operation === 'generate-hotp' || operation === 'generate-otp') return wasm_otp_at(args[0] as string, args[1] as number ?? 0, args[2] as number ?? 0);
     if (operation === 'validate-totp') {
       try { wasm_validate_totp(args[0] as string); }
       catch (error) { throw new Error(String(error)); }
@@ -79,6 +102,7 @@ beforeAll(async () => {
   await initCsv({ module_or_path: await readFile(new URL('../../../crates/vault-importers/pkg/vault_importers_bg.wasm', import.meta.url)) });
   await initOtp({ module_or_path: await readFile(new URL('../../../crates/vault-otp/pkg/vault_otp_bg.wasm', import.meta.url)) });
   await initPreferences({ module_or_path: await readFile(new URL('../../../crates/vault-preferences/pkg/vault_preferences_bg.wasm', import.meta.url)) });
+  await initSync({ module_or_path: await readFile(new URL('../../../crates/vault-sync/pkg/vault_sync_bg.wasm', import.meta.url)) });
   const output = wasm.wasm_create_new_vault(password, 32768, 2, 4, crypto.getRandomValues(new Uint8Array(32)), Date.now());
   fixture = { head: output.head_bytes, snap: output.snap_bytes, vaultId: output.vault_id, keyEpoch: Number(output.key_epoch), updatedAtMs: Date.now(), changesSinceBackup: 0 };
   recoveryCode = output.recovery_code;
@@ -89,7 +113,8 @@ beforeEach(() => {
   state.pauseSessionClear = undefined;
   state.idleState = 'active';
   state.failSave = false;
-  state.pendingHotp = undefined;
+  state.pendingWal = [];
+  state.legacy = false;
   state.local = {};
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
@@ -102,6 +127,56 @@ beforeEach(() => {
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
 describe('real WASM + background session integration', () => {
+  it('tests new WebDAV settings read-only, persists a circuit break and applies opt-in HTTPS time to codes', async () => {
+    const time = Math.floor(Date.now() / 30_000) * 30_000 + 95_000;
+    const input = { provider: 'nutstore', base: '', folder: 'test', username: 'private-fixture-account', password: 'fixture-secret-for-this-test' } as const;
+    const listed = () => new Response('<multistatus xmlns="DAV:"><response><href>/dav/test/</href><propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>',
+      { status: 207, headers: { Date: new Date(time + 45_000).toUTCString() } });
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => listed());
+    const date = vi.spyOn(Date, 'now').mockReturnValue(time);
+    try {
+      state.files = undefined;
+      const setupController = new VaultController();
+      await expect(setupController.handle({ type: 'webdav-test', input })).resolves.toMatchObject({ kind: 'empty', offsetSeconds: 45 });
+      expect(state.local).toEqual({});
+      state.files = structuredClone(fixture);
+      const controller = await unlocked();
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 429 }));
+      await expect(controller.handle({ type: 'webdav-test', input, remember: true })).rejects.toThrow('请求过于频繁');
+      const restarted = new VaultController();
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: false, paused: 429 });
+      await expect(restarted.handle({ type: 'webdav-test', input, remember: true })).resolves.toMatchObject({ writeAllowed: false });
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toEqual({ saved: true, paused: undefined, offsetSeconds: 45, compensation: false });
+      const stored = JSON.stringify(state.local);
+      expect(stored).not.toContain(input.password);
+      expect(stored).not.toContain(input.username);
+      expect(stored).not.toContain('jianguoyun');
+      const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+      const item = record('Clock sample');
+      item.data.totpUri = secret;
+      await restarted.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+      const [saved] = await restarted.handle({ type: 'list' }) as ItemSummary[];
+      const id = saved!.id;
+      const detail = await restarted.handle({ type: 'get', id }) as ItemDetailData;
+      const message = { type: 'read-otp', id, handle: detail.otp?.kind === 'time' ? detail.otp.handle! : '' } as const;
+      const site = { type: 'autofill-read', id, kind: 'otp', groups: [], url: 'https://example-bank.com' } as const;
+      const localCode = wasm_totp_at(secret, time / 1000).split(':')[0]!;
+      const [adjustedCode, validTo] = wasm_totp_at(secret, time / 1000 + 45).split(':');
+      expect(adjustedCode).not.toBe(localCode);
+      await expect(restarted.handle(message)).resolves.toMatchObject({ value: localCode });
+      await restarted.handle({ type: 'webdav-clock', enabled: true });
+      await expect(restarted.handle(message)).resolves.toMatchObject({ value: adjustedCode, validTo: Number(validTo) - 45 });
+      await expect(restarted.handle({ ...site, groups: [] })).resolves.toEqual({ values: { otp: adjustedCode } });
+      await restarted.handle({ type: 'webdav-clock', enabled: false });
+      await expect(restarted.handle(message)).resolves.toMatchObject({ value: localCode });
+      await restarted.lock();
+      const total = fetchMock.mock.calls.length;
+      await expect(restarted.handle({ type: 'webdav-test', input })).rejects.toThrow('先解锁');
+      expect(fetchMock).toHaveBeenCalledTimes(total);
+      expect(fetchMock.mock.calls.every(call => call[1]?.method === 'PROPFIND')).toBe(true);
+    } finally { fetchMock.mockRestore(); date.mockRestore(); }
+  });
+
   it('cleans the next copy even if the previous alarm was still removing its record', async () => {
     await unlocked();
     const clipboardAlarm = 'vault-clipboard';
@@ -127,9 +202,11 @@ describe('real WASM + background session integration', () => {
       idle: { queryState: async () => 'active', setDetectionInterval() {}, onStateChanged: { addListener() {} } },
       runtime: {
         id, onMessage: { addListener: (listener: typeof listenMessage) => { listenMessage = listener; } },
+        onConnect: { addListener() {} },
         onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
-      tabs: { onRemoved: { addListener() {} } },
+      tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} }, onActivated: { addListener() {} } },
+      windows: { onRemoved: { addListener() {} } },
       commands: { onCommand: { addListener() {} } },
       contextMenus: { onClicked: { addListener() {} } },
       alarms: { create: async () => undefined, onAlarm: { addListener: (listener: typeof listenAlarm) => { listenAlarm = listener; } } },
@@ -349,7 +426,32 @@ describe('real WASM + background session integration', () => {
     await controller.lock();
     expect(await (await unlocked()).handle({ type: 'list' })).toHaveLength(2);
   });
-  it('retains the backup reminder until confirmed and never clears edits made after exporting', async () => {
+  it('requires the current master password for every whole-vault export but allows PIN for individual items', async () => {
+    const controller = await unlocked();
+    const pin = { method: 'pin', secret: '736498' } as const;
+    await controller.handle({ type: 'create-pin', pin: pin.secret, proof });
+    const item = record('Protected authenticator', true);
+    item.data.totpUri = 'JBSWY3DPEHPK3PXP';
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    const [saved] = await controller.handle({ type: 'list' }) as ItemSummary[];
+    const filePassword = 'Independent-Backup#2026';
+    const requests = [
+      { type: 'export', password: filePassword },
+      { type: 'export-migration', format: 'csv', confirmPlaintext: true },
+      { type: 'export-migration', format: 'bitwarden', confirmPlaintext: true },
+      { type: 'export-migration', format: 'bitwarden', encrypted: true, password: filePassword, confirmPlaintext: false },
+      { type: 'export-ente', confirmPlaintext: true },
+    ] as const;
+    for (const message of requests) {
+      await expect(controller.handle({ ...message, proof: pin })).rejects.toThrow('主密码');
+      await expect(controller.handle(message as VaultMessage)).rejects.toThrow('主密码');
+      await expect(controller.handle({ ...message, proof: { method: 'master', secret: filePassword } })).rejects.toThrow('主密码验证失败');
+      expect(await controller.handle({ ...message, proof })).toBeTruthy();
+    }
+    await expect(controller.handle({ type: 'get', id: saved!.id, proof: pin })).resolves.toMatchObject({ title: item.title });
+    expect(state.files!.changesSinceBackup).toBe(1);
+  });
+  it('retains the reminder without an authentic export receipt and never clears edits made after exporting', async () => {
     const controller = await unlocked();
     const exportBackup = async () => await controller.handle({ type: 'export', password: 'Test-Backup-Password#2026', proof }) as BackupExport;
     await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('First')) });
@@ -357,6 +459,8 @@ describe('real WASM + background session integration', () => {
     expect(first.bytes.length).toBeGreaterThan(0);
     expect(state.files!.changesSinceBackup).toBe(1);
     await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Second')) });
+    await expect(controller.handle({ type: 'backup-saved', receipt: { ...first.receipt, changeCount: 2 } })).rejects.toThrow('无法确认');
+    expect(state.files!.changesSinceBackup).toBe(2);
     const second = await exportBackup();
     expect(state.files!.changesSinceBackup).toBe(2);
     const recreated = new VaultController();
@@ -414,6 +518,7 @@ describe('real WASM + background session integration', () => {
     expect(await controller.handle({ type: 'list' })).toEqual([]);
     const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
     item.data.totpUri = secret;
+    item.customFields.push({ name: 'CSV 未识别的验证码设置', value: 'Unrecognized-secret-fixture', hidden: true });
     await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
     expect(new TextDecoder().decode(state.files!.snap)).not.toContain(secret);
     await controller.lock();
@@ -421,8 +526,36 @@ describe('real WASM + background session integration', () => {
     const [summary] = await restored.handle({ type: 'list' }) as ItemSummary[];
     expect(summary!.hasTotp).toBe(true);
     await expect(restored.handle({ type: 'get', id: summary!.id })).rejects.toThrow('再次验证');
-    const loaded = await restored.handle({ type: 'get', id: summary!.id, proof }) as VaultItem;
-    expect(wasm_totp_at(String(loaded.data.totpUri), 59)).toBe('287082:60');
+    const id = summary!.id;
+    const detail = await restored.handle({ type: 'get', id, proof }) as ItemDetailData;
+    expect(JSON.stringify(detail)).not.toContain(secret);
+    expect(JSON.stringify(detail)).not.toContain('Unrecognized-secret-fixture');
+    expect(detail.otp).toMatchObject({ kind: 'time', handle: expect.any(String) });
+    const handle = detail.otp?.kind === 'time' ? detail.otp.handle! : '';
+    const start = Date.now();
+    // Advance to the same RFC test window within the current clock cycle.
+    const fixtureTime = Math.floor(start / 60000) * 60000 + 59000;
+    const date = vi.spyOn(Date, 'now').mockReturnValue(fixtureTime);
+    try {
+      const phaseCode = (timestamp: number) => wasm_totp_at(secret, timestamp).split(':')[0];
+      const freshWorker = new VaultController();
+      const read = { type: 'read-otp', id, handle } as const;
+      await expect(freshWorker.handle({ ...read, handle: 'invalid' })).rejects.toThrow('重新打开');
+      const lastTouch = state.session!.lastActivityMs;
+      await expect(freshWorker.handle(read)).resolves.toEqual({
+        kind: 'totp', value: phaseCode(fixtureTime / 1000), validTo: Math.floor(fixtureTime / 1000) + 1,
+        nextValue: phaseCode(fixtureTime / 1000 + 1),
+      });
+      expect(state.session!.lastActivityMs).toBe(lastTouch);
+      date.mockReturnValue(fixtureTime + 1000);
+      await expect(freshWorker.handle(read)).resolves.toMatchObject({ value: phaseCode(fixtureTime / 1000 + 1), nextValue: null });
+      await freshWorker.lock();
+      await freshWorker.handle({ type: 'unlock', password });
+      await expect(freshWorker.handle(read)).rejects.toThrow('重新打开');
+      const edit = await freshWorker.handle({ type: 'get-edit', id, proof }) as VaultItem;
+      expect(edit.data.totpUri).toBe(secret);
+      expect(edit.customFields[0]?.value).toBe('Unrecognized-secret-fixture');
+    } finally { date.mockRestore(); }
   });
   it('recovery rotates only the header and invalidates shortcuts', async () => {
     const controller = await unlocked();
@@ -466,17 +599,19 @@ describe('Ente migration and counter-based codes', () => {
   it('commits distinct HOTP counters for concurrent callers and resumes after worker recreation', async () => {
     const controller = await unlocked();
     const id = await addHotp(controller);
-    const results = await Promise.all([controller.handle({ type: 'next-hotp', id }), controller.handle({ type: 'next-hotp', id })]) as { code: OtpCode; item: VaultItem }[];
-    expect(results.map(result => result.code.value)).toEqual(['755224', '287082']);
-    expect(results.map(result => result.code.counter)).toEqual(['0', '1']);
+    const results = await Promise.all([controller.handle({ type: 'next-hotp', id }), controller.handle({ type: 'next-hotp', id })]);
+    expect(results).toEqual([{ kind: 'hotp', value: '755224', counter: '0' }, { kind: 'hotp', value: '287082', counter: '1' }]);
     expect(state.files!.changesSinceBackup).toBe(3);
-    expect(state.pendingHotp).toEqual(state.files!.snap);
-    expect(new TextDecoder().decode(state.pendingHotp)).not.toContain(secret);
+    expect(state.pendingWal).toHaveLength(3);
+    const last = state.pendingWal.at(-1)!;
+    expect(last.bytes).not.toEqual(state.files!.snap);
+    expect(new TextDecoder().decode(last.bytes)).not.toContain(secret);
+    expect(wasm_verify_local_wal(state.session!.key, state.session!.wrap, last.id, last.bytes)).toBe(true);
+    const staleEdit = await controller.handle({ type: 'get-edit', id });
     const restored = new VaultController();
-    const third = await restored.handle({ type: 'next-hotp', id }) as { code: OtpCode; item: VaultItem };
-    expect(third.code.value).toBe('359152');
-    expect(String(third.item.data.totpUri)).toContain('counter=3');
-    await expect(controller.handle({ type: 'upsert', itemJson: JSON.stringify(results[0]!.item) })).rejects.toThrow('其他窗口更新');
+    expect(await restored.handle({ type: 'next-hotp', id })).toEqual({ kind: 'hotp', value: '359152', counter: '2' });
+    expect((await restored.handle({ type: 'get-edit', id }) as VaultItem).data.totpUri).toContain('counter=3');
+    await expect(restored.handle({ type: 'upsert', itemJson: JSON.stringify(staleEdit) })).rejects.toThrow('其他窗口更新');
     expect(new TextDecoder().decode(state.files!.snap)).not.toContain(secret);
   });
 
@@ -484,15 +619,19 @@ describe('Ente migration and counter-based codes', () => {
     const controller = await unlocked();
     const id = await addHotp(controller, true);
     const before = structuredClone(state.files);
+    state.legacy = true;
     await expect(controller.handle({ type: 'next-hotp', id })).rejects.toThrow('再次验证');
     state.failSave = true;
     await expect(controller.handle({ type: 'next-hotp', id, proof })).rejects.toThrow('disk write failed');
     expect(state.files).toEqual(before);
-    expect(state.pendingHotp).toBeUndefined();
+    expect(state.pendingWal).toHaveLength(1);
+    expect(state.legacy).toBe(true);
     state.failSave = false;
-    const first = await controller.handle({ type: 'next-hotp', id, proof }) as { code: OtpCode };
-    expect(first.code.value).toBe('755224');
-    expect(first.code.counter).toBe('0');
+    const first = await controller.handle({ type: 'next-hotp', id, proof }) as HotpCode;
+    expect(first).toEqual({ kind: 'hotp', value: '755224', counter: '0' });
+    expect(state.legacy).toBe(false);
+    expect(state.pendingWal).toHaveLength(2);
+    expect(state.pendingWal.at(-1)?.replaceLegacy).toBe(true);
     await controller.handle({ type: 'trash', id, trashed: true });
     await expect(controller.handle({ type: 'next-hotp', id, proof })).rejects.toThrow('没有可用');
   });
@@ -664,6 +803,6 @@ describe('phase two migration transactions and autofill reads', () => {
     vi.mocked(offscreen).mockClear();
     expect(await controller.handle({ type: 'autofill-copy-otp', id, url: 'https://example.com', groups: [], proof })).toBeNull();
     expect(offscreen).not.toHaveBeenCalled();
-    expect((await controller.handle({ type: 'get', id, proof }) as VaultItem).data.totpUri).toContain('counter=5');
+    expect((await controller.handle({ type: 'get-edit', id, proof }) as VaultItem).data.totpUri).toContain('counter=5');
   });
 });

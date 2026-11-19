@@ -1,14 +1,38 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import type { JournalClock } from './sync/journal-device';
+import type { RemoteWal } from './sync/bootstrap';
 
 interface VaultDbSchema extends DBSchema {
   vault: { key: string; value: VaultFiles };
   pendingChanges: { key: string; value: Uint8Array };
+  pendingWal: { key: string; value: PendingWal };
+  journal: { key: string; value: JournalClock };
+  remoteState: { key: string; value: RemoteAnchor };
+}
+export interface PendingWal { vaultId: string; bytes: Uint8Array }
+export interface JournalCommit { id: string; state: JournalClock; bytes: Uint8Array; replaceLegacy: boolean }
+export interface RemoteAnchor {
+  vaultId: string; endpoint: string; head: Uint8Array; snap: Uint8Array; etag?: string;
+  objects: RemoteWal[];
+  appliedHead: Uint8Array; appliedSnap: Uint8Array; hasRecords: boolean;
+  outbox?: RemoteWal & { priorIds: string[]; source: VaultFiles };
+  checkedAt?: number;
+  conflicts?: Uint8Array;
+  conflictCount?: number;
+  pendingResolutions?: Uint8Array;
+  pendingCompaction?: { id: string; digest: string; priorHistory: string[] };
+  localRestoreHeld?: boolean;
+  rotationFrom?: number;
+  observedKeyEpoch?: number;
+  observedHead?: Uint8Array;
+  // Head and snapshot remain authenticated ciphertext; do not store a plaintext copy of the root or records.
 }
 export interface VaultFiles {
   head: Uint8Array; snap: Uint8Array; vaultId: string; keyEpoch: number;
   updatedAtMs: number; changesSinceBackup: number;
   /** Absolute change count covered by the latest confirmed backup; absent on older vaults. */
   backedUpChangeCount?: number;
+  everHadRecords?: boolean;
 }
 export interface SessionState {
   key: Uint8Array; wrap: Uint8Array; unlockedAtMs: number; lastActivityMs: number;
@@ -19,10 +43,13 @@ export interface LocalSettings {
 }
 let dbPromise: Promise<IDBPDatabase<VaultDbSchema>> | undefined;
 function database() {
-  dbPromise ??= openDB<VaultDbSchema>('vault-extension', 2, {
+  dbPromise ??= openDB<VaultDbSchema>('vault-extension', 4, {
     upgrade(db) {
       if (!db.objectStoreNames.contains('vault')) db.createObjectStore('vault');
       if (!db.objectStoreNames.contains('pendingChanges')) db.createObjectStore('pendingChanges');
+      if (!db.objectStoreNames.contains('pendingWal')) db.createObjectStore('pendingWal');
+      if (!db.objectStoreNames.contains('journal')) db.createObjectStore('journal');
+      if (!db.objectStoreNames.contains('remoteState')) db.createObjectStore('remoteState');
     },
   });
   return dbPromise;
@@ -30,16 +57,70 @@ function database() {
 export async function loadVaultFiles(): Promise<VaultFiles | undefined> {
   return (await database()).get('vault', 'active');
 }
-export async function saveVaultFiles(files: VaultFiles, queueHotpChange = false): Promise<void> {
+export async function loadJournal(vaultId: string): Promise<{ clock?: JournalClock; legacy: boolean }> {
+  const tx = (await database()).transaction(['journal', 'pendingChanges']);
+  const [clock, key] = await Promise.all([tx.objectStore('journal').get(vaultId), tx.objectStore('pendingChanges').getKey('hotp-snapshot')]);
+  return { clock, legacy: key !== undefined };
+}
+export async function loadRemoteAnchor(vaultId: string) { return (await database()).get('remoteState', vaultId); }
+export async function hasPendingWal(vaultId: string) {
+  const db = await database();
+  const tx = db.transaction(['pendingWal', 'pendingChanges']);
+  if (await tx.objectStore('pendingChanges').getKey('hotp-snapshot') !== undefined) return true;
+  for (let cursor = await tx.objectStore('pendingWal').openCursor(null, 'prev'); cursor; cursor = await cursor.continue())
+    if (cursor.value.vaultId === vaultId) return true;
+  return false;
+}
+export async function saveRemoteAnchor(anchor: RemoteAnchor, files: VaultFiles, clock?: JournalClock, newVault = false, consume = true) {
+  const tx = (await database()).transaction(['vault', 'remoteState', 'journal', 'pendingWal', 'pendingChanges'], 'readwrite', { durability: 'strict' });
+  const vault = tx.objectStore('vault');
+  const current = await vault.get('active');
+  if (newVault ? !!current : current?.vaultId !== anchor.vaultId) {
+    tx.abort();
+    await tx.done.catch(() => undefined);
+    throw new Error('此设备已有密码库，未覆盖本机数据。');
+  }
+  if (consume) {
+    const pending = tx.objectStore('pendingWal');
+    for (let cursor = await pending.openCursor(); cursor; cursor = await cursor.continue())
+      if (cursor.value.vaultId === anchor.vaultId) await cursor.delete();
+  }
+  await Promise.all([tx.objectStore('remoteState').put(anchor, anchor.vaultId), vault.put(files, 'active'),
+    consume ? tx.objectStore('pendingChanges').delete('hotp-snapshot') : undefined,
+    clock ? tx.objectStore('journal').put(clock, anchor.vaultId) : undefined, tx.done]);
+}
+export async function adoptRemoteVault(source: VaultFiles, anchor: RemoteAnchor, target: VaultFiles, change: JournalCommit) {
+  const tx = (await database()).transaction(['vault', 'remoteState', 'journal', 'pendingWal', 'pendingChanges'], 'readwrite', { durability: 'strict' });
+  const vault = tx.objectStore('vault'), remote = tx.objectStore('remoteState');
+  const [current, known] = await Promise.all([vault.get('active'), remote.get(source.vaultId)]);
+  const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
+  if (!current || current.vaultId !== source.vaultId || !same(current.head, source.head) || !same(current.snap, source.snap) ||
+      known || source.vaultId === target.vaultId || target.vaultId !== anchor.vaultId) {
+    tx.abort();
+    await tx.done.catch(() => undefined);
+    throw new Error('本机或目标库已经变化，未切换密码库。请重新预览。');
+  }
+  await Promise.all([
+    vault.add(current, `merged-source:${current.vaultId}`),
+    vault.put(target, 'active'),
+    remote.put(anchor, target.vaultId),
+    tx.objectStore('journal').put(change.state, target.vaultId),
+    tx.objectStore('pendingWal').add({ vaultId: target.vaultId, bytes: change.bytes }, change.id),
+    tx.objectStore('pendingChanges').delete('hotp-snapshot'),
+    tx.done,
+  ]);
+}
+export async function saveVaultFiles(files: VaultFiles, change?: JournalCommit, anchor?: RemoteAnchor): Promise<void> {
   const db = await database();
   const saved = { ...files, head: new Uint8Array(files.head), snap: new Uint8Array(files.snap) };
-  if (!queueHotpChange) { await db.put('vault', saved, 'active'); return; }
-  // Phase 3 will encode WAL deltas. Until then retain the latest encrypted HOTP
-  // snapshot as a coalesced pending change, atomically with the counter update.
-  const tx = db.transaction(['vault', 'pendingChanges'], 'readwrite', { durability: 'strict' });
+  if (!change) { await db.put('vault', saved, 'active'); return; }
+  const tx = db.transaction(['vault', 'journal', 'pendingWal', 'pendingChanges', 'remoteState'], 'readwrite', { durability: 'strict' });
   await Promise.all([
     tx.objectStore('vault').put(saved, 'active'),
-    tx.objectStore('pendingChanges').put(new Uint8Array(files.snap), 'hotp-snapshot'),
+    tx.objectStore('journal').put(change.state, files.vaultId),
+    tx.objectStore('pendingWal').add({ vaultId: files.vaultId, bytes: change.bytes }, change.id),
+    anchor ? tx.objectStore('remoteState').put(anchor, files.vaultId) : undefined,
+    change.replaceLegacy ? tx.objectStore('pendingChanges').delete('hotp-snapshot') : undefined,
     tx.done,
   ]);
 }

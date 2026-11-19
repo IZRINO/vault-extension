@@ -1,4 +1,5 @@
 import { ArchiveRestore, Copy, CreditCard, KeyRound, LockKeyhole, PackageOpen, Pin, Plus, SearchX, Trash2, TriangleAlert, User, type LucideIcon } from 'lucide-react';
+import { useMemo, useState } from 'react';
 import type { ItemSummary } from '../vault-messages';
 import { CopyButton, Ico } from './components';
 import { filterItems, plateText, rowSubtitle } from './lib';
@@ -12,6 +13,7 @@ const filters: { id: string; label: string }[] = [
   { id: 'identity', label: '身份' },
   { id: 'developer', label: '开发' },
 ];
+const PAGE_SIZE = 32;
 
 interface QuickAction { key: string; label: string; icon: LucideIcon }
 function quickActions(item: ItemSummary): QuickAction[] {
@@ -32,7 +34,9 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
   importCsv(): void;
 }) {
   const { busy } = useOps();
-  const visible = items ? filterItems(items, filter, query) : [];
+  const visible = useMemo(() => items ? filterItems(items, filter, query) : [], [items, filter, query]);
+  const [page, setPage] = useState<{ query: string; filter: string; limit: number }>();
+  const limit = page?.query === query && page.filter === filter ? page.limit : PAGE_SIZE;
   const searching = query.trim() !== '';
   const filterName = filters.find(entry => entry.id === filter)?.label;
   const trash = filter === 'trash' ? (items ?? []).filter(item => item.trashed) : [];
@@ -53,7 +57,7 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
       <button type="button" className="btn btn-s btn-danger" disabled={busy} onClick={() => emptyTrash(trash.map(item => item.id))}>清空回收站</button>
     </div>}
     {visible.length > 0 && <ul className="rows">
-      {visible.map(item => <li className="row" key={item.id}>
+      {visible.slice(0, limit).map(item => <li className="row" key={item.id}>
         <button type="button" className="row-main" disabled={busy} onClick={() => open(item)}>
           <span className="plate" data-kind={item.kind} aria-hidden="true">{plateText(item.title)}</span>
           <span className="row-text">
@@ -74,6 +78,11 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
         </div>
       </li>)}
     </ul>}
+    {visible.length > limit && <div className="actions">
+      <button type="button" className="btn" onClick={() => setPage({ query, filter, limit: limit + PAGE_SIZE })}>
+        显示更多（{limit} / {visible.length}）
+      </button>
+    </div>}
     {items && visible.length === 0 && (searching ? <div className="empty">
       <span className="plate" aria-hidden="true"><Ico of={SearchX} /></span>
       <h2>没有找到“{query.trim()}”</h2>

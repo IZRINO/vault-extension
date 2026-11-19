@@ -302,6 +302,8 @@ pub struct LoginCredential {
     pub password_history: Vec<PasswordHistoryEntry>,
     /// Reserved for Phase 2 built-in 2FA attachment (`otpauth://` or raw seed config)
     pub totp_uri: Option<String>,
+    /// Versioned authenticator records. Never projected into the editable JSON representation.
+    pub passkey_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Zeroize, ZeroizeOnDrop)]
@@ -485,6 +487,9 @@ impl VaultItem {
         if let (CredentialData::Login(old_login), CredentialData::Login(new_login)) =
             (&self.data, &mut incoming.data)
         {
+            if !old_login.passkey_data.is_empty() {
+                new_login.passkey_data.clone_from(&old_login.passkey_data);
+            }
             let mut merged_history = if new_login.password_history.is_empty() {
                 old_login.password_history.clone()
             } else {
@@ -867,6 +872,7 @@ impl VaultItem {
                     })
                     .unwrap_or_default();
                 CredentialData::Login(LoginCredential {
+                    passkey_data: Vec::new(),
                     username: data_obj.get_str("username"),
                     password: data_obj.get_str("password"),
                     uris,

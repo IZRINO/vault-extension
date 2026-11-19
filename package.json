@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@12.19.0",
   "scripts": {
-    "build:wasm": "wasm-pack build crates/vault-core --target web --release && wasm-pack build crates/vault-importers --target web --release && wasm-pack build crates/vault-otp --target web --release && wasm-pack build crates/vault-qr --target web --release && wasm-pack build crates/vault-preferences --target web --release && node scripts/check-wasm.cjs",
+    "build:wasm": "wasm-pack build crates/vault-core --target web --release && wasm-pack build crates/vault-importers --target web --release && wasm-pack build crates/vault-otp --target web --release && wasm-pack build crates/vault-qr --target web --release && wasm-pack build crates/vault-sync --target web --release && wasm-pack build crates/vault-preferences --target web --release && wasm-pack build crates/vault-passkeys --target web --release && node scripts/check-wasm.cjs",
     "dev": "pnpm --filter ./apps/extension dev",
     "build": "pnpm run build:wasm && pnpm --filter ./apps/extension build",
     "test:rust": "cargo test --workspace",
@@ -14,7 +14,9 @@
     "test:data-safety": "node scripts/test-data-safety.cjs",
     "test:phase-2": "node scripts/test-phase-2.cjs",
     "test:autofill": "node scripts/test-autofill.cjs",
-    "test:migration": "node scripts/test-migration.cjs"
+    "test:migration": "node scripts/test-migration.cjs",
+    "test:passkeys": "node scripts/test-passkeys.cjs",
+    "test:kdbx": "node scripts/test-kdbx.cjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.65.0",

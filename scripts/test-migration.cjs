@@ -5,6 +5,8 @@ const { createHmac, createCipheriv, createDecipheriv, createHash, pbkdf2Sync, ar
 const QR = require('qrcode');
 const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 const root = path.resolve(__dirname, '..'), output = path.join(root, 'test-results');
+const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
+const firstColor = process.env.VAULT_QR_FIRST || 'light';
 const browsers = { edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', helium: 'C:/Program Files/imput/Helium/Application/chrome.exe' };
 const master = 'Migration-Fixture-Master#2026', filePassword = 'Portable-File-Fixture#2026';
 const otp = 'otpauth://totp/QR-Fixture%3Aalice?secret=JBSWY3DPEHPK3PXP&issuer=QR-Fixture';
@@ -58,7 +60,7 @@ async function run(name, server) {
   let context;
   try {
     context = await chromium.launchPersistentContext(profile, { executablePath: browsers[name], headless: process.env.VAULT_HEADED == null ? name !== 'helium' : process.env.VAULT_HEADED !== '1',
-      args: ['--disable-extensions-except=' + path.join(root, 'apps/extension/.output/chrome-mv3'), '--load-extension=' + path.join(root, 'apps/extension/.output/chrome-mv3'), '--enable-unsafe-extension-debugging'],
+      args: ['--disable-extensions-except=' + extension, '--load-extension=' + extension, '--enable-unsafe-extension-debugging'],
       viewport: name === 'edge' ? { width: 400, height: 600 } : { width: 330, height: 760 } });
     const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker');
     await waitForBuiltInFilters(context, name);
@@ -118,9 +120,25 @@ async function run(name, server) {
     const csv = Buffer.from('称呼,站点,账号,口令,备注\r\nMapped fixture,https://mapped.example,alice," p,""q","two\r\nlines"\r\n');
     await page.getByLabel('CSV 文件', { exact: true }).setInputFiles({ name: 'mapping.csv', mimeType: 'text/csv', buffer: csv });
     await page.getByRole('button', { name: '读取列名', exact: true }).click();
-    await page.getByLabel('名称', { exact: true }).selectOption('0');
-    await page.getByLabel('网站（必选）', { exact: true }).selectOption('1');
-    await page.getByRole('button', { name: '预览迁移内容', exact: true }).click();
+    const previewButton = page.getByRole('button', { name: '预览迁移内容', exact: true });
+    await expect(previewButton).toBeDisabled();
+    const titleSelect = page.getByLabel('名称', { exact: true });
+    await titleSelect.focus();
+    await titleSelect.press('ArrowDown');
+    await expect(titleSelect).toHaveValue('0');
+    await page.locator('[draggable="true"]').filter({ hasText: /^2\. 站点$/ })
+      .dragTo(page.getByLabel('网站（必选）', { exact: true }));
+    await expect(page.getByLabel('网站（必选）', { exact: true })).toHaveValue('1');
+    await page.getByLabel('备注', { exact: true }).selectOption('1');
+    await expect(page.getByText('同一个源列不能用于多个字段。')).toBeVisible();
+    await expect(previewButton).toBeDisabled();
+    await page.getByLabel('备注', { exact: true }).selectOption('4');
+    await previewButton.click();
+    await expect(page.getByRole('heading', { name: '可导入 1 条凭证' })).toBeVisible();
+    await page.getByLabel('备注', { exact: true }).selectOption('');
+    await expect(page.getByRole('button', { name: '确认导入 1 条', exact: true })).toHaveCount(0);
+    await page.getByLabel('备注', { exact: true }).selectOption('4');
+    await previewButton.click();
     await expect(page.getByRole('heading', { name: '可导入 1 条凭证' })).toBeVisible();
     const mapping = { title: 0, url: 1, username: 2, password: 3, note: 4 };
     const preview = await send({ type: 'preview-migration', format: 'csv', bytes: [...csv], mapping });
@@ -130,6 +148,7 @@ async function run(name, server) {
     await expect(page.getByText('已导入 1 条凭证。', { exact: true })).toBeVisible();
     const mapped = (await send({ type: 'list' })).find(row => row.title === 'Mapped fixture');
     assert.equal((await send({ type: 'get', id: mapped.id })).data.password, ' p,"q');
+    assert.equal((await send({ type: 'get', id: mapped.id })).note, 'two\r\nlines');
     const exportedCsv = await send({ type: 'export-migration', format: 'csv', proof: { method: 'master', secret: master }, confirmPlaintext: true });
     assert.equal(exportedCsv.count, 2); assert.equal(exportedCsv.skipped, 3); assert(exportedCsv.text.includes('" p,""q"'));
     await page.screenshot({ path: path.join(output, `migration-${name}-csv.png`) });
@@ -137,7 +156,10 @@ async function run(name, server) {
     const website = await context.newPage();
     await website.bringToFront();
     await website.setViewportSize({ width: 1000, height: 800 });
-    await website.goto(`http://127.0.0.1:${server.address().port}/qr`);
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const firstPath = firstColor === 'dark' ? '/qr-dark' : '/qr';
+    const nextPath = firstColor === 'dark' ? '/qr' : '/qr-dark';
+    await website.goto(base + firstPath);
     await expect(website.getByRole('img')).toBeVisible();
     const tab = (await page.evaluate(() => chrome.tabs.query({}))).find(tab => tab.url?.includes('/qr'));
     await page.evaluate(tabId => chrome.tabs.update(tabId, { active: true }), tab.id);
@@ -148,20 +170,29 @@ async function run(name, server) {
     await browserCdp.send('Extensions.triggerAction', { id, targetId: tabTarget.targetId });
     await browserCdp.detach();
     const scanStarted = performance.now();
-    const scanned = await send({ type: 'scan-otp' });
+    const first = await send({ type: 'scan-otp' });
+    const scanned = first.values;
     const qrEndToEndMs = Math.round(performance.now() - scanStarted);
     assert.equal(scanned.length, 1); assert(scanned[0].includes('JBSWY3DPEHPK3PXP'));
     await website.screenshot({ path: path.join(output, `migration-${name}-qr.png`) });
-    await website.goto(`http://127.0.0.1:${server.address().port}/qr-dark`);
+    await website.goto(base + nextPath);
     await website.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-    const darkScan = await send({ type: 'scan-otp' }); assert.deepEqual(darkScan, scanned);
-    await website.goto(`http://127.0.0.1:${server.address().port}/empty`);
+    await new Promise(resolve => setTimeout(resolve, 650));
+    const nextStarted = performance.now();
+    const following = await send({ type: 'scan-otp' }); assert.deepEqual(following.values, scanned);
+    const qrFollowupMs = Math.round(performance.now() - nextStarted);
+    await website.goto(base + '/empty');
     await website.getByText('No QR here', { exact: true }).waitFor();
     await website.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const empty = await reply({ type: 'scan-otp' }); assert(!empty.ok && empty.error.includes('没有找到'), JSON.stringify(empty));
+    await website.goto(`http://localhost:${server.address().port}/qr`);
+    const notGranted = await reply({ type: 'scan-otp' });
+    assert(!notGranted.ok && notGranted.error.includes('尚未授权'), JSON.stringify(notGranted));
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,
-      fourTypesAndPreservedFields: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrEndToEndMs, canvasOverrideIgnored: true, errors }));
+      fourTypesAndPreservedFields: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrFirstColor: firstColor,
+      qrEndToEndMs, qrFollowupMs, qrFirstTimings: first.timings, qrFollowupTimings: following.timings,
+      noActiveTabRejected: true, canvasOverrideIgnored: true, errors }));
   } finally {
     await context?.close();
     assert(path.dirname(profile) === path.resolve(os.tmpdir()) && path.basename(profile).startsWith('vault-migration-'));
@@ -169,13 +200,18 @@ async function run(name, server) {
   }
 }
 (async () => {
+  assert(['light', 'dark'].includes(firstColor), 'VAULT_QR_FIRST must be light or dark');
   await fs.mkdir(output, { recursive: true });
-  const extension = path.join(root, 'apps/extension/.output/chrome-mv3');
-  const [background, kdf, content, qrWorker, migrationWorker] = await Promise.all(
-    ['background.js', 'kdf-worker.js', 'content-scripts/autofill.js', 'qr-worker.js', 'migration-worker.js']
+  const [background, kdf, content, qrWorker, migrationWorker, syncWorker, passkeyWorker] = await Promise.all(
+    ['background.js', 'kdf-worker.js', 'content-scripts/autofill.js', 'qr-worker.js', 'migration-worker.js', 'sync-worker.js', 'passkey-worker.js']
       .map(file => fs.readFile(path.join(extension, file), 'utf8')));
-  for (const bundle of [background, kdf, content]) assert.doesNotMatch(bundle, /wasm_parse_bitwarden|wasm_parse_mapped_csv|wasm_scan_otp|vault_importers_bg|vault_qr_bg/);
-  assert.match(qrWorker, /wasm_scan_otp/); assert.match(migrationWorker, /wasm_parse_bitwarden/);
+  for (const bundle of [background, kdf, content]) {
+    assert(!/vault_(?:importers|qr|sync|passkeys)_bg/.test(bundle), 'Main, KDF and autofill bundles must exclude optional WASM');
+  }
+  assert(qrWorker.includes('wasm_scan_otp'), 'Missing optional QR scanner');
+  assert(migrationWorker.includes('wasm_portable_import'), 'Missing optional portable import engine');
+  assert(syncWorker.includes('wasm_sync_replay'), 'Missing optional sync engine');
+  assert(passkeyWorker.includes('wasm_passkey_candidates'), 'Missing optional Passkey engine');
   const image = await QR.toDataURL(otp, { width: 420, margin: 4 });
   const darkImage = await QR.toDataURL(otp, { width: 420, margin: 4, color: { dark: '#ffffff', light: '#111111' } });
   const server = http.createServer((req, res) => {

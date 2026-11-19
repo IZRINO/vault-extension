@@ -8,7 +8,10 @@ export default defineConfig({
     permissions: ['storage', 'unlimitedStorage', 'alarms', 'idle', 'sidePanel', 'clipboardWrite', 'clipboardRead', 'offscreen', 'activeTab', 'contextMenus'],
     host_permissions: ['http://*/*', 'https://*/*'],
     commands: { 'fill-login': { suggested_key: { default: 'Alt+Shift+L' }, description: '使用 Vault 填充当前输入框' } },
-    web_accessible_resources: [{ resources: ['inline-menu.html'], matches: ['http://*/*', 'https://*/*'] }],
+    web_accessible_resources: [
+      { resources: ['inline-menu.html'], matches: ['http://*/*', 'https://*/*'] },
+      { resources: ['passkey-prompt.html'], matches: ['https://*/*', 'http://localhost/*'] },
+    ],
     optional_permissions: ['privacy'],
     optional_host_permissions: ['https://api.pwnedpasswords.com/*'],
     content_security_policy: {

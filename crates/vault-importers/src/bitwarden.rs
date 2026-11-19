@@ -32,7 +32,7 @@ pub fn text<'a>(value: &'a Value, key: &str) -> &'a str { value[key].as_str().un
 pub fn millis(value: &Value) -> Option<i64> {
     value.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_millis()).filter(|t| *t >= 0)
 }
-fn date(value: &Value) -> Value {
+pub(crate) fn date(value: &Value) -> Value {
     value.as_i64().and_then(DateTime::from_timestamp_millis).map(|d| json!(d.to_rfc3339_opts(SecondsFormat::Millis, true))).unwrap_or(Value::Null)
 }
 fn key(doc: &Value, password: &str) -> Result<Zeroizing<[u8; 64]>, &'static str> {
@@ -248,6 +248,13 @@ pub fn export(items_json: &str, password: &str, entropy: &[u8]) -> Result<String
                             row.0["login"]["totp"] = json!(format!("steam://{secret}"));
                         }
                     }
+                }
+                if let Some(added) = item["_vaultFido2"].as_array().filter(|values| !values.is_empty()) {
+                    let mut records = row.0["login"]["fido2Credentials"].as_array().cloned().unwrap_or_default();
+                    for key in added {
+                        if !records.iter().any(|old| old["credentialId"] == key["credentialId"]) { records.push(key.clone()); }
+                    }
+                    row.0["login"]["fido2Credentials"] = json!(records);
                 }
                 row.0["login"]["uris"] = json!(data["uris"].as_array().map(|uris| uris.iter().map(|uri|
                     json!({ "uri": uri["uri"], "match": RULES.iter().position(|r| *r == text(uri, "matchRule")) })

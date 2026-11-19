@@ -5,6 +5,12 @@ use zeroize::Zeroizing;
 mod ente_auth;
 mod bitwarden;
 mod migration_csv;
+mod authenticators;
+mod cxf;
+mod keepass_kdbx;
+mod portable;
+mod protected_jwe;
+mod vendor_archives;
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 5001; // header + 5,000 data records

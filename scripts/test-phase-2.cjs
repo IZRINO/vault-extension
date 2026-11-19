@@ -1,8 +1,10 @@
 const { chromium, expect } = require('@playwright/test');
 const assert = require('node:assert/strict');
+const { createHmac } = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -14,6 +16,17 @@ const password = 'Phase-Two-Local-Test#2026';
 const csvPassword = 'Sample-Csv-Secret#2026';
 const setupKey = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'; // RFC 6238 test fixture, never a real account.
 const output = path.join(root, 'test-results');
+function fixtureCode(ms, steam = false) {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(ms / 30000)));
+  const hash = createHmac('sha1', Buffer.from('12345678901234567890')).update(counter).digest();
+  let value = hash.readUInt32BE(hash[19] & 15) & 0x7fffffff;
+  if (!steam) return String(value % 1000000).padStart(6, '0');
+  const alphabet = '23456789BCDFGHJKMNPQRTVWXY';
+  return Array.from({ length: 5 }, () => {
+    const char = alphabet[value % alphabet.length]; value = Math.floor(value / alphabet.length); return char;
+  }).join('');
+}
 
 async function verify(name) {
   const executablePath = process.env.VAULT_BROWSER_PATH || browsers[name];
@@ -24,11 +37,12 @@ async function verify(name) {
   let context;
   try {
     context = await chromium.launchPersistentContext(profile, {
-      executablePath, headless: process.env.VAULT_HEADED !== '1',
+      executablePath, headless: process.env.VAULT_HEADED == null ? name !== 'helium' : process.env.VAULT_HEADED !== '1',
       args: ['--disable-extensions-except=' + extension, '--load-extension=' + extension],
       viewport: name === 'edge' ? { width: 400, height: 600 } : { width: 330, height: 760 },
     });
     const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 20000 });
+    await waitForBuiltInFilters(context, name);
     const id = new URL(worker.url()).host;
     const view = name === 'edge' ? 'popup' : 'sidepanel';
     const page = await context.newPage();
@@ -66,6 +80,10 @@ async function verify(name) {
     });
     await page.goto(`chrome-extension://${id}/${view}.html`);
     const otpLoaded = () => page.evaluate(() => globalThis.vaultOtpLoaded);
+    const setClock = async ms => {
+      await worker.evaluate(fixed => { Date.now = () => fixed; }, ms);
+      await page.clock.setFixedTime(new Date(ms));
+    };
     const send = message => page.evaluate(async message => {
       const reply = await chrome.runtime.sendMessage({ target: 'vault', ...message });
       if (!reply.ok) throw new Error(reply.error);
@@ -119,24 +137,24 @@ async function verify(name) {
     await expect(page.getByRole('dialog')).toBeVisible();
     await expect(page.locator('output[aria-label="当前验证码"]')).toHaveCount(0);
     assert.equal(await otpLoaded(), false);
-    await page.clock.setFixedTime(new Date(59_000));
+    const fixtureTime = Math.floor(Date.now() / 30000) * 30000 + 59000;
+    await setClock(fixtureTime);
     await enterProof(page);
     const code = page.locator('output[aria-label="当前验证码"] .cells');
-    await expect(code).toHaveText('287082');
-    assert.equal(await otpLoaded(), true);
+    await expect(code).toHaveText(fixtureCode(fixtureTime));
+    assert.equal(await otpLoaded(), false, 'The panel does not load OTP WASM or receive a setup key');
     await expect(page.getByText('1 秒后刷新')).toBeVisible();
-    await page.clock.setFixedTime(new Date(60_000));
-    await expect(code).toHaveText('359152');
+    await setClock(fixtureTime + 1000);
+    await expect(code).toHaveText(fixtureCode(fixtureTime + 1000));
     await screenshot(page, name, 'totp');
     await page.getByRole('button', { name: '复制验证码', exact: true }).click();
-    await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe('359152');
-    await page.clock.setFixedTime(new Date());
-    await verifyEnte(page, send, name);
+    await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe(fixtureCode(fixtureTime + 1000));
+    await verifyEnte(page, send, name, () => setClock(fixtureTime + 30000), fixtureTime + 30000);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpLoadedAfterProof: true,
+    console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
       totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, steamAndHotp: true, errors }));
   } finally {
     try { await context?.close(); }
@@ -148,7 +166,7 @@ async function verify(name) {
   }
 }
 
-async function verifyEnte(page, send, name) {
+async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   const proof = { method: 'master', secret: password };
   await send({ type: 'upsert', itemJson: JSON.stringify({
     title: 'GitHub login', data: { kind: 'login', username: 'tester', password: 'Keep-Original-GitHub-Password', uris: [{ uri: 'https://github.com/login' }] },
@@ -209,18 +227,22 @@ async function verifyEnte(page, send, name) {
   await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText('755224');
   await page.getByRole('button', { name: '生成下一个验证码', exact: true }).click();
   await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText('287082');
-  assert(await page.evaluate(() => new Promise((resolve, reject) => {
+  const counterId = all.find(item => item.title === 'Counter').id;
+  assert(await page.evaluate(async () => new Promise((resolve, reject) => {
     const open = indexedDB.open('vault-extension');
     open.onerror = () => reject(open.error);
     open.onsuccess = () => {
       const db = open.result;
-      const tx = db.transaction(['vault', 'pendingChanges']);
+      const tx = db.transaction(['vault', 'journal', 'pendingWal']);
       const current = tx.objectStore('vault').get('active');
-      const pending = tx.objectStore('pendingChanges').get('hotp-snapshot');
+      const pending = tx.objectStore('pendingWal').openCursor(null, 'prev');
+      const clock = tx.objectStore('journal').getAll();
       tx.oncomplete = () => {
-        const same = pending.result instanceof Uint8Array && pending.result.length === current.result.snap.length &&
-          pending.result.every((byte, index) => byte === current.result.snap[index]);
-        db.close(); resolve(same);
+        const bytes = pending.result?.value?.bytes;
+        const valid = bytes instanceof Uint8Array && new TextDecoder().decode(bytes.subarray(0, 4)) === 'VLTE' && bytes[6] === 3 &&
+          pending.result.value.vaultId === current.result.vaultId && clock.result.length === 1 &&
+          pending.result.key.endsWith(clock.result[0].sequence.toString(16).padStart(14, '0'));
+        db.close(); resolve(valid);
       };
       tx.onerror = () => { db.close(); reject(tx.error); };
     };
@@ -234,18 +256,17 @@ async function verifyEnte(page, send, name) {
   await page.getByLabel('备注', { exact: true }).fill('Edited after generating');
   await page.getByRole('button', { name: '保存凭证', exact: true }).click();
   await expect(page.getByText('凭证已保存。')).toBeVisible();
-  const counter = all.find(item => item.title === 'Counter');
-  assert((await send({ type: 'get', id: counter.id })).data.totpUri.includes('counter=2'));
+  assert(!(await send({ type: 'get', id: counterId })).data.totpUri);
+  assert((await send({ type: 'get-edit', id: counterId })).data.totpUri.includes('counter=2'));
 
   await page.getByText('Steam', { exact: true }).click();
   await expect(page.getByText('两步验证码', { exact: true })).toHaveCount(2);
   await expect(page.getByText('密码', { exact: true })).toHaveCount(0);
   await expect(page.getByText('在线泄露检查', { exact: true })).toHaveCount(0);
-  await page.clock.setFixedTime(new Date(59_000));
-  await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText('PV9M4');
+  await setSteamTime();
+  await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText(fixtureCode(steamTime, true));
   await expect(page.locator('output[aria-label="下一期验证码"]')).toBeVisible();
   await screenshot(page, name, 'steam-next-code');
-  await page.clock.setFixedTime(new Date());
 
   await send({ type: 'create-pin', pin: '734928', proof });
   await page.getByRole('button', { name: '设置', exact: true }).click();

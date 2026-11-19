@@ -5,6 +5,7 @@ import { readPrf } from '../webauthn';
 import { AreaField, ErrorBanner, Ico, SecretField } from './components';
 import { download, errorText } from './lib';
 import { ShellActions } from './shell';
+import WebDav from './WebDav';
 
 export interface EmergencyKit { recoveryCode: string; vaultId: string }
 interface Strength { score: number; warnings: string[] }
@@ -27,12 +28,14 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
   const [error, setError] = useState('');
   const [calibrate, setCalibrate] = useState(true);
   const [strength, setStrength] = useState<Strength>();
+  const [local, setLocal] = useState(false);
   const creating = !status.configured;
-  const choosing = creating || mode === 'recovery';
+  const choosing = !status.remoteKeyUpdate && ((creating && local) || mode === 'recovery');
 
   useEffect(() => {
+    if (status.remoteKeyUpdate && mode !== 'master') { setMode('master'); setPassword(''); setRecovery(''); }
     if (mode === 'pin' && !status.pinEnabled) { setMode('master'); setPassword(''); }
-  }, [status.pinEnabled, mode]);
+  }, [status.pinEnabled, status.remoteKeyUpdate, mode]);
   useEffect(() => {
     if (!choosing) return;
     let live = true;
@@ -50,7 +53,9 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
         setPassword(''); setConfirmPassword('');
         onCreated(output);
       } else {
-        if (mode === 'recovery') {
+        if (status.remoteKeyUpdate) {
+          await request({ type: 'webdav-update-key', password });
+        } else if (mode === 'recovery') {
           if (password !== confirmPassword) throw new Error('两次新主密码输入不一致。');
           await request({ type: 'recover', recoveryCode: recovery, newPassword: password });
         } else await request(mode === 'pin' ? { type: 'unlock-pin', pin: password } : { type: 'unlock', password });
@@ -74,8 +79,16 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
     setMode(next); setPassword(''); setConfirmPassword(''); setError('');
   }
 
-  const heading = creating ? '先设一个主密码' : mode === 'recovery' ? '用恢复码重设主密码' : '解锁密码库';
+  if (creating && !local) return <div className="door">
+    <div className="band-top"><span className="wordmark">Vault</span><ShellActions onError={e => setError(errorText(e))} /></div>
+    <div className="door-head"><h1>连接网盘</h1><p>已有密码库时，先测试它所在的 WebDAV 目录。也可以只使用本地密码库。</p></div>
+    <div className="door-panel">{error && <ErrorBanner text={error} />}<WebDav onboarding refresh={refresh} onCreated={onCreated}
+      stayLocal={() => { setError(''); setLocal(true); }} /></div>
+  </div>;
+
+  const heading = creating ? '先设一个主密码' : status.remoteKeyUpdate ? '验证新的主密码' : mode === 'recovery' ? '用恢复码重设主密码' : '解锁密码库';
   const lede = creating ? '以后只用记住这一个密码，其余的账号和密码都交给 Vault 保管。'
+    : status.remoteKeyUpdate ? '另一台设备已更新主密码。验证新密码后，需重新设置本机 PIN 和系统解锁。'
     : mode === 'recovery' ? '输入应急恢复包里的恢复码，再设一个新的主密码。'
       : mode === 'pin' ? '输入本机 PIN。连续输错 5 次后，需要改用主密码。'
         : '输入主密码，取用保存在这台电脑上的账号和密码。';
@@ -113,9 +126,10 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
         <button className="btn btn-primary btn-l btn-wide" disabled={busy}>
           {busy ? (creating ? '正在创建，请稍候…' : '正在验证…') : creating ? '创建本地密码库' : mode === 'recovery' ? '重设主密码' : '解锁'}
         </button>
+        {creating && <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => { setLocal(false); setPassword(''); setConfirmPassword(''); setError(''); }}>返回网盘连接</button>}
       </form>
     </div>
-    {!creating && <div className="door-alt">
+    {!creating && !status.remoteKeyUpdate && <div className="door-alt">
       {status.prf && mode !== 'recovery' && <button type="button" className="btn btn-door" disabled={busy} onClick={unlockWithSystem}><Ico of={Fingerprint} />系统解锁</button>}
       {status.pinEnabled && mode !== 'recovery' && <button type="button" className="btn btn-door" disabled={busy} onClick={() => switchMode(mode === 'pin' ? 'master' : 'pin')}>
         <Ico of={mode === 'pin' ? KeyRound : Hash} />{mode === 'pin' ? '使用主密码' : '使用 PIN'}</button>}
@@ -124,7 +138,7 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
     </div>}
     <p className="door-foot">{creating
       ? '密码库只保存在这台电脑上，不会上传。主密码没有“找回”功能，所以下一步会给你一份应急恢复包。'
-      : '密码库只保存在这台电脑上，不会上传。'}</p>
+      : '未配置网盘的密码库只保存在这台电脑上。'}</p>
   </div>;
 }
 

@@ -8,7 +8,7 @@ const path = require('node:path');
 const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
-const extension = path.join(root, 'apps/extension/.output/chrome-mv3');
+const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const output = path.join(root, 'test-results');
 const browsers = {
   edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',

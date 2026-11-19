@@ -1,17 +1,19 @@
-import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, Dices, LayoutGrid, Plus, Search, Settings as SettingsIcon, ShieldCheck, X, type LucideIcon } from 'lucide-react';
-import { request, type ItemSummary, type VaultItem, type VaultStatus } from '../vault-messages';
+import { request, type ItemDetailData, type ItemSummary, type VaultItem, type VaultStatus } from '../vault-messages';
 import { ErrorBanner, Ico, MenuButton, type MenuEntry } from './components';
 import { DialogHost, useDialogs } from './dialogs';
 import { Cancelled, errorText, newItem, text } from './lib';
 import { ShellActions } from './shell';
 import VaultList from './VaultList';
-import ItemDetail from './ItemDetail';
-import ItemEditor from './ItemEditor';
-import Generator from './Generator';
-import Audit from './Audit';
-import Settings, { type SettingsPage } from './Settings';
+import type { SettingsPage } from './Settings';
 import SiteSettings from './SiteSettings';
+
+const ItemDetail = lazy(() => import('./ItemDetail'));
+const ItemEditor = lazy(() => import('./ItemEditor'));
+const Generator = lazy(() => import('./Generator'));
+const Audit = lazy(() => import('./Audit'));
+const Settings = lazy(() => import('./Settings'));
 
 export interface Ops {
   busy: boolean;
@@ -30,7 +32,7 @@ export function useOps(): Ops {
 }
 
 type Tab = 'vault' | 'generator' | 'audit' | 'settings';
-type Screen = { name: 'list' } | { name: 'detail'; item: VaultItem } | { name: 'edit'; item: VaultItem; back?: VaultItem };
+type Screen = { name: 'list' } | { name: 'detail'; item: ItemDetailData } | { name: 'edit'; item: VaultItem; back?: ItemDetailData };
 const tabs: { id: Tab; label: string; icon: LucideIcon }[] = [
   { id: 'vault', label: '密码库', icon: LayoutGrid },
   { id: 'generator', label: '生成器', icon: Dices },
@@ -95,6 +97,13 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
     return () => { mounted.current = false; };
   }, [reload, fail, initialItems]);
   useEffect(() => {
+    const syncChanged = (message: { target?: string; type?: string }) => {
+      if (message?.target === 'vault-event' && message.type === 'sync-changed') void reload().catch(fail);
+    };
+    browser.runtime.onMessage.addListener(syncChanged);
+    return () => browser.runtime.onMessage.removeListener(syncChanged);
+  }, [reload, fail]);
+  useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(''), 4200);
     return () => clearTimeout(timer);
@@ -113,14 +122,18 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
     if (!await leave()) return;
     setTab(next); setScreen({ name: 'list' }); setSettingsPage(page); setError(''); setNotice('');
   }
-  async function fetchItem(summary: Pick<ItemSummary, 'id' | 'requireReprompt'>): Promise<VaultItem> {
+  async function fetchItem<T extends VaultItem>(summary: Pick<ItemSummary, 'id' | 'requireReprompt'>, type: 'get' | 'get-edit' = 'get') {
     const verified = summary.requireReprompt ? await dialogs.proof() : undefined;
-    try { return await request<VaultItem>({ type: 'get', id: summary.id, proof: verified }); }
+    try { return await request<T>({ type, id: summary.id, proof: verified }); }
     finally { if (verified) verified.secret = ''; }
   }
   const open = (summary: ItemSummary) => work(async () => {
-    const full = await fetchItem(summary);
+    const full = await fetchItem<ItemDetailData>(summary);
     if (mounted.current) { setTab('vault'); setScreen({ name: 'detail', item: full }); }
+  });
+  const edit = (detail: ItemDetailData) => work(async () => {
+    const item = await fetchItem<VaultItem>(detail, 'get-edit');
+    if (mounted.current) setScreen({ name: 'edit', item, back: detail });
   });
   const openById = (id: string) => {
     const summary = items?.find(item => item.id === id);
@@ -208,9 +221,10 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
             setFilter={setFilter} clearQuery={() => setQuery('')} open={summary => void open(summary)} quickCopy={quickCopy}
             create={() => create('login')} restore={item => void setTrashed(item, false)} remove={item => void remove(item)}
             emptyTrash={ids => void emptyTrash(ids)} backup={() => void go('settings', 'backup')} importCsv={() => void go('settings', 'csv')} />}
+          <Suspense fallback={<p className="hint" role="status">正在加载…</p>}>
           {tab === 'vault' && screen.name === 'detail' && <ItemDetail key={screen.item.id} item={screen.item}
-            back={() => setScreen({ name: 'list' })} edit={() => setScreen({ name: 'edit', item: screen.item, back: screen.item })}
-            updated={item => { setScreen({ name: 'detail', item }); void reload().catch(fail); }}
+            back={() => setScreen({ name: 'list' })} edit={() => void edit(screen.item)}
+            otpUsed={() => void reload().catch(fail)}
             setTrashed={trashed => void setTrashed(screen.item, trashed)} remove={() => void remove(screen.item)} />}
           {tab === 'vault' && screen.name === 'edit' && <ItemEditor key={screen.item.id || screen.item.data.kind + String(screen.item.data.subtype)} initial={screen.item}
             save={item => void save(item)} onDirty={value => { dirty.current = value; }}
@@ -218,6 +232,7 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
           {tab === 'generator' && <Generator />}
           {tab === 'audit' && <Audit open={openById} />}
           {tab === 'settings' && <Settings status={status} page={settingsPage} setPage={setSettingsPage} refresh={reload} />}
+          </Suspense>
         </main>
         <div className="toast-region" role="status" aria-live="polite">
           {notice && <div className="toast"><Ico of={Check} /><span>{notice}</span></div>}

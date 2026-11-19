@@ -3,6 +3,7 @@ import type { Reply } from './vault-messages';
 let tail: Promise<unknown> = Promise.resolve();
 // Serialize the shared offscreen document lifecycle, including clipboard alarms.
 export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
+  const result = Promise.withResolvers<T>();
   const run = tail.then(async () => {
     const opening = (async () => {
       if (!await browser.offscreen.hasDocument()) {
@@ -15,14 +16,18 @@ export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
       const [, prepared] = await Promise.all([opening, typeof payload === 'function' ? payload() : payload]);
       const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault-offscreen', operation, payload: prepared });
       if (!response?.ok) throw new Error(response?.error ?? '离屏任务失败');
-      return response.value;
+      // Deliver the completed task without paying document teardown latency.
+      // `tail` still includes teardown, so the next operation cannot race it.
+      result.resolve(response.value);
+    } catch (error) {
+      result.reject(error);
     } finally {
       await opening.catch(() => undefined);
       if (await browser.offscreen.hasDocument()) await browser.offscreen.closeDocument();
     }
   });
   tail = run.catch(() => undefined);
-  return run;
+  return result.promise;
 }
 export function derive<T>(operation: string, args: unknown[]): Promise<T> {
   return offscreen<T>('derive', { operation, args: args.map(value =>

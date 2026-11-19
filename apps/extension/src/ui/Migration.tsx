@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
+import { GripVertical } from 'lucide-react';
 import { MAX_BROWSER_CSV_BYTES, MAX_MIGRATION_BYTES, request, type CsvMapping, type MigrationExport, type MigrationFormat, type MigrationPreview } from '../vault-messages';
-import { SecretField, SelectField } from './components';
+import { Ico, SecretField, SelectField } from './components';
 import { useDialogs } from './dialogs';
 import { download, kinds } from './lib';
 import { useOps } from './Main';
@@ -30,6 +31,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
   const [file, setFile] = useState<File>();
   const [filePassword, setFilePassword] = useState('');
   const [headers, setHeaders] = useState<string[]>();
+  const [vendor, setVendor] = useState<string>();
   const [mapping, setMapping] = useState<CsvMapping>({});
   const [preview, setPreview] = useState<MigrationPreview>();
   const [encrypted, setEncrypted] = useState(!csv);
@@ -37,27 +39,39 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
   const [again, setAgain] = useState('');
   const [risk, setRisk] = useState(false);
   const input = useRef<HTMLInputElement>(null);
-  const clear = () => { setFile(undefined); setPreview(undefined); setHeaders(undefined); setMapping({}); setFilePassword(''); if (input.current) input.current.value = ''; };
+  const dragged = useRef<{ file: File | undefined; index: number } | undefined>(undefined);
+  const [target, setTarget] = useState<keyof CsvMapping>();
+  const stopDrag = () => { dragged.current = undefined; setTarget(undefined); };
+  const clear = () => { stopDrag(); setFile(undefined); setPreview(undefined); setHeaders(undefined); setVendor(undefined); setMapping({}); setFilePassword(''); if (input.current) input.current.value = ''; };
+  const assign = (key: keyof CsvMapping, index?: number) => {
+    setMapping(old => { const next = { ...old }; if (index == null) delete next[key]; else next[key] = index; return next; });
+    setPreview(undefined);
+  };
+  const assigned = Object.values(mapping);
+  const duplicate = new Set(assigned).size !== assigned.length;
+  const missing = columns.some(column => column.required && mapping[column.key] == null);
+  const canPreview = !headers || vendor === 'Enpass' || (!duplicate && !missing);
 
   return <>
     <div className="chips" role="group" aria-label="密码迁移操作">
       <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setRisk(false); }}>导入凭证</button>
-      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setPreview(undefined); setFilePassword(''); }}>导出凭证</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { clear(); setMode('export'); }}>导出凭证</button>
     </div>
     {mode === 'import' ? <>
       <p className="lede">{csv ? '选择 UTF-8 CSV，为每个字段指定源列。预览后再导入，已有凭证不会被覆盖。' : '从 Bitwarden 或 Vaultwarden 导出的 JSON 导入登录项、验证码、支付卡、身份和安全备注。已有凭证不会被覆盖。'}</p>
-      {!csv && <p className="hint">加密文件请选择「密码保护」导出，填写文件密码。账号绑定导出需要回到 Bitwarden 重新导出。未支持的源字段会加密保留在条目内；Passkey 暂不能使用。</p>}
+      {!csv && <p className="hint">支持密码保护或未加密的 JSON。账号绑定导出需要重新导出；不含受支持私钥的通行密钥不会启用。</p>}
       <form className="form" onSubmit={event => {
         event.preventDefault();
-        if (!file || busy) return;
+        if (!file || busy || !canPreview) return;
         void work(async () => {
           setPreview(undefined);
           if (csv && !headers) {
-            const parsed = await withFile(file, limit, bytes => request<{ headers: string[] }>({ type: 'csv-headers', bytes }));
+            const parsed = await withFile(file, limit, bytes => request<{ headers: string[]; vendor?: string; mapping?: CsvMapping }>({ type: 'csv-headers', bytes }));
             setHeaders(parsed.headers);
-            setMapping(Object.fromEntries(columns.flatMap(column => {
-              const index = parsed.headers.findIndex(header => column.aliases.includes(header.trim().toLowerCase()));
-              return index < 0 ? [] : [[column.key, index]];
+            setVendor(parsed.vendor);
+            setMapping(parsed.mapping ?? Object.fromEntries(columns.flatMap(column => {
+              const indices = parsed.headers.flatMap((header, index) => column.aliases.includes(header.trim().toLowerCase()) ? [index] : []);
+              return indices.length === 1 ? [[column.key, indices[0]]] : [];
             })));
           } else {
             setPreview(await withFile(file, limit, bytes => request<MigrationPreview>({ type: 'preview-migration', format, bytes, password: filePassword, mapping })));
@@ -66,31 +80,61 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
       }}>
         <label className="field">{csv ? 'CSV 文件' : 'Bitwarden JSON 文件'}<input ref={input} className="input" type="file" required disabled={busy}
           accept={csv ? '.csv,text/csv' : '.json,application/json'}
-          onChange={event => { setFile(event.target.files?.[0]); setPreview(undefined); setHeaders(undefined); setMapping({}); setFilePassword(''); }} /></label>
+          onChange={event => { stopDrag(); setFile(event.target.files?.[0]); setPreview(undefined); setHeaders(undefined); setVendor(undefined); setMapping({}); setFilePassword(''); }} /></label>
         <p className="hint">每次最多 {limit / 1024 / 1024} MiB、5,000 条。原文件保持不变。</p>
         {!csv && <SecretField label="文件密码（加密 JSON 才需填写）" autoComplete="off" value={filePassword} maxLength={4096} onChange={value => { setFilePassword(value); setPreview(undefined); }} />}
-        {csv && headers && <fieldset className="form">
+        {vendor && <p className="hint" role="status">识别到 {vendor} 导出。</p>}
+        {csv && headers && vendor !== 'Enpass' && <fieldset className="form">
           <legend>对应源列</legend>
-          {columns.map(column => <SelectField key={column.key} label={column.label + (column.required ? '（必选）' : '')} value={mapping[column.key] ?? ''} required={column.required} disabled={busy}
-            onChange={value => { setMapping(old => { const next = { ...old }; if (value === '') delete next[column.key]; else next[column.key] = Number(value); return next; }); setPreview(undefined); }}>
-            <option value="">{column.required ? '请选择源列' : '不导入此字段'}</option>
-            {headers.map((header, index) => <option key={index} value={index}>{index + 1}. {header || '无列名'}</option>)}
-          </SelectField>)}
+          <ul className="csv-source" aria-label="文件源列">
+            {headers.map((header, index) => <li className="csv-column" key={index} draggable={!busy}
+              onDragStart={event => {
+                dragged.current = { file, index };
+                event.dataTransfer.effectAllowed = 'copy';
+                event.dataTransfer.setData('application/x-vault-csv-column', String(index));
+              }}
+              onDragEnd={stopDrag}><Ico of={GripVertical} /><span>{index + 1}. {header || '无列名'}</span></li>)}
+          </ul>
+          {columns.map(column => <div className="csv-target" key={column.key} data-drag-over={target === column.key || undefined}
+            onDragOver={event => {
+              if (!busy && dragged.current?.file === file && event.dataTransfer.types.includes('application/x-vault-csv-column')) {
+                event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; setTarget(column.key);
+              }
+            }}
+            onDragLeave={event => { if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setTarget(undefined); }}
+            onDrop={event => {
+              event.preventDefault();
+              const source = dragged.current;
+              stopDrag();
+              if (!busy && source && source.file === file && event.dataTransfer.getData('application/x-vault-csv-column') === String(source.index)) {
+                assign(column.key, source.index);
+              }
+            }}>
+            <SelectField label={column.label + (column.required ? '（必选）' : '')} value={mapping[column.key] ?? ''} required={column.required} disabled={busy}
+              onChange={value => assign(column.key, value === '' ? undefined : Number(value))}>
+              <option value="">{column.required ? '请选择源列' : '不导入此字段'}</option>
+              {headers.map((header, index) => <option key={index} value={index}>{index + 1}. {header || '无列名'}</option>)}
+            </SelectField>
+          </div>)}
+          {duplicate ? <p className="banner banner-warn" role="alert">同一个源列不能用于多个字段。</p> :
+            missing && <p className="hint" role="status">网站和密码两列必选。</p>}
           <p className="hint">标签支持 JSON 数组或分号分隔。回收站值为 true、1 或 yes 时保留在回收站。</p>
         </fieldset>}
-        {!preview && <button className="btn btn-primary" disabled={busy || !file}>{csv && !headers ? '读取列名' : '预览迁移内容'}</button>}
+        {!preview && <button className="btn btn-primary" disabled={busy || !file || !canPreview}>{csv && !headers ? '读取列名' : '预览迁移内容'}</button>}
       </form>
       {preview && <section className="section">
         <h2>可导入 {preview.ready} 条凭证</h2>
         <p className="hint">重复跳过 {preview.skipped} 条，无法读取 {preview.invalid} 条，不支持的类型 {preview.unsupported} 条。</p>
+        {!csv && (preview.passkeys ?? 0) > 0 && <p className="hint">可启用 {preview.passkeys} 个通行密钥。</p>}
+        {!csv && (preview.ignoredPasskeys ?? 0) > 0 && <p className="banner banner-warn">有 {preview.ignoredPasskeys} 个通行密钥缺少可用私钥或使用了不支持的算法。</p>}
         {preview.ignoredOtp > 0 && <p className="banner banner-warn">有 {preview.ignoredOtp} 个验证码设置未启用，原值已保留为隐藏字段。请继续保留原验证器并检查这些记录。</p>}
         {preview.unsupported > 0 && <p className="banner banner-warn">请保留原密码库，检查未导入的条目。此向导暂不导入独立 SSH 类型或附件内容。</p>}
         <ul className="facts">{preview.sample.map((row, index) => <li className="fact" key={index}><div className="fact-text">
           <span className="fact-value">{row.title}</span><span className="fact-label">{row.account || kinds[row.kind] || row.kind}</span>
         </div></li>)}</ul>
         <div className="actions">
-          <button type="button" className="btn btn-primary" disabled={busy || !preview.ready} onClick={() => void work(async () => {
-            if (!file) return;
+          <button type="button" className="btn btn-primary" disabled={busy || !preview.ready || !canPreview} onClick={() => void work(async () => {
+            if (!file || !canPreview) return;
             const proof = await dialogs.proof();
             try {
               const count = await withFile(file, limit, bytes => request<number>({ type: 'import-migration', format, bytes, password: filePassword, mapping, stamp: preview.stamp, proof }));

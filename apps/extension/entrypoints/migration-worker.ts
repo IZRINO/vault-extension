@@ -1,16 +1,24 @@
-import init, { wasm_csv_headers, wasm_export_bitwarden, wasm_export_login_csv, wasm_parse_bitwarden, wasm_parse_mapped_csv } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import init, { wasm_csv_headers, wasm_export_login_csv, wasm_parse_mapped_csv, wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
 
 export default defineUnlistedScript(() => {
   self.onmessage = async ({ data }: MessageEvent<{ operation: string; args: unknown[] }>) => {
     try {
       await init();
       const [first, second, third] = data.args;
-      let value: string;
+      let value: unknown;
       switch (data.operation) {
         case 'csv-headers': value = wasm_csv_headers(first as Uint8Array); break;
         case 'parse-mapped-csv': value = wasm_parse_mapped_csv(first as Uint8Array, second as string); break;
-        case 'parse-bitwarden': value = wasm_parse_bitwarden(first as Uint8Array, second as string); break;
-        case 'export-bitwarden': value = wasm_export_bitwarden(first as string, second as string, third as Uint8Array); break;
+        case 'parse-authenticator-backup': value = wasm_parse_authenticator_backup(first as string, second as Uint8Array, third as string); break;
+        case 'portable-import': {
+          const result = wasm_portable_import(...data.args as Parameters<typeof wasm_portable_import>);
+          try { value = { report: result.report, head: Array.from(result.head), snap: Array.from(result.snap), count: result.count }; }
+          finally { result.free(); }
+          break;
+        }
+        case 'portable-export':
+          value = wasm_portable_export(...data.args as Parameters<typeof wasm_portable_export>);
+          break;
         case 'export-login-csv': value = wasm_export_login_csv(first as string); break;
         default: throw new Error('不支持的迁移格式。');
       }

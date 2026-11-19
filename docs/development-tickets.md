@@ -2,6 +2,8 @@
 
 原始拆分基线为 `4ce8c3d`；2026-11-18 按[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)、[分期计划](../分期开发与验证计划.md)和[八项决策](spec-gap-review.md)补订。已从 GitHub 读回核对 [38 张工单](https://github.com/IZRINO/vault-extension/issues?q=is%3Aissue%20label%3Aready-for-agent)及 63 条原生阻塞关系，编号 T01–T38 与实际票号对应。以下是待交付的行为，不是通过记录；已实现和待验收的部分见[一期](phase-1-status.md)、[二期](phase-2-status.md)记录。
 
+本轮按维护者要求推进开发、跳过人工签收；最新自动证据、发布候选包和未达项见[候选包验证记录](release-candidate-status.md)。下方依赖和验收阈值不因提前开发而改变。
+
 ## 从哪里开始
 
 | 顺序 | 范围 | 什么情况下才能往下走 |

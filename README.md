@@ -11,7 +11,7 @@
 
 ---
 
-> **项目状态（2026-11-17）**：第一阶段本地密码库已实现；第二阶段已实现防钓鱼网页填充与保存/改密提示、TOTP / HOTP / Steam Guard、亮暗二维码截图识别、浏览器 CSV 导入、通用 CSV 字段映射/导出、Bitwarden 明文及密码保护 JSON 双向迁移、Ente Auth 文本双向迁移与可选合并。Rust、后台集成与 Edge / Helium 自动回归已通过。二期完整验收仍未通过：Helium 首次扫码观测 236 ms，超过 200 ms 指标；实体 Windows Hello、实际锁屏、原生侧栏及第三方应用实际迁移仍待人工验收。WebDAV 和 Passkey 尚未实现。实现范围、测试结果与格式限制见 [一期记录](./docs/phase-1-status.md) 与 [二期记录](./docs/phase-2-status.md)。下文全景功能为分阶段目标，尚未全部实现。
+> **项目状态（2026-11-19）**：本地加密库、网页填充、OTP 与迁移在原实现上收尾，已加入 WebDAV 增量同步、软件 Passkey 和四期计划内迁移格式。可以构建 MV3 安装候选包；千条凭证的原生 Popup 冷开尚未达到准出指标，实体设备、真实网盘和第三方应用验收未签收。当前证据与格式限制见 [候选包验证记录](./docs/release-candidate-status.md)，历史基准见 [一期](./docs/phase-1-status.md) 和 [二期](./docs/phase-2-status.md)。下文全景包含尚未排期的架构目标。
 
 ## 设计目标与安全红线
 

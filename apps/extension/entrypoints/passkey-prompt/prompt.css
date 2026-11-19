@@ -1,0 +1,23 @@
+* { box-sizing: border-box; }
+body { margin: 0; background: transparent; font: 14px/1.4 system-ui, sans-serif; color: var(--text, #202124); }
+.passkey-ui { min-width: 0; padding: 16px; background: var(--surface, #fff); display: grid; gap: 10px; }
+.passkey-inline { padding: 9px; max-height: 100dvh; overflow: auto; border: 1px solid var(--border, #c6cad0); border-radius: 8px; box-shadow: 0 3px 12px #12141440; }
+.passkey-ui header, .passkey-ui footer { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.passkey-ui h1 { font-size: 17px; margin: 0; flex: 1; }
+.passkey-ui p { margin: 0; }
+.passkey-source, .passkey-choice { overflow-wrap: anywhere; }
+.passkey-ui small { display: block; color: var(--muted, #53575c); font-size: 12px; }
+.passkey-ui form, .passkey-proof { display: grid; gap: 9px; }
+.passkey-options { display: grid; gap: 4px; max-height: 160px; overflow: auto; }
+.passkey-inline .passkey-options { max-height: 116px; }
+.passkey-ui button, .passkey-proof input, .passkey-proof select { font: inherit; color: inherit; background: var(--surface, #fff); border: 1px solid var(--border, #bec4cc); border-radius: 6px; min-height: 34px; padding: 5px 8px; }
+.passkey-ui button { cursor: pointer; display: inline-flex; align-items: center; gap: 6px; justify-content: center; }
+.passkey-ui .close { min-width: 32px; padding: 4px; }
+.passkey-ui button:disabled { cursor: not-allowed; opacity: .58; }
+.passkey-ui button:focus-visible, .passkey-ui input:focus-visible, .passkey-ui select:focus-visible { outline: 2px solid var(--accent, #245c56); outline-offset: 1px; }
+.passkey-ui .primary { color: white; border-color: var(--accent, #245c56); background: var(--accent, #245c56); }
+.passkey-choice, .passkey-check { display: flex; align-items: center; gap: 8px; text-align: start; }
+.passkey-ui button.passkey-choice { width: 100%; justify-content: start; }
+.passkey-choice svg, .passkey-check input { flex: none; }
+.passkey-proof label { display: grid; gap: 3px; }
+.passkey-error { color: var(--danger, #a62831); }

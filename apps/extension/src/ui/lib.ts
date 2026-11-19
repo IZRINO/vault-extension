@@ -121,7 +121,7 @@ export function filterItems(items: ItemSummary[], filter: string, query: string)
   const needle = query.trim().toLocaleLowerCase();
   return items.filter(item => (filter === 'trash' ? item.trashed : !item.trashed) &&
     (['all', 'trash'].includes(filter) || (filter === 'pinned' ? item.pinned : item.kind === filter)) &&
-    [item.title, item.subtitle, item.primaryDomain, ...item.tags].join(' ').toLocaleLowerCase().includes(needle));
+    (!needle || [item.title, item.subtitle, item.primaryDomain, ...item.tags].join(' ').toLocaleLowerCase().includes(needle)));
 }
 
 /** 后端在没有填写服务名时给出的英文占位副标题，界面上改用中文类型名。 */

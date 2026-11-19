@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRightLeft, ChevronRight, Download, FileUp, Fingerprint, Globe, HardDrive, KeyRound, Lock, Upload } from 'lucide-react';
-import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultStatus } from '../vault-messages';
+import { ArrowLeft, ArrowRightLeft, ChevronRight, Cloud, Download, FileUp, Fingerprint, Globe, HardDrive, KeyRound, Lock, Upload } from 'lucide-react';
+import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultPackPreview, type VaultStatus } from '../vault-messages';
 import { registerPrf } from '../webauthn';
 import { Ico, SecretField, SelectField } from './components';
 import { useDialogs } from './dialogs';
@@ -11,9 +11,12 @@ import EnteAuth from './EnteAuth';
 import { AreaField } from './components';
 import type { AutofillSettings } from '../autofill-policy';
 import Migration from './Migration';
+import WebDav from './WebDav';
+import AuthMigration from './AuthMigration';
+import PortableMigration from './PortableMigration';
 
-export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'ente' | 'browser' | 'domains' | 'bitwarden' | 'mapped-csv';
-const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置', domains: '关联域名', bitwarden: 'Bitwarden 密码库迁移', 'mapped-csv': 'CSV 字段映射与导出' };
+export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'ente' | 'browser' | 'domains' | 'bitwarden' | 'mapped-csv' | 'webdav' | 'auth-migration' | 'portable-migration';
+const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置', domains: '关联域名', bitwarden: 'Bitwarden 密码库迁移', 'mapped-csv': 'CSV 字段映射与导出', webdav: '网盘连接', 'auth-migration': '导入其他验证器', 'portable-migration': '其他密码库与 CXF' };
 export default function Settings({ status, page, setPage, refresh }: {
   status: VaultStatus; page: SettingsPage; setPage(page: SettingsPage): void; refresh(): Promise<void>;
 }) {
@@ -23,10 +26,13 @@ export default function Settings({ status, page, setPage, refresh }: {
         {([
           ['security', Lock, '解锁与自动锁定', `主密码${status.pinEnabled ? '、PIN' : ''}${status.prf ? '、系统解锁' : ''} · ${status.autoLockMinutes} 分钟后锁定`],
           ['password', KeyRound, '更改主密码', '用当前主密码设置一个新的主密码'],
+          ['webdav', Cloud, '网盘连接', '测试 WebDAV 连接与时间偏差'],
           ['backup', HardDrive, '备份与恢复', '保存加密备份，或从备份恢复凭证'],
           ['csv', FileUp, '导入浏览器密码', '预览浏览器导出的 CSV，不覆盖已有凭证'],
           ['ente', ArrowRightLeft, 'Ente Auth 验证器迁移', '导入或导出验证码，可合并到已有登录项'],
+          ['auth-migration', ArrowRightLeft, '导入其他验证器', 'Google Authenticator、2FAS、Aegis、Raivo、andOTP、Stratum'],
           ['bitwarden', ArrowRightLeft, 'Bitwarden 密码库迁移', '支持明文或密码保护的 JSON 导入与导出'],
+          ['portable-migration', ArrowRightLeft, '其他密码库与 CXF', 'FIDO CXF、KeePass、1Password、Proton Pass'],
           ['mapped-csv', FileUp, 'CSV 字段映射与导出', '选择对应列导入，或导出登录凭证'],
           ['domains', Globe, '关联域名', '允许指定网站共用登录凭证'],
           ['browser', Globe, '浏览器设置', '管理浏览器原生的保存密码提示'],
@@ -39,10 +45,13 @@ export default function Settings({ status, page, setPage, refresh }: {
     {page === 'backup' && <Backup refresh={refresh} />}
     {page === 'csv' && <BrowserCsv refresh={refresh} />}
     {page === 'ente' && <EnteAuth refresh={refresh} />}
+    {page === 'auth-migration' && <AuthMigration refresh={refresh} />}
+    {page === 'portable-migration' && <PortableMigration refresh={refresh} />}
     {page === 'bitwarden' && <Migration key="bitwarden" format="bitwarden" refresh={refresh} />}
     {page === 'mapped-csv' && <Migration key="csv" format="csv" refresh={refresh} />}
     {page === 'domains' && <EquivalentDomains />}
     {page === 'browser' && <BrowserSettings />}
+    {page === 'webdav' && <WebDav refresh={refresh} />}
   </div>;
 }
 
@@ -133,40 +142,53 @@ function Backup({ refresh }: { refresh(): Promise<void> }) {
   const [file, setFile] = useState<File>();
   const [inputVersion, setInputVersion] = useState(0);
   const [pendingBackup, setPendingBackup] = useState<BackupReceipt>();
+  const [preview, setPreview] = useState<VaultPackPreview>();
   const receipt = mode === 'export' ? pendingBackup : undefined;
   const confirmHeading = useRef<HTMLHeadingElement>(null);
   useEffect(() => { if (receipt) confirmHeading.current?.focus(); }, [receipt]);
   return <>
     <div className="chips" role="group" aria-label="备份操作">
-      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setPassword(''); setAgain(''); }}>导出备份</button>
-      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setPassword(''); setAgain(''); }}>导入备份</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setPassword(''); setAgain(''); setPreview(undefined); }}>导出备份</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setPassword(''); setAgain(''); setPreview(undefined); }}>导入备份</button>
     </div>
-    <p className="lede">{mode === 'export' ? '备份包含整个密码库。用一个独立密码加密，再把文件存到另一台设备或 U 盘。' : '选择之前导出的 .vaultpack 文件。导入会合并凭证，相同编号保留较新版本。'}</p>
+    <p className="lede">{mode === 'export' ? '导出需要验证当前主密码；备份使用独立文件密码加密。' : '已有密码和条目字段不会被备份覆盖。'}</p>
     {!receipt && <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
       if (mode === 'export' && password !== again) throw new Error('两次备份密码输入不一致。');
       if (mode === 'import') {
         if (!file) throw new Error('请先选择备份文件。');
         if (file.size > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
-        if (!await dialogs.confirm({ title: '合并备份中的凭证？', body: '当前条目会保留；相同编号的凭证按较新版本合并。建议先导出当前密码库的备份。', confirmLabel: '验证并导入' })) return;
       }
-      const proof = await dialogs.proof();
+      const proof = await dialogs.proof({ masterOnly: true });
       try {
         if (mode === 'export') {
           const { bytes, receipt } = await request<BackupExport>({ type: 'export', password, proof });
           download('Vault-' + new Date().toISOString().slice(0, 10) + '.vaultpack', new Uint8Array(bytes), 'application/octet-stream');
           setPendingBackup(receipt);
         } else {
-          const count = await request<number>({ type: 'import', bytes: Array.from(new Uint8Array(await file!.arrayBuffer())), password, proof });
+          const bytes = Array.from(new Uint8Array(await file!.arrayBuffer()));
+          if (!preview) { setPreview(await request<VaultPackPreview>({ type: 'preview-vaultpack', bytes, password, proof })); return; }
+          const stamp = preview.stamp;
+          setPreview(undefined);
+          const count = await request<number>({ type: 'import', bytes, password, proof, stamp });
           setFile(undefined); setInputVersion(value => value + 1); notify('已合并 ' + count + ' 条凭证。');
         }
         setPassword(''); setAgain(''); await refresh();
       } finally { proof.secret = ''; }
     }); }}>
-      {mode === 'import' && <label className="field">导入加密备份<input key={inputVersion} className="input" type="file" accept=".vaultpack" required onChange={event => setFile(event.target.files?.[0])} /></label>}
-      <SecretField label="备份密码" autoComplete="off" required minLength={mode === 'export' ? 12 : undefined} maxLength={1024} value={password} onChange={setPassword}
+      {mode === 'import' && <label className="field">导入加密备份<input key={inputVersion} className="input" type="file" accept=".vaultpack" required disabled={busy}
+        onChange={event => { setFile(event.target.files?.[0]); setPreview(undefined); }} /></label>}
+      <SecretField label="备份密码" autoComplete="off" required minLength={mode === 'export' ? 12 : undefined} maxLength={1024} value={password}
+        disabled={busy} onChange={value => { setPassword(value); setPreview(undefined); }}
         hint={mode === 'export' ? '至少 12 个字符。请单独记好，恢复备份时会用到。' : '填写导出这个文件时设置的密码。'} />
       {mode === 'export' && <SecretField label="再次输入备份密码" autoComplete="off" required minLength={12} value={again} onChange={setAgain} />}
-      <button className="btn btn-primary" disabled={busy || (mode === 'import' && !file)}><Ico of={mode === 'export' ? Download : Upload} />{mode === 'export' ? '导出 .vaultpack' : '验证并导入'}</button>
+      {mode === 'import' && preview && <p className="banner banner-ok" role="status">新增 {preview.added} 条 · 更新验证码计数或通行密钥 {preview.updated} 条 · 跳过 {preview.skipped} 条</p>}
+      <div className="actions">
+        <button className="btn btn-primary" disabled={busy || (mode === 'import' && (!file || !!preview && preview.added + preview.updated === 0))}>
+          <Ico of={mode === 'export' ? Download : Upload} />{mode === 'export' ? '导出 .vaultpack' : preview ? '确认合入' : '验证并预览'}
+        </button>
+        {mode === 'import' && preview && <button type="button" className="btn" disabled={busy}
+          onClick={() => { setPreview(undefined); setPassword(''); }}>取消</button>}
+      </div>
     </form>}
     {receipt && <section className="section">
       <h2 ref={confirmHeading} tabIndex={-1}>确认备份已保存</h2>

@@ -746,6 +746,7 @@ mod tests {
             title: "Example Bank".into(),
             data: CredentialData::Login(LoginCredential {
                 username: "alice@example-bank.com".into(),
+                passkey_data: Vec::new(),
                 password: "MyUniqueTestSecret_9981".into(),
                 uris: vec![UriEntry {
                     uri: "https://example-bank.com/login".into(),
@@ -927,6 +928,7 @@ mod tests {
             title: "GitHub".into(),
             data: CredentialData::Login(LoginCredential {
                 username: "dev@example.com".into(),
+                passkey_data: Vec::new(),
                 password: "pw_0".into(),
                 uris: vec![UriEntry {
                     uri: "https://github.com".into(),
@@ -1158,6 +1160,7 @@ mod tests {
             title: "Pack Secret".into(),
             data: CredentialData::Login(LoginCredential {
                 username: "pack@user.io".into(),
+                passkey_data: Vec::new(),
                 password: "UltraSecretPackPassword!2026".into(),
                 uris: Vec::new(),
                 password_history: Vec::new(),
@@ -1210,6 +1213,7 @@ mod tests {
                 title: format!("Service Account #{idx}"),
                 data: CredentialData::Login(LoginCredential {
                     username: format!("engineer_{idx}@corp-domain.example.com"),
+                    passkey_data: Vec::new(),
                     password: format!("S3cur3#P@ssw0rd_K9m!{idx:04x}_XyZ"),
                     uris: vec![UriEntry {
                         uri: format!("https://portal-{}.corp-domain.example.com/auth/login", idx % 50),
@@ -1348,6 +1352,42 @@ mod tests {
         let restored = open_snapshot(&keys, Some("snap-legacy"), &envelope).unwrap();
         assert_eq!(restored.items[0].title, "Legacy item");
         assert_eq!(restored.state_mac, mac);
+    }
+
+    #[test]
+    fn authenticated_snapshot_with_unknown_login_field_is_not_rewritten() {
+        use crate::sync_codec::{MpReader, MsgPackWire};
+        let keys = VaultKeyHierarchy::from_master_dek(SecretKey::random().unwrap()).unwrap();
+        let mut snapshot = model::VaultSnapshot::new_empty("forward-vault".into(), "snap-forward".into(), 1000);
+        let item = VaultItem::from_json_str(r#"{"id":"x","title":"y","data":{"kind":"login"}}"#).unwrap();
+        let mut encoded = Vec::new();
+        item.encode_msgpack(&mut encoded);
+        snapshot.items.push(item);
+        let mut raw = Vec::new();
+        snapshot.encode_msgpack(&mut raw);
+        let start = raw.windows(encoded.len()).position(|bytes| bytes == encoded).unwrap();
+        let mut reader = MpReader::new(&encoded);
+        assert_eq!(reader.read_array_len(), 13);
+        assert_eq!(reader.read_string(), "x");
+        assert_eq!(reader.read_string(), "y");
+        assert_eq!(reader.read_u8(), 1);
+        let login_start = start + reader.position();
+        assert_eq!(reader.read_array_len(), 5);
+        assert_eq!(reader.read_string(), "");
+        assert_eq!(reader.read_string(), "");
+        assert_eq!(reader.read_array_len(), 0);
+        assert_eq!(reader.read_array_len(), 0);
+        assert_eq!(reader.read_opt_string(), None);
+        assert_eq!(raw[login_start], 0x95);
+        // Skip the optional Passkey slot to reach a genuinely unknown seventh field.
+        raw[login_start] = 0x97;
+        raw.splice(start + reader.position()..start + reader.position(), [0xc4, 0, 0x01]);
+        let mac = keys.compute_state_mac(&raw);
+        let mac_start = raw.len() - 32;
+        raw[mac_start..].copy_from_slice(&mac);
+        let compressed = crate::sync_codec::zstd_compress(&raw);
+        let envelope = SealedEnvelope::seal_bucketed(keys.snap_key(), FileRole::Snap, "snap-forward", 1, &compressed).unwrap().to_bytes().unwrap();
+        assert!(open_snapshot(&keys, Some("snap-forward"), &envelope).is_err());
     }
 
 }

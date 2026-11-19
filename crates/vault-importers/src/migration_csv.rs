@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 use crate::bitwarden::{SecretJson, text};
@@ -8,46 +9,153 @@ fn records(bytes: &[u8]) -> Result<Zeroizing<Vec<Vec<String>>>, &'static str> {
     let data = std::str::from_utf8(bytes).map_err(|_| "CSV 需使用 UTF-8 编码。")?;
     crate::read_csv(data.trim_start_matches('\u{feff}'))
 }
+
+type Mapping = BTreeMap<&'static str, usize>;
+fn detect(head: &[String]) -> Option<(&'static str, Mapping)> {
+    let names = head.iter().map(|name| name.trim().to_ascii_lowercase()).collect::<Vec<_>>();
+    let columns = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if columns.len() != head.len() || columns.contains("") { return None; }
+    let has = |required: &[&str]| required.iter().all(|name| columns.contains(name));
+    let candidates = [
+        ("Dashlane", has(&["username","username2","title","password","note","url","category"]), [
+            "title", "url", "username", "password", "note", "otpurl", "category",
+        ]),
+        ("NordPass", has(&["name","url","username","password","note","folder","cardholdername","cardnumber","type"]), [
+            "name", "url", "username", "password", "note", "totp", "folder",
+        ]),
+        ("LastPass", has(&["url","username","password","extra","name","grouping","fav"]), [
+            "name", "url", "username", "password", "extra", "totp", "grouping",
+        ]),
+    ];
+    let [(vendor, _, fields)] = candidates.iter().filter(|(_, matched, _)| *matched).collect::<Vec<_>>()[..] else { return None; };
+    let mut mapping = Mapping::new();
+    for (key, name) in ["title","url","username","password","note","totp","tags"].into_iter().zip(fields) {
+        if *vendor == "Dashlane" && key == "totp" && columns.contains("otpsecret") && columns.contains("otpurl") { return None; }
+        let name = if *vendor == "Dashlane" && key == "totp" && columns.contains("otpsecret") { "otpsecret" } else { name };
+        if let Some(index) = names.iter().position(|candidate| candidate == name) { mapping.insert(key, index); }
+    }
+    Some((vendor, mapping))
+}
+
+fn enpass(rows: &[Vec<String>]) -> bool {
+    rows.first().is_some_and(|row| row[1..].chunks_exact(2).any(|pair| pair[0].trim().eq_ignore_ascii_case("*password")))
+        || (rows.len() > 1 && rows[1..].iter().any(|row| {
+            let labels = row[1..].chunks_exact(2).map(|pair| pair[0].trim().to_ascii_lowercase()).collect::<BTreeSet<_>>();
+            labels.contains("*password") && (labels.contains("website") || labels.contains("username"))
+        }) && !rows[0].iter().any(|cell| ["url", "password", "website", "密码"].contains(&cell.trim().to_ascii_lowercase().as_str())))
+}
+
 fn headers(bytes: &[u8]) -> Result<String, &'static str> {
     let rows = records(bytes)?;
     let head = rows.first().ok_or("CSV 没有表头。")?;
-    Ok(json!({ "headers": head, "count": rows.len() - 1 }).to_string())
+    if enpass(&rows) {
+        return Ok(json!({ "vendor": "Enpass", "headers": [], "count": rows.len(), "mapping": {} }).to_string());
+    }
+    let mut result = json!({ "headers": head, "count": rows.len() - 1 });
+    if let Some((vendor, mapping)) = detect(head) {
+        result["vendor"] = json!(vendor);
+        result["mapping"] = json!(mapping);
+    }
+    Ok(result.to_string())
 }
+
+#[derive(Default)]
+struct Login<'a> {
+    title: &'a str, username: &'a str, password: &'a str, note: &'a str, otp: &'a str,
+    urls: Vec<&'a str>, tags: Vec<String>, pinned: bool, trashed: bool,
+}
+fn login_row(login: Login<'_>, ignored_otp: &mut usize) -> Value {
+    let mut fields = SecretJson(json!([]));
+    let uri = if login.otp.is_empty() { Value::Null } else {
+        match vault_otp::parse(login.otp) {
+            Ok(code) => json!(&*code.canonical_uri()),
+            Err(_) => {
+                *ignored_otp += 1;
+                fields.0.as_array_mut().unwrap().push(json!({"name":"CSV 未识别的验证码设置","value":login.otp,"hidden":true}));
+                Value::Null
+            }
+        }
+    };
+    let title = if login.title.is_empty() { login.urls.first().copied().unwrap_or("") } else { login.title };
+    json!({ "id": "", "title": title, "note": login.note, "tags": login.tags,
+        "data": { "kind": "login", "username": login.username, "password": login.password, "totpUri": uri,
+            "uris": login.urls.into_iter().map(|uri| json!({"uri": uri})).collect::<Vec<_>>() },
+        "customFields": fields.0, "pinned": login.pinned, "requireReprompt": false, "trashed": login.trashed })
+}
+
+fn import_enpass(rows: &[Vec<String>]) -> String {
+    let (mut invalid, mut skipped, mut ignored_otp) = (0, 0, 0);
+    let mut output = SecretJson(json!([]));
+    for row in rows {
+        let (title, fields) = row.split_first().unwrap();
+        let mut pairs = fields.chunks_exact(2);
+        let note = pairs.remainder().first().map_or("", String::as_str);
+        let mut row = Login { title, note, ..Default::default() };
+        let mut email = "";
+        let mut ambiguous = false;
+        for pair in &mut pairs {
+            let label = pair[0].trim_start_matches('*').trim().to_ascii_lowercase();
+            let value = pair[1].as_str();
+            match label.as_str() {
+                "username" if row.username.is_empty() => row.username = value,
+                "e-mail" | "email" if email.is_empty() => email = value,
+                "password" if row.password.is_empty() => row.password = value,
+                "password" if !value.is_empty() && row.password != value => ambiguous = true,
+                "website" | "url" if !value.is_empty() => row.urls.push(value),
+                "one-time code" if row.otp.is_empty() => row.otp = value,
+                "one-time code" if !value.is_empty() && row.otp != value => ambiguous = true,
+                _ => {}
+            }
+        }
+        if ambiguous || title.is_empty() { invalid += 1; continue; }
+        if row.password.is_empty() { skipped += 1; continue; }
+        if row.username.is_empty() { row.username = email; }
+        output.0.as_array_mut().unwrap().push(login_row(row, &mut ignored_otp));
+    }
+    json!({ "rows": output.0, "invalid": invalid, "unsupported": skipped, "ignoredOtp": ignored_otp }).to_string()
+}
+
 fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
     let records = records(bytes)?;
     let (head, rows) = records.split_first().ok_or("CSV 没有表头。")?;
     let mapping: Value = serde_json::from_str(mapping).map_err(|_| "字段映射无效。")?;
     if !mapping.is_object() { return Err("字段映射无效。"); }
+    if enpass(&records) {
+        if mapping.as_object().is_some_and(|fields| !fields.is_empty()) { return Err("Enpass 导出使用记录内的字段名，不接受表头映射。"); }
+        return Ok(import_enpass(&records));
+    }
+    let vendor = detect(head).filter(|(_, expected)| json!(expected) == mapping).map(|(vendor, _)| vendor);
+    let column = |name: &str| head.iter().position(|column| column.trim().eq_ignore_ascii_case(name));
+    let type_index = vendor.filter(|v| *v == "NordPass").and_then(|_| column("type"));
+    let additional = vendor.filter(|v| *v == "NordPass").and_then(|_| column("additional_urls"));
+    let favorite = vendor.filter(|v| *v == "LastPass").and_then(|_| column("fav"));
     let mut used = Vec::new();
     for (key, index) in mapping.as_object().unwrap() {
         if !["title", "url", "username", "password", "note", "totp", "tags", "trashed"].contains(&key.as_str()) { return Err("字段映射无效。"); }
-        let index = index.as_u64().filter(|n| (*n as usize) < head.len()).ok_or("请选择有效的源列。")?;
+        let index = index.as_u64().and_then(|index| usize::try_from(index).ok()).filter(|n| *n < head.len()).ok_or("请选择有效的源列。")?;
         if used.contains(&index) { return Err("同一个源列不能同时映射到多个字段。"); } used.push(index);
     }
     if mapping.get("password").is_none() || mapping.get("url").is_none() { return Err("请映射网站和密码列。"); }
-    let (mut invalid, mut ignored_otp) = (0, 0);
+    let (mut invalid, mut ignored_otp, mut unsupported) = (0, 0, 0);
     let mut output = SecretJson(json!([]));
     for row in rows {
         let get = |name: &str| mapping[name].as_u64().and_then(|i| row.get(i as usize)).map(String::as_str).unwrap_or("");
-        if row.len() != head.len() || get("password").is_empty() || get("url").trim().is_empty() { invalid += 1; continue; }
-        let otp = get("totp");
-        let mut fields = Vec::new();
-        let otp = if otp.is_empty() { Value::Null } else { match vault_otp::parse(otp) {
-            Ok(code) => json!(&*code.canonical_uri()),
-            Err(_) => {
-                ignored_otp += 1; fields.push(json!({ "name": "CSV 未识别的验证码设置", "value": otp, "hidden": true }));
-                Value::Null
-            }
-        }};
-        let tags = if get("tags").is_empty() { Vec::new() } else {
+        if row.len() != head.len() { invalid += 1; continue; }
+        if type_index.is_some_and(|i| !row[i].eq_ignore_ascii_case("password")) || (vendor == Some("LastPass") && get("url").trim() == "http://sn") {
+            unsupported += 1;
+            continue;
+        }
+        if get("password").is_empty() || get("url").trim().is_empty() { invalid += 1; continue; }
+        let tags = if get("tags").is_empty() { Vec::new() } else if vendor.is_some() { vec![get("tags").into()] } else {
             serde_json::from_str::<Vec<String>>(get("tags")).unwrap_or_else(|_| get("tags").split(';').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
         };
-        output.0.as_array_mut().unwrap().push(json!({ "id": "", "title": if get("title").trim().is_empty() { get("url").trim() } else { get("title").trim() },
-            "data": { "kind": "login", "username": get("username"), "password": get("password"), "uris": [{ "uri": get("url").trim() }], "totpUri": otp },
-            "note": get("note"), "customFields": fields, "tags": tags, "pinned": false, "requireReprompt": false,
-            "trashed": (["true", "1", "yes"].contains(&get("trashed"))) }));
+        let urls = std::iter::once(get("url").trim()).chain(additional.into_iter()
+            .flat_map(|index| row[index].split(',').map(str::trim).filter(|url| !url.is_empty()))).collect();
+        output.0.as_array_mut().unwrap().push(login_row(Login { title: get("title").trim(), username: get("username"),
+            password: get("password"), note: get("note"), otp: get("totp"), urls, tags,
+            pinned: favorite.is_some_and(|i| row[i] == "1"), trashed: ["true","1","yes"].contains(&get("trashed")) }, &mut ignored_otp));
     }
-    Ok(json!({ "rows": output.0, "invalid": invalid, "unsupported": 0, "ignoredOtp": ignored_otp }).to_string())
+    Ok(json!({ "rows": output.0, "invalid": invalid, "unsupported": unsupported, "ignoredOtp": ignored_otp }).to_string())
 }
 fn cell(value: &str) -> String { format!("\"{}\"", value.replace('"', "\"\"")) }
 fn export(items: &str) -> Result<String, &'static str> {
@@ -83,6 +191,41 @@ pub fn wasm_export_login_csv(items: String) -> Result<String, JsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vendor_signatures_preserve_login_fields_without_exposing_headers_from_enpass_rows() {
+        let dashlane = "\u{feff}username,username2,username3,title,password,note,url,category,otpUrl\r\nu,,,Entry,\" p,\"\"x\",\"Line\r\n2\",https://example.com,Work,JBSWY3DPEHPK3PXP";
+        let nordpass = "name,url,additional_urls,username,password,note,cardholdername,cardnumber,cvc,expirydate,zipcode,folder,full_name,phone_number,email,address1,address2,city,country,state,type,custom_fields\nEntry,https://example.com,https://example.org,u,p,Note,,,,,,Work,,,,,,,,,password,";
+        let lastpass = "url,username,password,totp,extra,name,grouping,fav\nhttps://example.com,u,p,JBSWY3DPEHPK3PXP,\"Line\n2\",Entry,Work,1";
+        let enpass = "\"Entry\",Username,u,*Password,\"p,\"\"x\",Website,https://example.com,Website,https://example.org,One-time code,JBSWY3DPEHPK3PXP,\"Line\n2\"\nNext,E-mail,other@example.com,*Password,q,Website,https://other.example";
+        for (vendor, csv) in [("Dashlane", dashlane), ("NordPass", nordpass), ("LastPass", lastpass), ("Enpass", enpass)] {
+            let report: Value = serde_json::from_str(&headers(csv.as_bytes()).unwrap()).unwrap();
+            assert_eq!(report["vendor"], vendor);
+            let batch: Value = serde_json::from_str(&import(csv.as_bytes(), &report["mapping"].to_string()).unwrap()).unwrap();
+            let first = &batch["rows"][0];
+            assert_eq!(first["title"], "Entry");
+            assert_eq!(first["data"]["username"], "u");
+            assert_eq!(first["data"]["uris"][0]["uri"], "https://example.com");
+            if vendor != "NordPass" {
+                assert!(text(&first["data"], "totpUri").starts_with("otpauth://totp/"));
+                assert!(text(first, "note").ends_with("\n2"));
+            }
+            if vendor == "Enpass" {
+                assert_eq!(report["headers"], json!([]));
+                assert_eq!(first["data"]["password"], "p,\"x");
+                assert_eq!(first["data"]["uris"][1]["uri"], "https://example.org");
+                assert_eq!(batch["rows"][1]["data"]["username"], "other@example.com");
+            }
+            if vendor == "Dashlane" { assert_eq!(first["data"]["password"], " p,\"x"); }
+        }
+        for ambiguous in [
+            "url,username,password,extra,name,grouping,fav,password\na,u,p,n,x,t,0,p",
+            "title,url,username,password,note\na,b,c,d,e",
+        ] {
+            let report: Value = serde_json::from_str(&headers(ambiguous.as_bytes()).unwrap()).unwrap();
+            assert!(report["vendor"].is_null());
+        }
+    }
+
     #[test]
     fn manual_mapping_quotes_otp_and_roundtrip() {
         let csv = "账号,站点,口令,备注,密钥\r\nu,https://example.com,\" p,\"\"q\",\"a\r\nb\",JBSWY3DPEHPK3PXP\r\n";

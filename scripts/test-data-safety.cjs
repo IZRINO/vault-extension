@@ -134,16 +134,22 @@ async function run(name) {
       await openBackup(page);
       await page.getByRole('button', { name: '导入备份', exact: true }).click();
       await page.getByLabel('导入加密备份').setInputFiles(backupPath);
-      const importBackup = async password => {
+      const previewBackup = async password => {
         await page.getByLabel('备份密码', { exact: true }).fill(password);
-        await page.getByRole('button', { name: '验证并导入', exact: true }).click();
-        await page.getByRole('dialog').getByRole('button', { name: '验证并导入', exact: true }).click();
+        await page.getByRole('button', { name: '验证并预览', exact: true }).click();
         await enterProof(page, restorePassword);
       };
-      await importBackup('Wrong-Test-Password#2026');
-      await expect(page.getByRole('alert')).toContainText('验证失败');
+      await previewBackup('Wrong-Test-Password#2026');
+      await expect(page.getByRole('alert')).toContainText('无法读取此备份');
       assert.deepEqual(await send({ type: 'list' }), []);
-      await importBackup(backupPassword);
+      await previewBackup(backupPassword);
+      await expect(page.getByRole('button', { name: '确认合入', exact: true })).toBeEnabled();
+      assert.deepEqual(await send({ type: 'list' }), []);
+      await page.getByRole('button', { name: '取消', exact: true }).click();
+      assert.deepEqual(await send({ type: 'list' }), []);
+      await previewBackup(backupPassword);
+      await page.getByRole('button', { name: '确认合入', exact: true }).click();
+      await enterProof(page, restorePassword);
       await expect(page.getByText('已合并 1 条凭证。')).toBeVisible();
       const [item] = await send({ type: 'list' });
       assert(item.requireReprompt);

@@ -14,11 +14,12 @@ const executables = {
   helium: 'C:/Program Files/imput/Helium/Application/chrome.exe',
 };
 const sampleCount = Number(process.env.VAULT_WAKE_SAMPLES ?? 10);
+const fixtureCount = Number(process.env.VAULT_WAKE_ITEMS ?? 1);
 const title = 'Vault Wake Fixture';
 const tabUrl = 'about:blank#vault-wakeup';
 const fixture = {
   id: '', title, data: { kind: 'login', username: 'fixture', password: 'Fixture-Only#2026', uris: [] },
-  note: '', customFields: [], tags: [], pinned: false, requireReprompt: true, trashed: false,
+  note: '', customFields: [], tags: [], pinned: true, requireReprompt: true, trashed: false,
 };
 
 const now = () => performance.timeOrigin + performance.now();
@@ -35,14 +36,25 @@ function stats(values) {
 }
 
 async function addFixture(page) {
-  await page.evaluate(async item => {
+  await page.evaluate(async ({ item, count }) => {
     const send = async message => {
       const reply = await chrome.runtime.sendMessage({ target: 'vault', ...message });
       if (!reply?.ok) throw new Error(reply?.error || 'Vault did not reply');
+      return reply.value;
     };
-    await send({ type: 'create', masterPassword: 'Wake-Fixture-Master#2026' });
+    const masterPassword = 'Wake-Fixture-Master#2026';
+    await send({ type: 'create', masterPassword });
+    if (count > 1) {
+      const csv = 'url,username,password,name\r\n' + Array.from({ length: count - 1 }, (_, i) =>
+        `https://w${i}.example.net,fixture${i},Test-Only-${i},Wake setup ${i}`).join('\r\n');
+      const bytes = Array.from(new TextEncoder().encode(csv));
+      const preview = await send({ type: 'preview-browser-csv', bytes });
+      await send({ type: 'import-browser-csv', bytes, stamp: preview.stamp, proof: { method: 'master', secret: masterPassword } });
+    }
     await send({ type: 'upsert', itemJson: JSON.stringify(item) });
-  }, fixture);
+    const opened = await send({ type: 'open' });
+    if (opened.items.length !== count) throw new Error(`Fixture count mismatch: ${opened.items.length}`);
+  }, { item: fixture, count: fixtureCount });
 }
 
 async function readPopup(cdp, targetId) {
@@ -50,23 +62,18 @@ async function readPopup(cdp, targetId) {
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: false });
   let listener, timer;
   try {
-    const expression = `new Promise(resolve => {
-      const deadline = performance.now() + 3000;
-      const inspect = () => {
-        const ready = performance.getEntriesByName('vault:list-ready', 'mark')[0];
-        const row = [...document.querySelectorAll('.row-main')].find(button => button.textContent.includes(${JSON.stringify(title)}));
-        const rowUsable = !!row && !row.disabled && row.getBoundingClientRect().height > 0
-          && getComputedStyle(row).visibility === 'visible';
-        if ((ready && rowUsable) || performance.now() > deadline) resolve({
-          readyAt: ready && performance.timeOrigin + ready.startTime,
-          navigationAt: performance.timeOrigin,
-          requestMs: performance.getEntriesByName('vault:popup-request', 'mark')[0]?.startTime,
-          rowUsable, heading: document.querySelector('h1')?.textContent,
-        });
-        else setTimeout(inspect, 20);
+    const expression = `(() => {
+      const ready = performance.getEntriesByName('vault:list-ready', 'mark')[0];
+      const row = [...document.querySelectorAll('.row-main')].find(button => button.textContent.includes(${JSON.stringify(title)}));
+      const rowUsable = !!row && !row.disabled && row.getBoundingClientRect().height > 0
+        && getComputedStyle(row).visibility === 'visible';
+      return {
+        readyAt: ready && performance.timeOrigin + ready.startTime,
+        navigationAt: performance.timeOrigin,
+        requestMs: performance.getEntriesByName('vault:popup-request', 'mark')[0]?.startTime,
+        rowUsable, heading: document.querySelector('h1')?.textContent,
       };
-      inspect();
-    })`;
+    })()`;
     const result = new Promise((resolve, reject) => {
       listener = event => {
         if (event.sessionId !== sessionId) return;
@@ -80,7 +87,7 @@ async function readPopup(cdp, targetId) {
     });
     const [, popup] = await Promise.all([
       cdp.send('Target.sendMessageToTarget', {
-        sessionId, message: JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true, awaitPromise: true } }),
+        sessionId, message: JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }),
       }),
       result,
     ]);
@@ -134,8 +141,8 @@ async function run(name, artifact) {
       await expect.poll(() => version?.runningStatus).toBe('stopped');
       const startedAt = now();
       await browserCdp.send('Extensions.triggerAction', { id, targetId: actionTab.targetId });
-      // Read the in-page clocks after the deadline so polling cannot make a sample pass or fail it.
-      await delay(250);
+      // Read marks after the deadline; hidden Popup timers may be throttled by Chromium.
+      await delay(1000);
       let popupTarget;
       await expect.poll(async () => {
         const { targetInfos } = await browserCdp.send('Target.getTargets', { filter: [{ type: 'page' }] });
@@ -164,10 +171,11 @@ async function run(name, artifact) {
       });
     }
     const result = {
-      browser: name, version: context.browser().version(), extension: path.relative(root, extension), artifact,
+      browser: name, version: context.browser().version(), extension: path.relative(root, extension), artifact, fixtureCount,
       samples: samples.map(sample => Object.fromEntries(Object.entries(sample)
         .filter(([, value]) => Number.isFinite(value)).map(([key, value]) => [key, ms(value)]))),
       restoreMs: stats(samples.map(sample => sample.restoreMs)), popupMs: stats(samples.map(sample => sample.popupMs)),
+      restorePassed: samples.every(sample => sample.restoreMs < 5), popupPassed: samples.every(sample => sample.popupMs < 50),
       passed: samples.every(sample => sample.restoreMs < 5 && sample.popupMs < 50),
     };
     console.log(JSON.stringify(result));
@@ -192,6 +200,7 @@ async function buildHash() {
 
 (async () => {
   assert(Number.isInteger(sampleCount) && sampleCount >= 2, 'At least two cold samples are required');
+  assert(Number.isInteger(fixtureCount) && fixtureCount >= 1 && fixtureCount <= 5000, 'Fixture count must be 1–5000');
   const names = process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium'];
   const artifact = await buildHash();
   const results = [];
@@ -199,6 +208,7 @@ async function buildHash() {
   assert.equal(await buildHash(), artifact, 'The production build changed during measurement');
   const output = path.join(root, 'test-results');
   await fs.mkdir(output, { recursive: true });
-  await fs.writeFile(path.join(output, 'wakeup.json'), JSON.stringify(results, null, 2) + '\n');
+  const filename = fixtureCount === 1 ? 'wakeup.json' : `wakeup-${fixtureCount}.json`;
+  await fs.writeFile(path.join(output, filename), JSON.stringify(results, null, 2) + '\n');
   assert(results.every(result => result.passed), 'Cold-wake limits: WASM restore < 5 ms and native Popup list < 50 ms on every sample');
 })().catch(error => { console.error(error); process.exitCode = 1; });

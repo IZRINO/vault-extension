@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { request, type ItemSummary, type VaultOpening, type VaultStatus } from '../vault-messages';
 import { ErrorBanner } from './components';
 import { errorText } from './lib';
 import Main from './Main';
-import Welcome, { KitScreen, type EmergencyKit } from './Welcome';
+import type { EmergencyKit } from './Welcome';
+const Welcome = lazy(() => import('./Welcome'));
+const KitScreen = lazy(async () => ({ default: (await import('./Welcome')).KitScreen }));
 
 export default function App({ readOpening }: { readOpening?: () => Promise<VaultOpening | undefined> }) {
   const [status, setStatus] = useState<VaultStatus>();
@@ -78,9 +80,11 @@ export default function App({ readOpening }: { readOpening?: () => Promise<Vault
         <button type="button" className="btn btn-primary btn-wide" onClick={() => { setError(''); void refresh().catch(e => setError(errorText(e))); }}>重试</button>
       </div>}
     </div>
-      : kit ? <KitScreen kit={kit} onDone={() => { setKit(undefined); void refresh().catch(e => setError(errorText(e))); }} />
-        : status.unlocked ? <Main status={status} refresh={refresh} initialItems={initialItems} />
-          : <Welcome key={String(status.configured)} status={status} refresh={refresh} onCreated={setKit} />}
+      : status.unlocked && !kit ? <Main status={status} refresh={refresh} initialItems={initialItems} />
+        : <Suspense fallback={<div className="door" role="status">正在打开密码库…</div>}>
+          {kit ? <KitScreen kit={kit} onDone={() => { setKit(undefined); void refresh().catch(e => setError(errorText(e))); }} />
+            : <Welcome key={String(status.configured)} status={status} refresh={refresh} onCreated={setKit} />}
+        </Suspense>}
     {shutter > 0 && <div key={shutter} className="shutter" aria-hidden="true" />}
   </div>;
 }

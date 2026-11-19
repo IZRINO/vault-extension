@@ -24,6 +24,7 @@ async function run(name) {
     page.on('pageerror', error => errors.push(error.message));
     page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
     await page.goto('chrome-extension://' + id + '/sidepanel.html');
+    await page.getByRole('button', { name: '暂不配置，创建本地密码库', exact: true }).click();
     await page.getByLabel('主密码', { exact: true }).fill('Browser-Test-Master#2026');
     await page.getByLabel('再次输入主密码').fill('Browser-Test-Master#2026');
     await page.getByRole('button', { name: '创建本地密码库', exact: true }).click();
@@ -100,7 +101,9 @@ async function run(name) {
     await send({ type: 'trash', id: item.id, trashed: true });
     await send({ type: 'delete', id: item.id });
     assert.equal((await send({ type: 'list' })).length, 0);
-    assert.equal(await send({ type: 'import', bytes: backup, password: 'Backup-Password-2026!', proof }), 1);
+    const backupPreview = await send({ type: 'preview-vaultpack', bytes: backup, password: 'Backup-Password-2026!', proof });
+    assert.equal(backupPreview.added, 1);
+    assert.equal(await send({ type: 'import', bytes: backup, password: 'Backup-Password-2026!', proof, stamp: backupPreview.stamp }), 1);
     const beforeRotation = await readFiles();
     await send({ type: 'lock' });
     await send({ type: 'recover', recoveryCode, newPassword: 'Recovered-Master#2026' });

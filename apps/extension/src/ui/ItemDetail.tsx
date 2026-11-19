@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ArrowLeft, ChevronRight, ExternalLink, Eye, EyeOff, MoreHorizontal, Pencil, ShieldCheck, Trash2 } from 'lucide-react';
-import { request, type VaultItem } from '../vault-messages';
+import { request, type ItemDetailData } from '../vault-messages';
 import { CopyButton, Ico, MenuButton } from './components';
 import { useDialogs } from './dialogs';
 import { developerFieldVisible, fieldSets, formatDateTime, kinds, openableUrl, plateText, subtypeNames, text } from './lib';
@@ -18,14 +18,14 @@ export function Fact({ label, value, secret = false }: { label: string; value: s
   </div>;
 }
 
-export default function ItemDetail({ item, back, edit, setTrashed, remove, updated }: {
-  item: VaultItem; back(): void; edit(): void; setTrashed(trashed: boolean): void; remove(): void; updated(item: VaultItem): void;
+export default function ItemDetail({ item, back, edit, setTrashed, remove, otpUsed }: {
+  item: ItemDetailData; back(): void; edit(): void; setTrashed(trashed: boolean): void; remove(): void; otpUsed(): void;
 }) {
   const ops = useOps();
   const dialogs = useDialogs();
   const [onlineNotice, setOnlineNotice] = useState('');
   const [onlineConfirmed, setOnlineConfirmed] = useState(false);
-  const authenticatorOnly = item.data.kind === 'login' && !!item.data.totpUri && !item.data.password;
+  const authenticatorOnly = !!item.otp && !item.data.password;
   const fields = (fieldSets[item.data.kind] ?? []).filter(field => item.data.kind !== 'developer' ||
     developerFieldVisible(field.key, text(item.data.subtype), item.data[field.key]))
     .filter(field => !authenticatorOnly || field.key !== 'password');
@@ -55,9 +55,8 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove, updat
       <div><h2>{item.title}</h2><p>{authenticatorOnly ? '两步验证码' : item.data.kind === 'developer' ? subtypeNames[text(item.data.subtype)] : kinds[item.data.kind]}{item.pinned && ' · 已置顶'}{item.requireReprompt && ' · 需要再次验证'}</p></div></div>
     {item.trashed && <div className="banner banner-warn">这条凭证在回收站里。恢复后可以继续使用。</div>}
     <div className="facts">{fields.map(field => <Fact key={field.key} label={field.label} value={text(item.data[field.key])} secret={field.secret} />)}</div>
-    {item.data.kind === 'login' && !item.trashed && !!item.data.totpUri && (
-      text(item.data.totpUri).trim().startsWith('otpauth://hotp/')
-        ? <HotpSection item={item} updated={updated} /> : <TotpSection setupKey={text(item.data.totpUri)} />)}
+    {!item.trashed && (item.otp?.kind === 'hotp' ? <HotpSection id={item.id} requireReprompt={item.requireReprompt} used={otpUsed} /> :
+      item.otp?.handle ? <TotpSection id={item.id} handle={item.otp.handle} /> : null)}
     {uris.length > 0 && <section className="section"><h2>网站</h2><div className="facts">{uris.map((uri, i) => {
       const url = openableUrl(uri.uri);
       return <div className="fact" key={i}><div className="fact-text"><span className="fact-value">{uri.uri}</span></div>

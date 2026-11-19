@@ -1,7 +1,7 @@
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
-fn decode(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, &'static str> {
+fn decode(bytes: Vec<u8>, width: u32, height: u32, migration: bool) -> Result<String, &'static str> {
     let bytes = Zeroizing::new(bytes);
     let size = (width as usize).checked_mul(height as usize).ok_or("截图过大。")?;
     if width < 21 || height < 21 || width > 8192 || height > 8192 || size > 16_777_216 || bytes.len() != size {
@@ -14,6 +14,12 @@ fn decode(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, &'static st
         for grid in image.detect_grids().into_iter().take(32) {
             if let Ok((_, text)) = grid.decode() {
                 let text = Zeroizing::new(text);
+                if migration {
+                    if text.len() <= 256 * 1024 && text.starts_with("otpauth-migration://offline?data=") && !results.contains(&*text) {
+                        results.push(text.to_string());
+                    }
+                    continue;
+                }
                 if !text.starts_with("otpauth://") { continue; }
                 if let Ok(otp) = vault_otp::parse(&text) {
                     let uri = otp.canonical_uri();
@@ -29,7 +35,12 @@ fn decode(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, &'static st
 
 #[wasm_bindgen]
 pub fn wasm_scan_otp(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, JsValue> {
-    decode(bytes, width, height).map_err(JsValue::from_str)
+    decode(bytes, width, height, false).map_err(JsValue::from_str)
+}
+
+#[wasm_bindgen]
+pub fn wasm_scan_migration(bytes: Vec<u8>, width: u32, height: u32) -> Result<String, JsValue> {
+    decode(bytes, width, height, true).map_err(JsValue::from_str)
 }
 
 #[cfg(test)]
@@ -37,8 +48,8 @@ mod tests {
     use super::*;
     #[test]
     fn rejects_malformed_sizes_and_ignores_empty_screen() {
-        assert!(decode(vec![0; 10], 200, 200).is_err());
-        assert!(decode(Vec::new(), u32::MAX, u32::MAX).is_err());
-        assert_eq!(decode(vec![255; 80 * 80], 80, 80).unwrap(), "[]");
+        assert!(decode(vec![0; 10], 200, 200, false).is_err());
+        assert!(decode(Vec::new(), u32::MAX, u32::MAX, false).is_err());
+        assert_eq!(decode(vec![255; 80 * 80], 80, 80, false).unwrap(), "[]");
     }
 }

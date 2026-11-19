@@ -11,6 +11,7 @@ wasm-bindgen.workspace = true
 zeroize.workspace = true
 vault-core = { path = "../vault-core" }
 hkdf = "0.12"
+hmac = "0.12"
 sha2 = "0.10"
 
 [package.metadata.wasm-pack.profile.release]

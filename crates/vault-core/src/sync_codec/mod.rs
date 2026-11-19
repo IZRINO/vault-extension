@@ -58,6 +58,14 @@ impl<'a> MpReader<'a> {
         }
     }
 
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub fn consumed_since(&self, start: usize) -> &[u8] {
+        self.buf.get(start..self.pos).unwrap_or_default()
+    }
+
     #[inline(never)]
     fn take(&mut self, n: usize) -> &'a [u8] {
         if self.err {
@@ -288,114 +296,20 @@ impl<'a> MpReader<'a> {
         if self.err { Vec::new() } else { s.to_vec() }
     }
 
-    #[inline(never)]
-    pub fn skip_value(&mut self, depth: u8) {
-        if self.err {
-            return;
-        }
-        if depth > 16 {
-            self.err = true;
-            return;
-        }
-        let m = self.byte();
-        match m {
-            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => {}
-            0x80..=0x8f => {
-                for _ in 0..((m & 0x0f) as usize * 2) {
-                    self.skip_value(depth + 1);
-                }
-            }
-            0x90..=0x9f => {
-                for _ in 0..(m & 0x0f) {
-                    self.skip_value(depth + 1);
-                }
-            }
-            0xa0..=0xbf => {
-                self.take((m & 0x1f) as usize);
-            }
-            0xcc | 0xd0 => {
-                self.take(1);
-            }
-            0xcd | 0xd1 | 0xd4 => {
-                self.take(2);
-            }
-            0xd5 => {
-                self.take(3);
-            }
-            0xca | 0xce | 0xd2 => {
-                self.take(4);
-            }
-            0xd6 => {
-                self.take(5);
-            }
-            0xcb | 0xcf | 0xd3 => {
-                self.take(8);
-            }
-            0xd7 => {
-                self.take(9);
-            }
-            0xd8 => {
-                self.take(17);
-            }
-            0xc4 | 0xd9 => {
-                let n = self.be_len(1);
-                self.take(n);
-            }
-            0xc5 | 0xda => {
-                let n = self.be_len(2);
-                self.take(n);
-            }
-            0xc6 | 0xdb => {
-                let n = self.be_len(4);
-                self.take(n);
-            }
-            0xc7 => {
-                let n = self.be_len(1);
-                self.take(1 + n);
-            }
-            0xc8 => {
-                let n = self.be_len(2);
-                self.take(1 + n);
-            }
-            0xc9 => {
-                let n = self.be_len(4);
-                self.take(1 + n);
-            }
-            0xdc => {
-                let n = self.be_len(2);
-                for _ in 0..n {
-                    self.skip_value(depth + 1);
-                }
-            }
-            0xdd => {
-                let n = self.be_len(4);
-                for _ in 0..n {
-                    self.skip_value(depth + 1);
-                }
-            }
-            0xde => {
-                let n = self.be_len(2);
-                for _ in 0..(n * 2) {
-                    self.skip_value(depth + 1);
-                }
-            }
-            0xdf => {
-                let n = self.be_len(4);
-                for _ in 0..(n * 2) {
-                    self.skip_value(depth + 1);
-                }
-            }
-            0xc1 => {
-                self.err = true;
-            }
-        }
+    fn require_array_len(&mut self, expected: u32) {
+        self.err |= self.read_array_len() != expected;
     }
 
-    #[inline(never)]
-    pub fn skip_remaining(&mut self, total_len: u32, consumed: u32) {
-        for _ in consumed..total_len {
-            self.skip_value(0);
-        }
+    fn read_tag(&mut self, max: u8) -> u8 {
+        let tag = self.read_u8();
+        self.err |= tag > max;
+        tag
+    }
+
+    fn decode_object<T: MsgPackWire>(&mut self) -> Result<T, VaultError> {
+        let value = T::decode_msgpack(self)?;
+        if self.err || self.pos != self.buf.len() { return Err(mp_read_err()); }
+        Ok(value)
     }
 }
 
@@ -405,7 +319,7 @@ fn mp_read_err() -> VaultError {
 }
 
 #[inline(never)]
-fn mp_write_array_len(wr: &mut Vec<u8>, len: usize) {
+pub fn mp_write_array_len(wr: &mut Vec<u8>, len: usize) {
     if len <= 15 {
         wr.push(0x90 | (len as u8));
     } else if len <= 0xffff {
@@ -418,12 +332,12 @@ fn mp_write_array_len(wr: &mut Vec<u8>, len: usize) {
 }
 
 #[inline(never)]
-fn mp_write_bool(wr: &mut Vec<u8>, val: bool) {
+pub fn mp_write_bool(wr: &mut Vec<u8>, val: bool) {
     wr.push(if val { 0xc3 } else { 0xc2 });
 }
 
 #[inline(never)]
-fn mp_write_uint(wr: &mut Vec<u8>, val: u64) {
+pub fn mp_write_uint(wr: &mut Vec<u8>, val: u64) {
     if val <= 0x7f {
         wr.push(val as u8);
     } else if val <= 0xff {
@@ -442,7 +356,7 @@ fn mp_write_uint(wr: &mut Vec<u8>, val: u64) {
 }
 
 #[inline(never)]
-fn mp_write_opt_u64(wr: &mut Vec<u8>, val: Option<u64>) {
+pub fn mp_write_opt_u64(wr: &mut Vec<u8>, val: Option<u64>) {
     match val {
         Some(v) => mp_write_uint(wr, v),
         None => wr.push(0xc0),
@@ -450,7 +364,7 @@ fn mp_write_opt_u64(wr: &mut Vec<u8>, val: Option<u64>) {
 }
 
 #[inline(never)]
-fn mp_write_str(wr: &mut Vec<u8>, s: &str) {
+pub fn mp_write_str(wr: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     let len = b.len();
     if len <= 31 {
@@ -477,7 +391,7 @@ fn mp_write_opt_str(wr: &mut Vec<u8>, val: &Option<String>) {
 }
 
 #[inline(never)]
-fn mp_write_bin(wr: &mut Vec<u8>, b: &[u8]) {
+pub fn mp_write_bin(wr: &mut Vec<u8>, b: &[u8]) {
     let len = b.len();
     if len <= 0xff {
         wr.push(0xc4);
@@ -523,7 +437,7 @@ impl MsgPackWire for HeadEncryptedPointer {
 
     fn decode_msgpack(rd: &mut MpReader<'_>) -> Result<Self, VaultError> {
         let len = rd.read_array_len();
-        if rd.err || len < 5 {
+        if rd.err || len != 5 {
             return Err(mp_read_err());
         }
         let latest_snapshot_id = rd.read_string();
@@ -538,7 +452,6 @@ impl MsgPackWire for HeadEncryptedPointer {
         let snapshot_epoch = rd.read_u64();
         let mac_vec = rd.read_bin_vec();
         let updated_at_ms = rd.read_u64();
-        rd.skip_remaining(len, 5);
         rd.finish()?;
         if mac_vec.len() != 32 {
             return Err(mp_read_err());
@@ -563,7 +476,7 @@ impl MsgPackWire for VaultItem {
         match &self.data {
             CredentialData::Login(l) => {
                 mp_write_uint(wr, 1);
-                mp_write_array_len(wr, 5);
+                mp_write_array_len(wr, if l.passkey_data.is_empty() { 5 } else { 6 });
                 mp_write_str(wr, &l.username);
                 mp_write_str(wr, &l.password);
                 mp_write_array_len(wr, l.uris.len());
@@ -580,6 +493,7 @@ impl MsgPackWire for VaultItem {
                     mp_write_opt_str(wr, &h.source_device);
                 }
                 mp_write_opt_str(wr, &l.totp_uri);
+                if !l.passkey_data.is_empty() { mp_write_bin(wr, &l.passkey_data); }
             }
             CredentialData::PaymentCard(c) => {
                 mp_write_uint(wr, 2);
@@ -643,7 +557,8 @@ impl MsgPackWire for VaultItem {
 
     fn decode_msgpack(rd: &mut MpReader<'_>) -> Result<Self, VaultError> {
         let len = rd.read_array_len();
-        if rd.err || len < 12 {
+        // The pre-release writer declared 12 fields but wrote 13.
+        if rd.err || !matches!(len, 12 | 13) {
             return Err(mp_read_err());
         }
         let id = rd.read_string();
@@ -652,6 +567,7 @@ impl MsgPackWire for VaultItem {
         let data = match kind_tag {
             1 => {
                 let dlen = rd.read_array_len();
+                if !(4..=6).contains(&dlen) { return Err(mp_read_err()); }
                 let username = rd.read_string();
                 let password = rd.read_string();
                 let ulen = rd.read_array_len() as usize;
@@ -660,10 +576,9 @@ impl MsgPackWire for VaultItem {
                     if rd.err {
                         break;
                     }
-                    let elen = rd.read_array_len();
+                    rd.require_array_len(2);
                     let uri = rd.read_string();
-                    let rule = UriMatchRule::from_u8(rd.read_u8());
-                    rd.skip_remaining(elen, 2);
+                    let rule = UriMatchRule::from_u8(rd.read_tag(5));
                     uris.push(UriEntry {
                         uri,
                         match_rule: rule,
@@ -675,11 +590,10 @@ impl MsgPackWire for VaultItem {
                     if rd.err {
                         break;
                     }
-                    let elen = rd.read_array_len();
+                    rd.require_array_len(3);
                     let pw = rd.read_string();
                     let changed_at_ms = rd.read_u64();
                     let source_device = rd.read_opt_string();
-                    rd.skip_remaining(elen, 3);
                     password_history.push(PasswordHistoryEntry {
                         password: pw,
                         changed_at_ms,
@@ -687,26 +601,26 @@ impl MsgPackWire for VaultItem {
                     });
                 }
                 let totp_uri = if dlen >= 5 { rd.read_opt_string() } else { None };
-                rd.skip_remaining(dlen, 5.min(dlen));
+                let passkey_data = if dlen >= 6 { rd.read_bin_vec() } else { Vec::new() };
                 CredentialData::Login(LoginCredential {
                     username,
                     password,
                     uris,
                     password_history,
                     totp_uri,
+                    passkey_data,
                 })
             }
             2 => {
-                let dlen = rd.read_array_len();
+                rd.require_array_len(8);
                 let cardholder_name = rd.read_string();
                 let card_number = rd.read_string();
-                let brand = CardBrand::from_u8(rd.read_u8());
+                let brand = CardBrand::from_u8(rd.read_tag(6));
                 let exp_month = rd.read_string();
                 let exp_year = rd.read_string();
                 let cvv = rd.read_string();
                 let card_pin = rd.read_string();
                 let billing_address = rd.read_string();
-                rd.skip_remaining(dlen, 8);
                 CredentialData::PaymentCard(PaymentCardCredential {
                     cardholder_name,
                     card_number,
@@ -719,7 +633,7 @@ impl MsgPackWire for VaultItem {
                 })
             }
             3 => {
-                let dlen = rd.read_array_len();
+                rd.require_array_len(11);
                 let full_name = rd.read_string();
                 let phone = rd.read_string();
                 let email = rd.read_string();
@@ -731,7 +645,6 @@ impl MsgPackWire for VaultItem {
                 let postal_code = rd.read_string();
                 let company = rd.read_string();
                 let tax_id = rd.read_string();
-                rd.skip_remaining(dlen, 11);
                 CredentialData::Identity(IdentityCredential {
                     full_name,
                     phone,
@@ -747,14 +660,13 @@ impl MsgPackWire for VaultItem {
                 })
             }
             4 => {
-                let dlen = rd.read_array_len();
-                let subtype = DeveloperCredentialSubtype::from_u8(rd.read_u8());
+                rd.require_array_len(6);
+                let subtype = DeveloperCredentialSubtype::from_u8(rd.read_tag(2));
                 let service_or_product = rd.read_string();
                 let token_or_license = rd.read_string();
                 let public_key = rd.read_string();
                 let private_key = rd.read_string();
                 let expires_at_ms = rd.read_opt_u64();
-                rd.skip_remaining(dlen, 6);
                 CredentialData::Developer(DeveloperCredential {
                     subtype,
                     service_or_product,
@@ -778,11 +690,10 @@ impl MsgPackWire for VaultItem {
             if rd.err {
                 break;
             }
-            let elen = rd.read_array_len();
+            rd.require_array_len(3);
             let name = rd.read_string();
             let value = rd.read_string();
             let hidden = rd.read_bool();
-            rd.skip_remaining(elen, 3);
             custom_fields.push(CustomField {
                 name,
                 value,
@@ -802,12 +713,9 @@ impl MsgPackWire for VaultItem {
         let trashed = rd.read_bool();
         let trashed_at_ms = rd.read_opt_u64();
         let created_at_ms = rd.read_u64();
-        let meta_len = rd.read_array_len();
+        rd.require_array_len(2);
         let updated_at_ms = rd.read_u64();
         let revision = rd.read_u64();
-        rd.skip_remaining(meta_len, 2);
-        // Accept the pre-release header (12) that actually encoded 13 fields.
-        rd.skip_remaining(len, 13);
         rd.finish()?;
 
         Ok(Self {
@@ -842,7 +750,7 @@ impl MsgPackWire for DeviceMetadata {
     }
 
     fn decode_msgpack(rd: &mut MpReader<'_>) -> Result<Self, VaultError> {
-        let len = rd.read_array_len();
+        rd.require_array_len(8);
         let device_id = rd.read_string();
         let dev_tag = rd.read_string();
         let device_name = rd.read_string();
@@ -851,7 +759,6 @@ impl MsgPackWire for DeviceMetadata {
         let ext_version = rd.read_string();
         let created_at_ms = rd.read_u64();
         let last_seen_at_ms = rd.read_u64();
-        rd.skip_remaining(len, 8);
         rd.finish()?;
         Ok(Self {
             device_id,
@@ -890,7 +797,7 @@ impl MsgPackWire for VaultSnapshot {
 
     fn decode_msgpack(rd: &mut MpReader<'_>) -> Result<Self, VaultError> {
         let len = rd.read_array_len();
-        if rd.err || len < 8 {
+        if rd.err || len != 8 {
             return Err(mp_read_err());
         }
         let vault_id = rd.read_string();
@@ -922,7 +829,6 @@ impl MsgPackWire for VaultSnapshot {
             included_wal_ids.push(rd.read_string());
         }
         let mac_vec = rd.read_bin_vec();
-        rd.skip_remaining(len, 8);
         rd.finish()?;
         if mac_vec.len() != 32 {
             return Err(mp_read_err());
@@ -1222,7 +1128,7 @@ pub fn decode_msgpack_zstd_padded<T: MsgPackWire>(padded: &[u8]) -> Result<T, Va
     let compressed = crate::crypto::unpad_from_256_bucket(padded)?;
     let mut raw = zstd_decompress_bounded(compressed.as_slice(), MAX_MSGPACK_BYTES)?;
     let mut reader = MpReader::new(raw.as_slice());
-    let decoded = T::decode_msgpack(&mut reader);
+    let decoded = reader.decode_object();
     raw.zeroize();
     decoded
 }
@@ -1257,7 +1163,7 @@ pub fn open_compact_object<T: MsgPackWire>(
     let compressed = env.open_bucketed(key, expected_role, expected_object_id)?;
     let mut decompressed = zstd_decompress_bounded(compressed.as_slice(), MAX_MSGPACK_BYTES)?;
     let mut reader = MpReader::new(decompressed.as_slice());
-    let res = T::decode_msgpack(&mut reader);
+    let res = reader.decode_object();
     decompressed.zeroize();
     res
 }
@@ -1304,7 +1210,7 @@ pub fn open_snapshot(
         return Err(VaultError::CryptoAuthFailed);
     }
     raw[mac_start..].copy_from_slice(&recorded_mac);
-    VaultSnapshot::decode_msgpack(&mut MpReader::new(&raw))
+    MpReader::new(&raw).decode_object()
 }
 
 pub fn export_vaultpack(

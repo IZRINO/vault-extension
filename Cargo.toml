@@ -6,6 +6,8 @@ members = [
     "crates/vault-otp",
     "crates/vault-qr",
     "crates/vault-preferences",
+    "crates/vault-sync",
+    "crates/vault-passkeys",
 ]
 
 [workspace.dependencies]

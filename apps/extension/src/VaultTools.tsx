@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultStatus } from './vault-messages';
+import { MAX_VAULTPACK_BYTES, request, type BackupExport, type BackupReceipt, type Proof, type VaultPackPreview, type VaultStatus } from './vault-messages';
 import { registerPrf } from './webauthn';
 
 export function download(name: string, data: BlobPart, type: string) {
@@ -63,12 +63,15 @@ export function Settings({ status, proof, refresh, work, busy, notice }: ToolsPr
         setPendingBackup(undefined); await refresh(); notice('已记录这次备份。');
       })}>文件已保存</button>}
       <label>导入加密备份<input type="file" accept=".vaultpack" onChange={e => setFile(e.target.files?.[0])} /></label>
-      <p className="hint">导入将合并条目；相同编号以较新版本为准。</p>
+      <p className="hint">已有密码和条目字段不会被备份覆盖。</p>
       <button disabled={busy || !file || !backupPassword} onClick={() => void work(async () => {
         if (!file) return;
         if (file.size > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
-        if (!confirm('导入将合并备份中的凭证，是否继续？')) return;
-        const count = await request<number>({ type: 'import', bytes: Array.from(new Uint8Array(await file.arrayBuffer())), password: backupPassword, proof: await proof() });
+        const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+        const verified = await proof();
+        const preview = await request<VaultPackPreview>({ type: 'preview-vaultpack', bytes, password: backupPassword, proof: verified });
+        if (!confirm(`新增 ${preview.added} 条、更新 ${preview.updated} 条、跳过 ${preview.skipped} 条。确认合入？`)) return;
+        const count = await request<number>({ type: 'import', bytes, password: backupPassword, proof: verified, stamp: preview.stamp });
         setBackupPassword(''); setFile(undefined); await refresh(); notice('已合并 ' + count + ' 条凭证。');
       })}>验证并导入</button>
     </div>
