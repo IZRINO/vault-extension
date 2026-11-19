@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, Dices, LayoutGrid, Plus, Search, Settings as SettingsIcon, ShieldCheck, X, type LucideIcon } from 'lucide-react';
 import { request, type ItemSummary, type VaultItem, type VaultStatus } from '../vault-messages';
 import { ErrorBanner, Ico, MenuButton, type MenuEntry } from './components';
@@ -39,16 +39,17 @@ const tabs: { id: Tab; label: string; icon: LucideIcon }[] = [
 ];
 const COPIED = '已复制，将在约 30 秒后检查并清理。';
 
-export default function Main({ status, refresh }: { status: VaultStatus; refresh(): Promise<void> }) {
-  return <DialogHost pinEnabled={status.pinEnabled}><Workspace status={status} refresh={refresh} /></DialogHost>;
+interface WorkspaceProps { status: VaultStatus; refresh(): Promise<void>; initialItems?: ItemSummary[] }
+export default function Main(props: WorkspaceProps) {
+  return <DialogHost pinEnabled={props.status.pinEnabled}><Workspace {...props} /></DialogHost>;
 }
 
-function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promise<void> }) {
+function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
   const dialogs = useDialogs();
   const [tab, setTab] = useState<Tab>('vault');
   const [screen, setScreen] = useState<Screen>({ name: 'list' });
   const [settingsPage, setSettingsPage] = useState<SettingsPage>('home');
-  const [items, setItems] = useState<ItemSummary[]>();
+  const [items, setItems] = useState(initialItems);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [busy, setBusy] = useState(false);
@@ -58,7 +59,14 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
   const running = useRef(0);
   const dirty = useRef(false);
   const content = useRef<HTMLElement>(null);
+  const initialListReady = useRef(false);
 
+  useLayoutEffect(() => {
+    if (items && !initialListReady.current && tab === 'vault' && screen.name === 'list') {
+      initialListReady.current = true;
+      performance.mark('vault:list-ready');
+    }
+  }, [items, tab, screen.name]);
   const fail = useCallback((e: unknown) => {
     if (mounted.current && !(e instanceof Cancelled)) setError(errorText(e));
   }, []);
@@ -83,9 +91,9 @@ function Workspace({ status, refresh }: { status: VaultStatus; refresh(): Promis
 
   useEffect(() => {
     mounted.current = true;
-    void reload().catch(fail);
+    if (!initialItems) void reload().catch(fail);
     return () => { mounted.current = false; };
-  }, [reload, fail]);
+  }, [reload, fail, initialItems]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(''), 4200);

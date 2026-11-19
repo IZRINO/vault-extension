@@ -1,29 +1,51 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { request, type VaultStatus } from '../vault-messages';
+import { request, type ItemSummary, type VaultOpening, type VaultStatus } from '../vault-messages';
 import { ErrorBanner } from './components';
 import { errorText } from './lib';
 import Main from './Main';
 import Welcome, { KitScreen, type EmergencyKit } from './Welcome';
 
-export default function App() {
+export default function App({ readOpening }: { readOpening?: () => Promise<VaultOpening | undefined> }) {
   const [status, setStatus] = useState<VaultStatus>();
+  const [initialItems, setInitialItems] = useState<ItemSummary[]>();
   const [error, setError] = useState('');
   const [kit, setKit] = useState<EmergencyKit>();
   const [shutter, setShutter] = useState(0);
   const wasUnlocked = useRef<boolean | undefined>(undefined);
-  const refresh = useCallback(async () => setStatus(await request<VaultStatus>({ type: 'status' })), []);
+  const lockVersion = useRef(0);
+  const refresh = useCallback(async () => {
+    const version = lockVersion.current;
+    const current = await request<VaultStatus>({ type: 'status' });
+    if (version !== lockVersion.current) return;
+    if (!current.unlocked) setInitialItems(undefined);
+    setStatus(current);
+  }, []);
 
-  useEffect(() => {
-    void refresh().catch(e => setError(errorText(e)));
+  useLayoutEffect(() => {
+    let mounted = true;
     const onMessage = (message: { target?: string; type?: string }) => {
       if (message?.target === 'vault-event' && message.type === 'locked') {
+        lockVersion.current++;
+        setInitialItems(undefined);
         setStatus(old => old ? { ...old, unlocked: false } : old);
         void refresh().catch(() => undefined);
       }
     };
     browser.runtime.onMessage.addListener(onMessage);
-    return () => { browser.runtime.onMessage.removeListener(onMessage); };
-  }, [refresh]);
+    const version = lockVersion.current;
+    const current = () => mounted && version === lockVersion.current;
+    void (async () => {
+      const opened = await readOpening?.() ?? await request<VaultOpening>({ type: 'open' });
+      if (current()) {
+        setInitialItems(opened.items);
+        setStatus(opened.status);
+      }
+    })().catch(e => { if (current()) setError(errorText(e)); });
+    return () => {
+      mounted = false;
+      browser.runtime.onMessage.removeListener(onMessage);
+    };
+  }, [readOpening, refresh]);
   const unlocked = status?.unlocked;
   useEffect(() => {
     if (!unlocked) return;
@@ -57,7 +79,7 @@ export default function App() {
       </div>}
     </div>
       : kit ? <KitScreen kit={kit} onDone={() => { setKit(undefined); void refresh().catch(e => setError(errorText(e))); }} />
-        : status.unlocked ? <Main status={status} refresh={refresh} />
+        : status.unlocked ? <Main status={status} refresh={refresh} initialItems={initialItems} />
           : <Welcome key={String(status.configured)} status={status} refresh={refresh} onCreated={setKit} />}
     {shutter > 0 && <div key={shutter} className="shutter" aria-hidden="true" />}
   </div>;

@@ -13,6 +13,7 @@ import type { LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
+  pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
   failSave: false, pendingHotp: undefined as Uint8Array | undefined, local: {} as Record<string, unknown> }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
@@ -23,7 +24,10 @@ vi.mock('./vault-storage', () => ({
   },
   loadSessionState: async () => structuredClone(state.session),
   saveSessionState: async (session: SessionState) => { state.session = structuredClone(session); },
-  clearSessionState: async () => { state.session = undefined; },
+  clearSessionState: async () => {
+    if (state.pauseSessionClear) await state.pauseSessionClear;
+    state.session = undefined;
+  },
   loadSettings: async () => structuredClone(state.settings),
   saveSettings: async (settings: LocalSettings) => { state.settings = structuredClone(settings); },
 }));
@@ -82,11 +86,14 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   state.files = structuredClone(fixture); state.session = undefined; state.pause = undefined;
+  state.pauseSessionClear = undefined;
+  state.idleState = 'active';
   state.failSave = false;
   state.pendingHotp = undefined;
   state.local = {};
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
+    idle: { queryState: async () => state.idleState },
     storage: { session: { get: async () => ({}), set: vi.fn() }, local: {
       get: async () => structuredClone(state.local),
       set: async (values: Record<string, unknown>) => { Object.assign(state.local, structuredClone(values)); },
@@ -156,6 +163,49 @@ describe('real WASM + background session integration', () => {
     expect((await expired.handle({ type: 'status' }) as VaultStatus).unlocked).toBe(false);
     expect(state.session).toBeUndefined();
     await expect(expired.handle({ type: 'list' })).rejects.toThrow('解锁');
+  });
+  it('does not restore an unlocked session while a cold worker is clearing it for a lock', async () => {
+    await unlocked();
+    const recreated = new VaultController();
+    let finishClear!: () => void;
+    state.pauseSessionClear = new Promise<void>(resolve => { finishClear = resolve; });
+    const lock = recreated.lock();
+    const status = recreated.handle({ type: 'status' });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    finishClear();
+    await lock;
+    expect(await status).toMatchObject({ configured: true, unlocked: false });
+    await expect(recreated.handle({ type: 'list' })).rejects.toThrow('解锁');
+  });
+  it('leaves the vault locked when a new worker finds Windows already locked', async () => {
+    await unlocked();
+    state.idleState = 'locked';
+    const recreated = new VaultController();
+    expect(await recreated.handle({ type: 'status' })).toMatchObject({ configured: true, unlocked: false });
+    expect(state.session).toBeUndefined();
+  });
+  it('opens a cold vault with status and protected item summaries in the same reply', async () => {
+    const controller = await unlocked();
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Protected fixture', true)) });
+    const recreated = new VaultController();
+    const opened = await recreated.handle({ type: 'open' });
+    expect(opened).toMatchObject({
+      status: { configured: true, unlocked: true },
+      items: [{ title: 'Protected fixture', requireReprompt: true }],
+    });
+    expect(JSON.stringify(opened)).not.toContain('Unique-Secret-Pass#719');
+    await recreated.lock();
+    expect(await new VaultController().handle({ type: 'open' })).toEqual({
+      status: expect.objectContaining({ configured: true, unlocked: false }),
+    });
+  });
+  it('clears a corrupted saved session before opening a cold vault', async () => {
+    await unlocked();
+    state.session!.wrap[0]! ^= 1;
+    expect(await new VaultController().handle({ type: 'open' })).toEqual({
+      status: expect.objectContaining({ configured: true, unlocked: false }),
+    });
+    expect(state.session).toBeUndefined();
   });
   it('destroys the PIN wrapper on the fifth failed attempt and refuses a correct sixth PIN', async () => {
     const controller = await unlocked();

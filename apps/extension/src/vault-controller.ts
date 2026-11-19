@@ -1,7 +1,7 @@
 import { loadVaultCore, randomBytes } from './vault-core';
 import { derive, offscreen } from './bridge';
 import * as store from './vault-storage';
-import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type EntePreview, type ItemSummary, type OtpCode, type Proof, type VaultItem, type VaultMessage, type VaultStatus } from './vault-messages';
+import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BrowserCsvPreview, type EntePreview, type ItemSummary, type OtpCode, type Proof, type VaultItem, type VaultMessage, type VaultOpening, type VaultStatus } from './vault-messages';
 import { planEnteImport, type EnteBatch } from './ente-auth';
 import { uriMatches, validateGroups, webUrl, type AutofillSettings } from './autofill-policy';
 import type { FillCandidate, FillKind, FillPayload } from './autofill-messages';
@@ -10,6 +10,7 @@ import { MAX_MIGRATION_BYTES, type MigrationExport } from './vault-messages';
 
 export const LOCK_ALARM = 'vault-lock';
 export const CLIPBOARD_ALARM = 'vault-clipboard';
+export const IDLE_DETECTION_SECONDS = 60;
 type Core = Awaited<ReturnType<typeof loadVaultCore>>;
 type Engine = InstanceType<Core['WasmVaultEngine']>;
 type Created = { head: number[]; snap: number[]; wrap: number[]; vaultId: string; keyEpoch: number; recoveryCode: string };
@@ -28,6 +29,7 @@ export class VaultController {
   private session?: store.SessionState;
   private settings?: store.LocalSettings;
   private tail: Promise<unknown> = Promise.resolve();
+  private locking?: Promise<void>;
   private generation = 0;
   private lastCaptureMs = -Infinity;
   private autofill?: AutofillSettings;
@@ -37,6 +39,7 @@ export class VaultController {
     const generation = this.generation;
     const run = this.tail.then(async () => {
       const check = () => { if (generation !== this.generation) throw new Error('密码库已锁定，请重新解锁。'); };
+      if (this.locking) await this.locking;
       check();
       await this.prepare();
       check();
@@ -48,35 +51,64 @@ export class VaultController {
     return run;
   }
 
-  async lock(invalidatePending = true): Promise<void> {
+  lock(invalidatePending = true): Promise<void> {
     if (invalidatePending) this.generation++;
     this.engine?.lock_and_zeroize();
     this.session?.key.fill(0);
     this.session?.wrap.fill(0);
     this.session = undefined;
     this.autofill = undefined;
-    await store.clearSessionState();
-    await browser.alarms.clear(LOCK_ALARM);
-    void browser.runtime.sendMessage({ target: 'vault-event', type: 'locked' }).catch(() => undefined);
+    const locking = store.clearSessionState().then(async () => {
+      await browser.alarms.clear(LOCK_ALARM);
+      void browser.runtime.sendMessage({ target: 'vault-event', type: 'locked' }).catch(() => undefined);
+    });
+    // Requests arriving after lock began must not read the session being erased.
+    this.locking = locking;
+    void locking.then(() => {
+      if (this.locking === locking) this.locking = undefined;
+    }, () => undefined);
+    return locking;
   }
 
   private async prepare() {
     const generation = this.generation;
-    this.core ??= await loadVaultCore();
-    this.engine ??= new this.core.WasmVaultEngine();
-    this.settings = await store.loadSettings();
-    this.files = await store.loadVaultFiles();
-    const saved = this.session ?? await store.loadSessionState();
-    if (!saved || generation !== this.generation) return;
-    if (!this.files || saved.lastActivityMs > Date.now() || Date.now() - saved.lastActivityMs >= this.settings.autoLockMinutes * 60000) {
-      saved.key.fill(0);
-      await this.lock(false);
-      return;
-    }
+    if (!this.core) performance.mark('vault:prepare');
+    const memorySession = this.session;
+    const readSession = memorySession ? undefined : store.loadSessionState();
     try {
-      if (!this.engine.is_unlocked()) this.engine.restore_from_session(saved.key, saved.wrap, this.files.head, this.files.snap);
-      this.session = saved;
-    } catch { await this.lock(false); }
+      const [core, settings, files, saved, idle] = await Promise.all([
+        this.core ?? loadVaultCore(),
+        store.loadSettings(),
+        store.loadVaultFiles(),
+        memorySession ?? readSession,
+        readSession ? browser.idle.queryState(IDLE_DETECTION_SECONDS) : undefined,
+      ]);
+      if (generation !== this.generation) return;
+      this.core = core;
+      this.engine ??= new core.WasmVaultEngine();
+      this.settings = settings;
+      this.files = files;
+      if (!saved) return;
+      const now = Date.now();
+      if (!files || idle === 'locked' || saved.lastActivityMs > now || now - saved.lastActivityMs >= settings.autoLockMinutes * 60000) {
+        await this.lock(false);
+        return;
+      }
+      try {
+        if (memorySession) return;
+        this.engine.restore_from_session(saved.key, saved.wrap, files.head, files.snap);
+        this.session = saved;
+        performance.mark('vault:session-restored');
+      } catch { await this.lock(false); }
+    } finally {
+      // A lock or failed parallel read can abandon a copy read from session storage.
+      void readSession?.then(saved => {
+        if (saved && saved !== this.session) {
+          saved.key.fill(0);
+          saved.wrap.fill(0);
+        }
+      }, () => undefined);
+    }
   }
 
   private status(): VaultStatus {
@@ -101,7 +133,7 @@ export class VaultController {
     if (!this.session) throw new Error('请先解锁密码库。');
     this.session.lastActivityMs = Date.now();
     await store.saveSessionState(this.session);
-    await browser.alarms.create(LOCK_ALARM, { when: this.session.lastActivityMs + this.settings!.autoLockMinutes * 60000 });
+    if (this.session) await browser.alarms.create(LOCK_ALARM, { when: this.session.lastActivityMs + this.settings!.autoLockMinutes * 60000 });
   }
 
   private async verify(proof: Proof | undefined, check: () => void) {
@@ -179,6 +211,15 @@ export class VaultController {
     const engine = this.engine!;
     const settings = this.settings!;
     if (message.type === 'status') return this.status();
+    if (message.type === 'open') {
+      const opening: VaultOpening = { status: this.status() };
+      if (opening.status.unlocked) {
+        await this.touch();
+        check();
+        opening.items = JSON.parse(engine.list_summaries_json()) as ItemSummary[];
+      }
+      return opening;
+    }
     if (message.type === 'autofill-settings') {
       if (!engine.is_unlocked() || !this.session) return { sites: {}, equivalentDomains: [] };
       return this.readAutofillSettings(check);

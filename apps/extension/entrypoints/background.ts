@@ -1,4 +1,4 @@
-import { VaultController, LOCK_ALARM, CLIPBOARD_ALARM } from '../src/vault-controller';
+import { VaultController, LOCK_ALARM, CLIPBOARD_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
 import { isVaultPage } from '../src/sender-policy';
 import { offscreen } from '../src/bridge';
 import type { VaultMessage } from '../src/vault-messages';
@@ -6,13 +6,14 @@ import { AutofillController } from '../src/autofill-controller';
 import type { AutofillMessage } from '../src/autofill-messages';
 
 export default defineBackground(() => {
+  performance.mark('vault:background-entry');
   const vault = new VaultController();
   const autofill = new AutofillController(vault);
   const ready = Promise.all([
     browser.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
     browser.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
   ]);
-  browser.idle.setDetectionInterval(60);
+  browser.idle.setDetectionInterval(IDLE_DETECTION_SECONDS);
   browser.runtime.onMessage.addListener((message, sender, respond) => {
     if (message?.target === 'vault-autofill') {
       void ready.then(() => autofill.handle(message as AutofillMessage, sender)).then(
@@ -48,7 +49,10 @@ export default defineBackground(() => {
       if (active?.id != null) await browser.tabs.sendMessage(active.id, { target: 'vault-fill', type: 'open' }).catch(() => undefined);
     }
   });
-  browser.contextMenus.removeAll().then(() => browser.contextMenus.create({ id: 'vault-fill', title: '使用 Vault 填充', contexts: ['editable'] })).catch(() => undefined);
+  function registerMenu() {
+    void browser.contextMenus.removeAll().then(() => browser.contextMenus.create({ id: 'vault-fill', title: '使用 Vault 填充', contexts: ['editable'] })).catch(() => undefined);
+  }
+  browser.runtime.onInstalled.addListener(registerMenu);
   browser.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === 'vault-fill' && tab?.id != null) void browser.tabs.sendMessage(tab.id,
       { target: 'vault-fill', type: 'open', reason: 'context-menu' }, { frameId: info.frameId ?? 0 }).catch(() => undefined);
@@ -71,7 +75,5 @@ export default defineBackground(() => {
       await browser.storage.session.remove('clipboard');
     } catch { await browser.alarms.create(CLIPBOARD_ALARM, { when: Date.now() + 30000 }); }
   }
-  browser.runtime.onStartup.addListener(() => { void vault.lock(); });
-  // Alarms can be lost across browser restarts; the timestamp check is authoritative.
-  void ready.then(() => vault.handle({ type: 'status' })).catch(() => undefined);
+  browser.runtime.onStartup.addListener(() => { registerMenu(); void vault.lock(); });
 });

@@ -1,10 +1,10 @@
-import { loadVaultCore } from '../src/vault-core';
+import initWasm, * as core from '../../../crates/vault-core/pkg/vault_core.js';
 import { capacityErrorText } from '../src/vault-messages';
 
 export default defineUnlistedScript(() => {
   self.onmessage = async ({ data }: MessageEvent<{ operation: string; args: unknown[] }>) => {
     try {
-      const core = await loadVaultCore();
+      await initWasm();
       const fn = core[data.operation as keyof typeof core];
       if (typeof fn !== 'function' || !data.operation.startsWith('wasm_')) throw new Error('无效的密钥操作');
       const result = (fn as (...args: unknown[]) => unknown)(...data.args);

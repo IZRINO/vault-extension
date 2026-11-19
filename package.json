@@ -9,6 +9,7 @@
     "test:rust": "cargo test --workspace",
     "test:extension": "vitest run",
     "test:smoke": "node scripts/smoke-extension.cjs",
+    "test:wakeup": "node scripts/test-wakeup.cjs",
     "test:data-safety": "node scripts/test-data-safety.cjs",
     "test:phase-2": "node scripts/test-phase-2.cjs",
     "test:autofill": "node scripts/test-autofill.cjs",

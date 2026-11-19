@@ -45,7 +45,7 @@ export type VaultMessage =
   | { type: 'set-equivalent-domains'; groups: string[][] }
   | { type: 'autofill-settings' }
   | { type: 'set-autofill-site'; origin: string; flags: import('./autofill-settings').SiteFlags }
-  | { type: 'status' | 'lock' | 'list' | 'audit' | 'remove-pin' | 'remove-prf' }
+  | { type: 'status' | 'open' | 'lock' | 'list' | 'audit' | 'remove-pin' | 'remove-prf' }
   | { type: 'create'; masterPassword: string; calibrate?: boolean }
   | { type: 'unlock'; password: string }
   | { type: 'unlock-pin'; pin: string }
@@ -78,6 +78,10 @@ export interface VaultStatus {
   configured: boolean; unlocked: boolean; pinEnabled: boolean;
   prf?: { credentialId: number[]; salt: number[] };
   vaultId?: string; keyEpoch?: number; autoLockMinutes: number; changesSinceBackup: number;
+}
+export interface VaultOpening {
+  status: VaultStatus;
+  items?: ItemSummary[];
 }
 export interface ItemSummary {
   id: string; title: string; kind: string; subtitle: string;
