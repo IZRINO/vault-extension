@@ -11,7 +11,7 @@
 
 ---
 
-> **项目状态（2026-11-19）**：本地加密库、网页填充、OTP 与迁移在原实现上收尾，已加入 WebDAV 增量同步、软件 Passkey 和四期计划内迁移格式。可以构建 MV3 安装候选包；千条凭证的原生 Popup 冷开尚未达到准出指标，实体设备、真实网盘和第三方应用验收未签收。当前证据与格式限制见 [候选包验证记录](./docs/release-candidate-status.md)，历史基准见 [一期](./docs/phase-1-status.md) 和 [二期](./docs/phase-2-status.md)。下文全景包含尚未排期的架构目标。
+> **项目状态（2026-11-20）**：MV3 候选包已从同一解压目录通过 Edge 和 Helium 的功能回归，覆盖本地加密库、网页填充、OTP、WebDAV 增量同步、软件 Passkey 和计划内迁移。千条凭证的原生 Popup 冷开与 WASM 会话恢复均未达到准出指标；实体设备、真实网站/网盘和第三方应用仍未验收。实测与格式限制见 [候选包验证记录](./docs/release-candidate-status.md)，历史基准见 [一期](./docs/phase-1-status.md) 和 [二期](./docs/phase-2-status.md)。下文全景也包含尚未排期的架构目标。
 
 ## 设计目标与安全红线
 
@@ -20,7 +20,7 @@
 1. **真正的零知识架构（Zero-Knowledge）**：无官方后端；主密码（Master Password）永不离开本机内存，网站域名（URL / RP ID）、2FA 密钥、备注及条目精确字节长度等全部元数据均经认证加密并按 `256 Bytes` 分桶填充隐藏。
 2. **Rust / WASM 内存隔离与即时擦除**：密钥派生、AEAD 加解密、Passkey 私钥签名、TOTP/HOTP/Steam 口令计算及第三方加密备份解析全部运行于 **Rust 编译的 WebAssembly 线性内存**中，核心密钥材料与 Rust 敏感缓冲区通过 `Zeroize` 擦除。输入和显示密码时仍会经过 JavaScript 字符串，不能承诺浏览器 GC 内存的确定性擦除。
 3. **全链路加密传输与最小权限隔离**：外部 WebDAV 同步强制要求 `HTTPS (TLS 1.2/1.3)` 叠加应用层 `XChaCha20-Poly1305` 端到端加密与 BLAKE3 状态树防回滚校验；内部 `Content Script ↔ Background Service Worker` 严格校验 `sender.origin` / `tab.url`，仅向页面上下文传递脱敏候选摘要与句柄，绝不下发整库或私钥。
-4. **纯 WebDAV 无锁极简增量同步**：无需自建同步后端，采用 **LSM-Tree 思想的紧凑快照（Snapshot）+ 预写增量日志（WAL Delta）+ HLC 三路合并（3-Way Merge）**；内置**坚果云**与 **Koofr** 官方地址预设，1,000 条全量凭证快照仅 `~200 KB`，单次修改增量传输仅 `~320–512 B`。
+4. **纯 WebDAV 无锁极简增量同步**：无需自建同步后端，采用 **LSM-Tree 思想的紧凑快照（Snapshot）+ 预写增量日志（WAL Delta）+ HLC 三路合并（3-Way Merge）**；内置**坚果云**与 **Koofr** 地址预设，实测数据见[候选包验证记录](./docs/release-candidate-status.md#本机记录)。
 5. **开放生态与零锁定迁移（Zero Lock-in）**：一等公民双向兼容 **Ente Auth 纯文本导出格式**（完整保留置顶、标签、备注等扩展元数据）与 **FIDO CXF 1.0** 行业凭证交换标准，支持主流密码管理器及验证器本地内存直解迁移。
 
 ---
@@ -134,7 +134,7 @@
 
 摒弃“改一个字重传整个大文件”或“几千条密码拆成几千个碎文件触发网盘限流”的做法，通过四步二进制紧凑编码（**原始字节类型化 → `MessagePack` 整数键序列化 → `Zstandard` 压缩 → `256B` 对齐填充**，且不同步 Favicon 图标）将体积压缩 **85%+**：
 
-- **存储开销**：单条完整凭证（密码 + TOTP + Passkey + 备注）仅 `~180–240 B`；千级凭证全量快照 `snap_*.bin` 仅 `~200 KB`；单次增量日志 `wal/*.bin` 仅 `~320–512 B`。
+- **存储开销**：候选版的 1,000 条合成凭证加密快照为 `123,752 B`，单条变更 WAL 为 `598 B`。体积随凭证内容和历史变化；完整夹具与口径见[候选包验证记录](./docs/release-candidate-status.md#本机记录)。
 - **网盘开箱预设与专项保护**：
   - **坚果云（Nutstore）**：自动拼接独立子目录并按序执行 `MKCOL` 建库，单次轮询仅 1 次 `PROPFIND`（`< 2 KB`），远低于免费版限流阈值。
   - **Koofr**：固化区分大小写的 `/dav/Koofr/` 标准路径；内置 **`401/403/429` 鉴权防锁号熔断器**，避免后台重试触发 Koofr 1 小时封禁；全程采用不可变追加写，不发 `LOCK` 请求，彻底规避 `423 Locked` 锁残留。
@@ -162,7 +162,7 @@
 | **二步验证（一等公民）** | **Ente Auth** | **纯文本 `.txt`**、加密 `.json` | **双向无损互通**：TOTP + HOTP + Steam + `codeDisplay`（置顶/标签/备注/回收站）+ 智能合并入已有密码项 |
 | **二步验证** | **Google Authenticator / 2FAS / Aegis / Raivo / andOTP / Stratum** | `otpauth-migration://` 二维码、`.2fas`、加密 `.json`、`.txt` | 批量 TOTP / HOTP / Steam（支持本地直解 2FAS 与 Aegis 加密备份） |
 
-**规划的导出格式**：原生加密备份（`.vaultpack`）、FIDO CXF 1.0（`.cxf`）、Bitwarden JSON、Ente Auth 文本及通用 CSV。所有整库导出均须重新验证当前库主密码，PIN 和独立文件密码不可替代；明文另需风险确认。原生备份尚需按 [#37](https://github.com/IZRINO/vault-extension/issues/37) 对齐此规则；日常看码、填码不交付种子的修正见 [#38](https://github.com/IZRINO/vault-extension/issues/38)。
+**当前导出格式**：原生加密备份（`.vaultpack`）、FIDO CXF 1.0 JSON、Bitwarden JSON、Ente Auth 文本及通用 CSV。所有整库导出（含 `.vaultpack`）均须重新验证当前库主密码，PIN 和独立文件密码不可替代；明文另需风险确认（[#37](https://github.com/IZRINO/vault-extension/issues/37)）。日常看码和网页填码只交付动态码，显式编辑及已授权导出才会读取种子（[#38](https://github.com/IZRINO/vault-extension/issues/38)）。
 
 ---
 
