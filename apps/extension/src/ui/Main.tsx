@@ -63,12 +63,26 @@ function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
   const dirty = useRef(false);
   const content = useRef<HTMLElement>(null);
   const initialListReady = useRef(false);
+  const initialListPresented = useRef(false);
 
   useLayoutEffect(() => {
-    if (items && !initialListReady.current && tab === 'vault' && screen.name === 'list') {
+    if (!items || initialListPresented.current || tab !== 'vault' || screen.name !== 'list') return;
+    if (!initialListReady.current) {
       initialListReady.current = true;
       performance.mark('vault:list-ready');
     }
+    // The second animation frame is after the first opportunity to paint the usable list.
+    let afterPaint: number | undefined;
+    const beforePaint = requestAnimationFrame(() => {
+      afterPaint = requestAnimationFrame(() => {
+        initialListPresented.current = true;
+        performance.mark('vault:list-presented');
+      });
+    });
+    return () => {
+      cancelAnimationFrame(beforePaint);
+      if (afterPaint != null) cancelAnimationFrame(afterPaint);
+    };
   }, [items, tab, screen.name]);
   const fail = useCallback((e: unknown) => {
     if (mounted.current && !(e instanceof Cancelled)) setError(errorText(e));

@@ -38,9 +38,11 @@ export default function App({ readOpening }: { readOpening?: () => Promise<Vault
     browser.runtime.onMessage.addListener(onMessage);
     const version = lockVersion.current;
     const current = () => mounted && version === lockVersion.current;
+    if (readOpening) performance.mark('vault:popup-opening-listener');
     void (async () => {
       const opened = await readOpening?.() ?? await request<VaultOpening>({ type: 'open' });
       if (current()) {
+        if (readOpening) performance.mark('vault:popup-opening-apply');
         setInitialItems(opened.items);
         setStatus(opened.status);
       }

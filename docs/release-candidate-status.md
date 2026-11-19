@@ -48,6 +48,8 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 
 [一期同机最小 MV3 对照](phase-1-status.md#t01-冷唤醒补测2026-11-19)的最快工具栏打开也约 430 ms，表明这台机器的冷 Worker 调度已占大头。没有把等待期间的骨架屏、预热 Worker 或修改起点计作通过。候选包未发布；未达性能门禁及需真实环境的验收项不关闭、不代签。
 
+[后续冷开补测](cold-wake-diagnostics.md)独立记录了新构建、原生首屏计时和无后台对照；两项门槛仍未达。
+
 同步快照新增的来源记录在认证密文内，当前版可读没有来源的旧快照。旧客户端读不懂新字段时会停止同步写回；先升级各设备再试用新版同步。
 
 ### 外部夹具

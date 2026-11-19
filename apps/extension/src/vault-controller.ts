@@ -246,6 +246,7 @@ export class VaultController {
       }
       try {
         if (memorySession) return;
+        performance.mark('vault:restore-compute-start');
         this.engine.restore_from_session(saved.key, saved.wrap, files.head, files.snap);
         this.session = saved;
         performance.mark('vault:session-restored');
@@ -780,10 +781,14 @@ export class VaultController {
       const opening: VaultOpening = { status: this.status() };
       if (!opening.status.unlocked && this.files && (await store.loadRemoteAnchor(this.files.vaultId))?.observedHead) opening.status.remoteKeyUpdate = true;
       if (opening.status.unlocked) {
-        await this.touch();
+        const touch = this.touch();
+        try {
+          opening.items = JSON.parse(engine.list_summaries_json()) as ItemSummary[];
+        } finally { await touch; }
         check();
         this.scheduleDav();
-        opening.items = JSON.parse(engine.list_summaries_json()) as ItemSummary[];
+        performance.clearMarks('vault:open-response-ready');
+        performance.mark('vault:open-response-ready');
       }
       return opening;
     }

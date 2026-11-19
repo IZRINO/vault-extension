@@ -1,4 +1,5 @@
 import { VaultController, DAV_ALARM, LOCK_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
+import { loadVaultCore } from '../src/vault-core';
 import { isVaultPage } from '../src/sender-policy';
 import { CLIPBOARD_ALARM, clearExpiredClipboard } from '../src/clipboard';
 import type { VaultMessage } from '../src/vault-messages';
@@ -56,6 +57,9 @@ export default defineBackground(() => {
       return;
     }
     if (message.type === 'lock') { autofill.clear(); passkeys.stop(); }
+    // The trusted open request can start compiling the static binary while storage access
+    // levels are being applied. Vault/session reads still wait for that protection.
+    if (message.type === 'open') void loadVaultCore().catch(() => undefined);
     void ready.then(() => vault.handle(message as VaultMessage)).then(
       value => {
         if (['unlock', 'unlock-pin', 'unlock-prf', 'recover', 'create', 'webdav-create', 'webdav-join', 'webdav-update-key', 'set-equivalent-domains'].includes(message.type)) {

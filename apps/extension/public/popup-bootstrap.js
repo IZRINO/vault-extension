@@ -9,7 +9,10 @@
   runtime.onMessage.addListener(recordLock);
   // Start only when the popup document opens, in parallel with loading React.
   performance.mark('vault:popup-request');
-  reply = runtime.sendMessage({ target: 'vault', type: 'open' }).catch(() => undefined);
+  reply = runtime.sendMessage({ target: 'vault', type: 'open' }).then(result => {
+    performance.mark('vault:popup-reply');
+    return result;
+  }).catch(() => undefined);
   window.readVaultOpening = async () => {
     const pending = reply;
     const result = await pending;

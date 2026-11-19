@@ -346,6 +346,28 @@ describe('real WASM + background session integration', () => {
       status: expect.objectContaining({ configured: true, unlocked: false }),
     });
   });
+  it('does not return cold opening summaries if the vault locks while renewing the session alarm', async () => {
+    const controller = await unlocked();
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Protected fixture', true)) });
+    let beginAlarm!: () => void;
+    let finishAlarm!: () => void;
+    const alarmEntered = new Promise<void>(resolve => { beginAlarm = resolve; });
+    const alarmFinished = new Promise<void>(resolve => { finishAlarm = resolve; });
+    vi.spyOn(browser.alarms, 'create').mockImplementationOnce(() => {
+      beginAlarm();
+      return alarmFinished;
+    });
+    const recreated = new VaultController();
+    const opening = recreated.handle({ type: 'open' });
+    const rejected = expect(opening).rejects.toThrow('密码库已锁定');
+    try {
+      await alarmEntered;
+      await recreated.lock();
+    } finally { finishAlarm(); }
+    await rejected;
+    expect(state.session).toBeUndefined();
+    expect(await recreated.handle({ type: 'open' })).toEqual({ status: expect.objectContaining({ unlocked: false }) });
+  });
   it('clears a corrupted saved session before opening a cold vault', async () => {
     await unlocked();
     state.session!.wrap[0]! ^= 1;

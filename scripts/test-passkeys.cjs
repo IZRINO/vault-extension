@@ -91,22 +91,37 @@ async function fixture() {
       document.querySelector('#start').onclick = start;
       </script></body></html>`;
   };
-  const server = createServer((req, res) => {
+  let served = 0;
+  const reply = (req, res) => {
     if (req.url === '/favicon.ico') { res.writeHead(204).end(); return; }
+    ++served;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(html());
-  });
-  await new Promise((resolve, reject) => {
+  };
+  const listen = (server, host, port) => new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
+    server.listen(port, host, resolve);
   });
-  const origin = `http://localhost:${server.address().port}`;
+  const ipv4 = createServer(reply), ipv6 = createServer(reply);
+  const done = () => Promise.all([ipv4, ipv6].filter(server => server.listening)
+    .map(server => new Promise(resolve => server.close(resolve))));
+  await listen(ipv4, '127.0.0.1', 0);
+  const { port } = ipv4.address();
+  // Browsers can resolve the same localhost RP to either loopback family.
+  try { await listen(ipv6, '::1', port); }
+  catch (error) {
+    if (!['EADDRNOTAVAIL', 'EAFNOSUPPORT'].includes(error.code)) { await done(); throw error; }
+  }
+  const origin = `http://localhost:${port}`;
   return { async page(local) {
     const page = await local.context.newPage();
-    await page.route(origin + '/', route => route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html() }));
     await page.bringToFront();
-    await page.goto(origin, { waitUntil: 'domcontentloaded' });
+    const before = served;
+    const response = await page.goto(origin, { waitUntil: 'domcontentloaded' }).catch(error => {
+      throw new Error(`Local WebAuthn verifier did not load (HTTP requests served: ${served - before})`, { cause: error });
+    });
+    assert.equal(response?.status(), 200, 'The loopback verifier must serve the ceremony page');
     return page;
-  }, done: () => new Promise(resolve => server.close(resolve)) };
+  }, done };
 }
 
 async function open(name, localMaster = master) {

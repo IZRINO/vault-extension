@@ -20,4 +20,34 @@ async function waitForBuiltInFilters(context, name) {
     console.log('Helium built-in filters ready');
   } finally { await dashboard.close(); }
 }
-module.exports = { waitForBuiltInFilters };
+// Toolbar Popups have CDP targets but are not exposed as Playwright Pages.
+async function evaluateNativePopup(cdp, targetId, expression) {
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: false });
+  let listener, timer;
+  try {
+    const result = new Promise((resolve, reject) => {
+      listener = event => {
+        if (event.sessionId !== sessionId) return;
+        const message = JSON.parse(event.message);
+        if (message.id !== 1) return;
+        const error = message.error?.message ?? message.result?.exceptionDetails?.exception?.description ?? message.result?.exceptionDetails?.text;
+        if (error) reject(new Error(`Could not read the native Popup: ${error}`));
+        else resolve(message.result.result.value);
+      };
+      cdp.on('Target.receivedMessageFromTarget', listener);
+      timer = setTimeout(() => reject(new Error('Native Popup did not respond')), 4000);
+    });
+    const [, value] = await Promise.all([
+      cdp.send('Target.sendMessageToTarget', {
+        sessionId, message: JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }),
+      }),
+      result,
+    ]);
+    return value;
+  } finally {
+    clearTimeout(timer);
+    if (listener) cdp.off('Target.receivedMessageFromTarget', listener);
+    await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => undefined);
+  }
+}
+module.exports = { waitForBuiltInFilters, evaluateNativePopup };

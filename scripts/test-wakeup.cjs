@@ -5,7 +5,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
-const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
+const { evaluateNativePopup, waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -15,6 +15,8 @@ const executables = {
 };
 const sampleCount = Number(process.env.VAULT_WAKE_SAMPLES ?? 10);
 const fixtureCount = Number(process.env.VAULT_WAKE_ITEMS ?? 1);
+const reportLabel = process.env.VAULT_WAKE_REPORT_LABEL ?? '';
+const traceFirstRender = process.env.VAULT_WAKE_TRACE === '1';
 const title = 'Vault Wake Fixture';
 const tabUrl = 'about:blank#vault-wakeup';
 const fixture = {
@@ -58,47 +60,68 @@ async function addFixture(page) {
 }
 
 async function readPopup(cdp, targetId) {
-  // The native extension Popup has a CDP target that Playwright does not expose as a Page.
-  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: false });
-  let listener, timer;
-  try {
-    const expression = `(() => {
+  const popup = await evaluateNativePopup(cdp, targetId, `(() => {
       const ready = performance.getEntriesByName('vault:list-ready', 'mark')[0];
+      const presented = performance.getEntriesByName('vault:list-presented', 'mark')[0];
       const row = [...document.querySelectorAll('.row-main')].find(button => button.textContent.includes(${JSON.stringify(title)}));
-      const rowUsable = !!row && !row.disabled && row.getBoundingClientRect().height > 0
-        && getComputedStyle(row).visibility === 'visible';
+      const rect = row?.getBoundingClientRect();
+      const hit = rect && document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      const rowUsable = !!row && !row.disabled && row.contains(hit) && getComputedStyle(row).visibility === 'visible';
+      const navigation = performance.getEntriesByType('navigation')[0];
       return {
         readyAt: ready && performance.timeOrigin + ready.startTime,
+        presentedAt: presented && performance.timeOrigin + presented.startTime,
         navigationAt: performance.timeOrigin,
         requestMs: performance.getEntriesByName('vault:popup-request', 'mark')[0]?.startTime,
+        replyMs: performance.getEntriesByName('vault:popup-reply', 'mark')[0]?.startTime,
+        popupModuleMs: performance.getEntriesByName('vault:popup-module-entry', 'mark')[0]?.startTime,
+        popupListenMs: performance.getEntriesByName('vault:popup-opening-listener', 'mark')[0]?.startTime,
+        popupApplyMs: performance.getEntriesByName('vault:popup-opening-apply', 'mark')[0]?.startTime,
+        documentResponseFromNavigationMs: navigation?.responseEnd,
+        domInteractiveMs: navigation?.domInteractive,
+        domContentLoadedMs: navigation?.domContentLoadedEventEnd,
         rowUsable, heading: document.querySelector('h1')?.textContent,
       };
-    })()`;
-    const result = new Promise((resolve, reject) => {
-      listener = event => {
-        if (event.sessionId !== sessionId) return;
-        const message = JSON.parse(event.message);
-        if (message.id !== 1) return;
-        if (message.error || message.result.exceptionDetails) reject(new Error('Could not read the native Popup'));
-        else resolve(message.result.result.value);
-      };
-      cdp.on('Target.receivedMessageFromTarget', listener);
-      timer = setTimeout(() => reject(new Error('Native Popup did not respond')), 4000);
-    });
-    const [, popup] = await Promise.all([
-      cdp.send('Target.sendMessageToTarget', {
-        sessionId, message: JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }),
-      }),
-      result,
-    ]);
-    assert(popup?.rowUsable, `The native Popup must have a rendered, enabled fixture row: ${JSON.stringify(popup)}`);
-    assert(Number.isFinite(popup.readyAt), 'Missing first-list render mark');
-    return popup;
+    })()`);
+  assert(popup?.rowUsable, `The native Popup must have a rendered, enabled fixture row: ${JSON.stringify(popup)}`);
+  assert(Number.isFinite(popup.readyAt), 'Missing first-list render mark');
+  return popup;
+}
+
+async function renderTrace(cdp) {
+  let listener, timeout;
+  const completed = new Promise((resolve, reject) => {
+    listener = resolve;
+    cdp.once('Tracing.tracingComplete', listener);
+    timeout = setTimeout(() => reject(new Error('Chromium did not finish the diagnostic trace')), 6000);
+  });
+  let stream;
+  try {
+    [, { stream }] = await Promise.all([cdp.send('Tracing.end'), completed]);
   } finally {
-    clearTimeout(timer);
-    if (listener) cdp.off('Target.receivedMessageFromTarget', listener);
-    await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => undefined);
+    clearTimeout(timeout);
+    cdp.off('Tracing.tracingComplete', listener);
   }
+  assert(stream, 'Chromium did not return a trace stream');
+  const fragments = [];
+  try {
+    for (;;) {
+      const part = await cdp.send('IO.read', { handle: stream });
+      fragments.push(part.base64Encoded ? Buffer.from(part.data, 'base64').toString('utf8') : part.data);
+      if (part.eof) break;
+    }
+  } finally { await cdp.send('IO.close', { handle: stream }); }
+  const events = JSON.parse(fragments.join('')).traceEvents;
+  const start = events.find(event => event.name === 'vault:popup-opening-apply');
+  const end = events.find(event => event.name === 'vault:list-ready' && event.pid === start?.pid && event.tid === start?.tid);
+  assert(start && end && end.ts >= start.ts, 'Missing paired Popup render marks in trace');
+  return {
+    renderMs: ms((end.ts - start.ts) / 1000),
+    longest: events.filter(event => event.pid === start.pid && event.tid === start.tid && event.ph === 'X' &&
+      event.ts < end.ts && event.ts + event.dur > start.ts && event.dur >= 1000)
+      .sort((a, b) => b.dur - a.dur).slice(0, 12)
+      .map(event => ({ name: event.name, startMs: ms((event.ts - start.ts) / 1000), ms: ms(event.dur / 1000) })),
+  };
 }
 
 async function run(name, artifact) {
@@ -136,9 +159,14 @@ async function run(name, artifact) {
     await expect.poll(() => version?.runningStatus).toBe('running');
 
     const samples = [];
+    let trace;
     for (let index = 0; index < sampleCount; index++) {
       await cdp.send('ServiceWorker.stopWorker', { versionId: version.versionId });
       await expect.poll(() => version?.runningStatus).toBe('stopped');
+      if (traceFirstRender && index === 0) await browserCdp.send('Tracing.start', {
+        categories: 'devtools.timeline,blink.user_timing,loading,toplevel,disabled-by-default-devtools.timeline',
+        transferMode: 'ReturnAsStream',
+      });
       const startedAt = now();
       await browserCdp.send('Extensions.triggerAction', { id, targetId: actionTab.targetId });
       // Read marks after the deadline; hidden Popup timers may be throttled by Chromium.
@@ -149,13 +177,20 @@ async function run(name, artifact) {
         popupTarget = targetInfos.find(target => target.url === `chrome-extension://${id}/popup.html`);
         return !!popupTarget;
       }, { timeout: 2500 }).toBe(true);
-      const { readyAt, navigationAt, requestMs } = await readPopup(browserCdp, popupTarget.targetId);
+      const { readyAt, presentedAt, navigationAt, requestMs, replyMs, popupModuleMs, documentResponseFromNavigationMs,
+        popupListenMs, popupApplyMs, domInteractiveMs, domContentLoadedMs } =
+        await readPopup(browserCdp, popupTarget.targetId);
+      if (traceFirstRender && index === 0) {
+        trace = await renderTrace(browserCdp);
+        console.log(JSON.stringify({ browser: name, diagnosticOnly: true, trace }));
+      }
       const started = context.serviceWorkers().find(entry => entry.url() === worker.url());
       assert(started, 'Popup should wake the Vault service worker');
       const restored = await started.evaluate(() => {
         const mark = name => performance.getEntriesByName(name, 'mark')[0]?.startTime;
         return {
           workerAt: performance.timeOrigin, restoreMs: mark('vault:session-restored'),
+          restoreComputeStartMs: mark('vault:restore-compute-start'), openResponseMs: mark('vault:open-response-ready'),
           backgroundEntryMs: mark('vault:background-entry'), prepareMs: mark('vault:prepare'), wasmLoadedMs: mark('vault:wasm-loaded'),
         };
       });
@@ -163,20 +198,52 @@ async function run(name, artifact) {
       assert(restored.workerAt >= startedAt && readyAt >= restored.workerAt + restored.restoreMs,
         'Expected cold worker start and authenticated restore after the toolbar action and before the list');
       samples.push({ restoreMs: restored.restoreMs, popupMs: readyAt - startedAt,
+        presentationMs: presentedAt - startedAt,
         workerStartMs: restored.workerAt - startedAt, popupNavigationMs: navigationAt - startedAt, popupRequestMs: requestMs,
+        documentResponseFromNavigationMs, domInteractiveMs, domContentLoadedMs, popupReplyMs: replyMs, popupModuleMs, popupListenMs, popupApplyMs,
+        restoreComputeMs: restored.restoreMs - restored.restoreComputeStartMs, workerOpenResponseMs: restored.openResponseMs,
         backgroundEntryMs: restored.backgroundEntryMs, prepareMs: restored.prepareMs, wasmLoadedMs: restored.wasmLoadedMs });
       await browserCdp.send('Target.closeTarget', { targetId: popupTarget.targetId }).catch(error => {
         // Chromium already dismisses the toolbar Popup when it loses focus.
         if (!error.message.includes('No target with given id found')) throw error;
       });
+      if (traceFirstRender) {
+        await tab.bringToFront();
+        await delay(250);
+      }
     }
+    if (fixtureCount > 32) {
+      const list = await context.newPage();
+      try {
+        await list.goto(`chrome-extension://${id}/popup.html`);
+        const search = list.getByRole('searchbox', { name: '搜索凭证' });
+        await expect(search).toBeFocused();
+        const rows = list.locator('.row-main');
+        await expect(rows).toHaveCount(32);
+        await list.getByRole('button', { name: /^显示更多/ }).click();
+        await expect(rows).toHaveCount(Math.min(fixtureCount, 64));
+        await rows.last().focus();
+        await expect(rows.last()).toBeInViewport();
+        await search.fill(`fixture${fixtureCount - 2}`);
+        await expect(rows).toHaveCount(1);
+        await expect(rows.first()).toContainText(`Wake setup ${fixtureCount - 2}`);
+        await rows.first().focus();
+        await rows.first().press('Enter');
+        await expect(list.getByRole('heading', { name: `Wake setup ${fixtureCount - 2}`, exact: true })).toBeVisible();
+      } finally { await list.close(); }
+    }
+    const restorePassed = samples.every(sample => sample.restoreMs < 5);
+    const popupPassed = samples.every(sample => sample.popupMs < 50);
     const result = {
       browser: name, version: context.browser().version(), extension: path.relative(root, extension), artifact, fixtureCount,
+      diagnosticTrace: trace,
+      listInteractions: fixtureCount > 32 ? { pages: true, offscreenFocus: true, fullSearch: true, enterOpens: true } : undefined,
       samples: samples.map(sample => Object.fromEntries(Object.entries(sample)
         .filter(([, value]) => Number.isFinite(value)).map(([key, value]) => [key, ms(value)]))),
       restoreMs: stats(samples.map(sample => sample.restoreMs)), popupMs: stats(samples.map(sample => sample.popupMs)),
-      restorePassed: samples.every(sample => sample.restoreMs < 5), popupPassed: samples.every(sample => sample.popupMs < 50),
-      passed: samples.every(sample => sample.restoreMs < 5 && sample.popupMs < 50),
+      presentationMs: samples.every(sample => Number.isFinite(sample.presentationMs)) ? stats(samples.map(sample => sample.presentationMs)) : null,
+      presentationUpperBoundWithinBudget: samples.every(sample => sample.presentationMs >= sample.popupMs && sample.presentationMs < 50),
+      restorePassed, popupPassed, passed: traceFirstRender ? null : restorePassed && popupPassed,
     };
     console.log(JSON.stringify(result));
     return result;
@@ -201,6 +268,8 @@ async function buildHash() {
 (async () => {
   assert(Number.isInteger(sampleCount) && sampleCount >= 2, 'At least two cold samples are required');
   assert(Number.isInteger(fixtureCount) && fixtureCount >= 1 && fixtureCount <= 5000, 'Fixture count must be 1–5000');
+  assert(!reportLabel || /^[a-z0-9-]{1,36}$/.test(reportLabel), 'Report label must be 1–36 lowercase ASCII letters, digits or hyphens');
+  assert(!traceFirstRender || reportLabel, 'A diagnostic trace requires a separate report label');
   const names = process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium'];
   const artifact = await buildHash();
   const results = [];
@@ -208,7 +277,8 @@ async function buildHash() {
   assert.equal(await buildHash(), artifact, 'The production build changed during measurement');
   const output = path.join(root, 'test-results');
   await fs.mkdir(output, { recursive: true });
-  const filename = fixtureCount === 1 ? 'wakeup.json' : `wakeup-${fixtureCount}.json`;
+  const filename = `wakeup${fixtureCount === 1 ? '' : '-' + fixtureCount}${reportLabel ? '.' + reportLabel : ''}.json`;
   await fs.writeFile(path.join(output, filename), JSON.stringify(results, null, 2) + '\n');
-  assert(results.every(result => result.passed), 'Cold-wake limits: WASM restore < 5 ms and native Popup list < 50 ms on every sample');
+  if (!traceFirstRender) assert(results.every(result => result.passed),
+    'Cold-wake limits: WASM restore < 5 ms and native Popup list < 50 ms on every sample');
 })().catch(error => { console.error(error); process.exitCode = 1; });
