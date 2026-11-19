@@ -2,6 +2,7 @@ const { chromium, expect } = require('@playwright/test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
+const { waitForSetupTab } = require('./browser-fixtures.cjs');
 const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
@@ -32,7 +33,7 @@ async function run(name) {
     try {
       const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 20000 });
       const id = new URL(worker.url()).host;
-      const page = await context.newPage();
+      const page = view === 'setup' ? await waitForSetupTab(context, worker.url()) : await context.newPage();
       page.on('pageerror', error => errors.push(error.message));
       page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
       page.on('requestfailed', request => {
@@ -41,7 +42,7 @@ async function run(name) {
       page.on('response', response => {
         if (response.status() >= 400 && response.url().startsWith('chrome-extension://')) errors.push(response.url() + ': ' + response.status());
       });
-      await page.goto(`chrome-extension://${id}/${view}.html`);
+      if (view !== 'setup') await page.goto(`chrome-extension://${id}/${view}.html`);
       const send = message => page.evaluate(async message => {
         const reply = await chrome.runtime.sendMessage({ target: 'vault', ...message });
         if (!reply.ok) throw new Error(reply.error);
@@ -61,14 +62,38 @@ async function run(name) {
     title, data: { kind: 'login', username: 'sample', password: 'Previous-Test-Password#2026' },
   }) });
   const countChanges = async send => (await send({ type: 'status' })).changesSinceBackup;
+  const beginRestore = async page => {
+    await page.getByRole('button', { name: '从本地备份恢复', exact: true }).click({ timeout: 4000 });
+    await expect(page.getByRole('heading', { name: '先设置新的主密码', exact: true })).toBeVisible();
+    await page.getByLabel('主密码', { exact: true }).fill(restorePassword);
+    await page.getByLabel('再次输入主密码', { exact: true }).fill(restorePassword);
+    await page.getByText('高级选项', { exact: true }).click();
+    await page.getByRole('checkbox', { name: /调整加密强度/ }).uncheck();
+    await page.getByRole('button', { name: '创建本地密码库', exact: true }).click();
+    await expect(page.getByRole('heading', { name: '保存应急恢复包', exact: true })).toBeVisible();
+  };
 
   try {
     await fs.mkdir(output, { recursive: true });
+    await withVault('lock-kit', true, 'setup', async ({ page, send }) => {
+      await beginRestore(page);
+      await expect(page.getByText('你的恢复码', { exact: true })).toBeVisible();
+      await send({ type: 'lock' });
+      assert.equal((await send({ type: 'status' })).unlocked, false);
+      await expect(page.getByText('你的恢复码', { exact: true })).toHaveCount(0);
+      await expect(page.getByRole('button', { name: '下载应急恢复包', exact: true })).toHaveCount(0);
+      await expect(page.getByRole('heading', { name: '解锁密码库', exact: true })).toBeVisible();
+    });
     let exportedItem;
     let beforeBackup;
     // Deny browser downloads in the first run to exercise a real browser-side cancellation.
     await withVault('source', false, 'popup', async ({ page, send }) => {
+      const setupTab = await waitForSetupTab(page.context(), page.url());
+      await expect(setupTab.getByRole('heading', { name: '连接网盘', exact: true })).toBeVisible();
       await send({ type: 'create', masterPassword: sourcePassword, calibrate: false });
+      await setupTab.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await expect(setupTab.getByRole('button', { name: '设置', exact: true })).toBeVisible();
+      await setupTab.close();
       for (const title of ['Keep my login', 'Visible trash', 'Hidden trash']) await add(send, title);
       const items = await send({ type: 'list' });
       const keptId = items.find(item => item.title === 'Keep my login').id;
@@ -127,12 +152,33 @@ async function run(name) {
       assert.equal(await countChanges(send), 1);
     });
 
-    await withVault('new-profile', true, 'sidepanel', async ({ page, send }) => {
+    await withVault('new-profile', true, 'setup', async ({ page, send }) => {
       assert.equal((await send({ type: 'status' })).configured, false);
-      await send({ type: 'create', masterPassword: restorePassword, calibrate: false });
-      await page.reload();
-      await openBackup(page);
-      await page.getByRole('button', { name: '导入备份', exact: true }).click();
+      await beginRestore(page);
+      const proceed = page.getByRole('button', { name: '我已保存，选择备份文件', exact: true });
+      await expect(proceed).toBeDisabled();
+      const recovery = page.waitForEvent('download');
+      await page.getByRole('button', { name: '下载应急恢复包', exact: true }).click();
+      const kit = await recovery;
+      assert.equal(kit.suggestedFilename(), 'Vault-Emergency-Kit.txt');
+      assert.equal(await kit.failure(), null);
+      await proceed.evaluate(button => {
+        button.addEventListener('click', () => {
+          const send = chrome.runtime.sendMessage;
+          chrome.runtime.sendMessage = function (message, ...args) {
+            if (message?.target === 'vault' && message.type === 'status') {
+              chrome.runtime.sendMessage = send;
+              return Promise.reject(new Error('测试：后台状态暂不可读'));
+            }
+            return send.call(this, message, ...args);
+          };
+        }, { capture: true, once: true });
+      });
+      await proceed.click();
+      await expect(page.getByRole('alert')).toContainText('测试：后台状态暂不可读');
+      await expect(page.getByText('你的恢复码', { exact: true })).toHaveCount(0);
+      await page.getByRole('button', { name: '重试', exact: true }).click();
+      await expect(page.getByRole('button', { name: '导入备份', exact: true })).toHaveAttribute('aria-pressed', 'true');
       await page.getByLabel('导入加密备份').setInputFiles(backupPath);
       const previewBackup = async password => {
         await page.getByLabel('备份密码', { exact: true }).fill(password);
@@ -160,10 +206,13 @@ async function run(name) {
       assert.equal(restored.data.passwordHistory.length, 1);
       assert.deepEqual(restored.customFields, exportedItem.customFields);
       assert.equal(restored.note, exportedItem.note);
+      await assert.rejects(send({ type: 'get', id: item.id, proof: proof(sourcePassword) }));
+      assert.equal((await send({ type: 'webdav-status' })).saved, false);
       await screenshot(page, 'fresh-restore');
     });
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ browser: name, trashScope: true, canceledDownloadKeptReminder: true, savedBackupKeptLaterEdits: true, restoredInFreshProfile: true, pageErrors: errors }));
+    console.log(JSON.stringify({ browser: name, recoveryKitHiddenOnLock: true, resumedRestoreAfterStatusFailure: true,
+      trashScope: true, canceledDownloadKeptReminder: true, savedBackupKeptLaterEdits: true, restoredFromInstallSetup: true, pageErrors: errors }));
   } finally {
     const resolved = path.resolve(directory);
     assert(path.dirname(resolved) === tempRoot && path.basename(resolved).startsWith('vault-data-safety-'));

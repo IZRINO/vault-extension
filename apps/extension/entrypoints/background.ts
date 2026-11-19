@@ -87,7 +87,10 @@ export default defineBackground(() => {
   function registerMenu() {
     void browser.contextMenus.removeAll().then(() => browser.contextMenus.create({ id: 'vault-fill', title: '使用 Vault 填充', contexts: ['editable'] })).catch(() => undefined);
   }
-  browser.runtime.onInstalled.addListener(registerMenu);
+  browser.runtime.onInstalled.addListener(({ reason }) => {
+    registerMenu();
+    if (reason === 'install') void browser.tabs.create({ url: browser.runtime.getURL('/sidepanel.html?view=setup') }).catch(() => undefined);
+  });
   browser.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === 'vault-fill' && tab?.id != null) void browser.tabs.sendMessage(tab.id,
       { target: 'vault-fill', type: 'open', reason: 'context-menu' }, { frameId: info.frameId ?? 0 }).catch(() => undefined);

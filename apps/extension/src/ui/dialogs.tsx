@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react';
-import type { Proof } from '../vault-messages';
+import type { BackupImportProof, Proof } from '../vault-messages';
 import { Cancelled } from './lib';
 import { SecretField, SelectField } from './components';
 
@@ -14,11 +14,13 @@ export interface ConfirmOptions {
 export interface DialogApi {
   /** 请用户再输入一次主密码或 PIN；用户取消时以 Cancelled 拒绝。 */
   proof(options?: { masterOnly?: boolean }): Promise<Proof>;
+  backupImportProof(allowRecovery: boolean): Promise<BackupImportProof>;
   confirm(options: ConfirmOptions): Promise<boolean>;
 }
 
 type Pending =
   | { kind: 'proof'; masterOnly?: boolean; resolve(proof: Proof): void; reject(error: Error): void }
+  | { kind: 'backup-import'; allowRecovery: boolean; resolve(proof: BackupImportProof): void; reject(error: Error): void }
   | { kind: 'confirm'; options: ConfirmOptions; resolve(value: boolean): void };
 
 const DialogContext = createContext<DialogApi | undefined>(undefined);
@@ -31,8 +33,8 @@ export function useDialogs(): DialogApi {
 
 function settle(pending: Pending | undefined, reason: string) {
   if (!pending) return;
-  if (pending.kind === 'proof') pending.reject(new Cancelled(reason));
-  else pending.resolve(false);
+  if (pending.kind === 'confirm') pending.resolve(false);
+  else pending.reject(new Cancelled(reason));
 }
 
 export function DialogHost({ pinEnabled, children }: { pinEnabled: boolean; children: ReactNode }) {
@@ -46,6 +48,7 @@ export function DialogHost({ pinEnabled, children }: { pinEnabled: boolean; chil
     };
     return {
       proof: options => new Promise<Proof>((resolve, reject) => show({ kind: 'proof', masterOnly: options?.masterOnly, resolve, reject })),
+      backupImportProof: allowRecovery => new Promise<BackupImportProof>((resolve, reject) => show({ kind: 'backup-import', allowRecovery, resolve, reject })),
       confirm: options => new Promise<boolean>(resolve => show({ kind: 'confirm', options, resolve })),
     };
   }, []);
@@ -59,7 +62,10 @@ export function DialogHost({ pinEnabled, children }: { pinEnabled: boolean; chil
   };
   return <DialogContext.Provider value={api}>
     {children}
-    {pending?.kind === 'proof' && <ProofDialog pinEnabled={pinEnabled && !pending.masterOnly}
+    {pending?.kind === 'proof' && <ProofDialog<'pin'> alternate={pinEnabled && !pending.masterOnly ? 'pin' : undefined}
+      onSubmit={proof => { finish(); pending.resolve(proof); }}
+      onCancel={() => { finish(); pending.reject(new Cancelled('已取消验证。')); }} />}
+    {pending?.kind === 'backup-import' && <ProofDialog<'recovery'> alternate={pending.allowRecovery ? 'recovery' : undefined}
       onSubmit={proof => { finish(); pending.resolve(proof); }}
       onCancel={() => { finish(); pending.reject(new Cancelled('已取消验证。')); }} />}
     {pending?.kind === 'confirm' && <ConfirmDialog options={pending.options} onResult={value => { finish(); pending.resolve(value); }} />}
@@ -84,19 +90,23 @@ function Modal({ titleId, onCancel, children }: { titleId: string; onCancel(): v
   </dialog>;
 }
 
-function ProofDialog({ pinEnabled, onSubmit, onCancel }: { pinEnabled: boolean; onSubmit(proof: Proof): void; onCancel(): void }) {
+function ProofDialog<Alternate extends 'pin' | 'recovery'>({ alternate, onSubmit, onCancel }: {
+  alternate?: Alternate; onSubmit(proof: { method: 'master' | Alternate; secret: string }): void; onCancel(): void;
+}) {
   const titleId = useId();
-  const [method, setMethod] = useState<Proof['method']>(pinEnabled ? 'pin' : 'master');
+  const [method, setMethod] = useState<'master' | Alternate>(alternate === 'pin' ? alternate : 'master');
   const [secret, setSecret] = useState('');
+  const label = alternate === 'pin' ? '本机 PIN' : '目标库应急恢复码';
   return <Modal titleId={titleId} onCancel={onCancel}>
     <form className="dialog-body" onSubmit={event => { event.preventDefault(); onSubmit({ method, secret }); }}>
       <h2 id={titleId}>再次验证身份</h2>
-      <p>{pinEnabled ? '这一步需要确认是你本人。请输入本机 PIN，或改用主密码。' : '这一步需要确认是你本人。请输入主密码。'}</p>
-      {pinEnabled && <SelectField label="验证方式" value={method} onChange={value => { setMethod(value === 'pin' ? 'pin' : 'master'); setSecret(''); }}>
-        <option value="pin">本机 PIN</option>
+      <p>{alternate === 'pin' ? '这一步需要确认是你本人。请输入本机 PIN，或改用主密码。'
+        : alternate === 'recovery' ? '请用目标库的主密码或应急恢复码验证。备份文件密码单独填写。' : '这一步需要确认是你本人。请输入主密码。'}</p>
+      {alternate && <SelectField label="验证方式" value={method} onChange={value => { setMethod(value === alternate ? alternate : 'master'); setSecret(''); }}>
+        <option value={alternate}>{label}</option>
         <option value="master">主密码</option>
       </SelectField>}
-      <SecretField key={method} label={method === 'master' ? '主密码' : '本机 PIN'} value={secret} onChange={setSecret} required autoComplete="off"
+      <SecretField key={method} label={method === 'master' ? '主密码' : label} value={secret} onChange={setSecret} required autoComplete="off"
         inputMode={method === 'pin' ? 'numeric' : undefined} data-autofocus />
       <div className="dialog-actions">
         <button type="button" className="btn" onClick={onCancel}>取消</button>

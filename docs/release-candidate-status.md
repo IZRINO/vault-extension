@@ -2,7 +2,7 @@
 
 2026-11-20。对应[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)与[工单 T01–T38](development-tickets.md)。生产 ZIP 不等于正式准出；不代签，也不把模拟证据当作系统设备、第三方服务或应用互通的证据。
 
-当前可安装包见[2FAS 备份兼容候选](#2fas-备份兼容候选2026-11-20)。正式准出仍未通过。
+当前可安装包见[首装备份恢复候选](#首装备份恢复候选)。正式准出仍未通过。
 
 ## 实现范围
 
@@ -40,6 +40,7 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 `node scripts/test-passkeys.cjs --history-only` 只跑双端 WebDAV 历史恢复；不带参数时也会执行它。使用独立配置、本机 HTTP WebDAV 和双栈回环 RP，不连接真实网盘。
 
 `node scripts/test-sync-lifecycle.cjs` 验证远端主密码轮换、重新配置本机包装及重装设备认领；使用相同的本机故障服务和独立配置。
+加 `--backup-only` 则验证使用目标恢复码加入已有远端库，再合入独立 `.vaultpack`；只在用户显式启用写入并验证条件写后同步。
 
 ## 本机记录
 
@@ -87,6 +88,19 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 - ZIP：`test-results/Vault-2026-11-20-fd83a6c5d193-chrome.zip`（5,995,533 B），SHA-256 `fd83a6c5d1938dc071460fc2718bdcc5a8144bbcbceda987cc33dcd27d7fca69`；解压目录 `test-results/release-unpacked-fd83a6c5d193`，52 个文件，树摘要 `09d3b55bcb8e7cd3d1ea7b275edefd27219949487ad66af9ad5763ffd754079d`。相对轮换候选只变 CSV、Ente 与迁移 Worker；修复的导入 WASM（2,396,643 B）按内容哈希确认只位于这三个按需 Worker。生产 MV3、CSP 及权限通过，主核未变（255,677 B）。Rust 57 项，Vitest 86 项，TypeScript 通过。
 - T32：原应用的 256 字节盐不再误拒；旧版没有 OTP 类型的条目不再被外层服务类型挡掉。错密、超限、缺段及任一段认证失败仍拒绝，畸形 OTP 元数据不会变成可用的 TOTP。6 份 Aegis 上游公开 `.2fas`（schema 2/3/4 明文、加密）逐条比对账号、参数和独立出码。Aegis、andOTP、Stratum 的另外 5 个夹具经相同测试入口验证解析；原样本分组和未测变体的边界见[复现文档](agents/authenticator-backup-fixtures.md)。
 - Edge `157.0.4341.60`、Helium `157.0.8103.78` 从本解压包通过迁移回归：公开 2FAS v4 加密样本预览和错密不写库，确认导入 5 条，以原计数对照 3 个 HOTP，无种子及重复。中间包 `b460fb791b2a` 另通过双端二期、备份防丢；随后只收紧畸形 OTP 字段，最终包不把前一包的二期证据当成同包全量准出。
+
+### 首装备份恢复候选
+
+- ZIP：`test-results/Vault-2026-11-20-0c3c9376ab60-chrome.zip`（5,997,922 B），SHA-256 `0c3c9376ab609137078d96d2c8675adceb19f0f958d2f365b8d742fe7c38db75`。解压目录 `test-results/release-unpacked-0c3c9376ab60`，52 个文件，树摘要 `4221e4b4fdaed86fe2a5b261121f91c8014826106610c9389b86bbe626acccdc`。MV3 版本 `0.0.0`、清单与主核字节未变，CSP 及权限检查通过。主核 **255,677 B**；同步与迁移仍按需加载。Rust **57** 项、Vitest **89** 项、TypeScript、WASM 检查和生产 ZIP 均通过。
+- T08：首装自动开一个标签，WebDAV 优先，默认坚果云，可选 Koofr 和自定义；更新不弹。Edge `157.0.4341.60` 和 Helium `157.0.8103.78` 在回环服务实测不存在、空、残缺、已有及不可达。四个目录探测各只发一次 `PROPFIND`，不留下连接凭据、不创建对象或目录。后台回归证实重启后 `404` 不解除 `429` 熔断，手动读到有效目录后才恢复。
+- 首装可直接选择本地备份恢复。用新主密码创建独立库、保存新恢复包、再进入既有预览并确认合入。双端测试了下载完成、锁库隐藏恢复码、状态读取失败后重试、错密和取消零写入、二次验证及独立主密码。后台模拟会话清理异常时仍通知面板清除恢复码，该 Worker 的后续读取保持拒绝。可见 HTTP 预览加载首屏且无控制台错误；后续焦点操作失败，交互证据来自真实扩展。
+- T10/T13：仅已验证的网盘目标库可用其恢复码验证 `.vaultpack` 的预览与合入，两个阶段都复验。Edge 生成独立库备份，Helium 用正确的目标恢复码加入；源恢复码和文件密码不能证明目标身份。错密、预览和取消不改条目，确认后保留目标库身份、密钥版本和主密码。只读期间保持远端字节不变，显式写验证后才同步给 Edge；整库导出仍只认当前主密码。
+- T09 旧格式：从同步引入前的 [8ac6c4d](https://github.com/IZRINO/vault-extension/commit/8ac6c4d4238097be929a94e0bd8cd68e85b1d0c6) 重建旧核心 WASM（SHA-256 `3f6c113fecf9beac80ad6cfb2568f52eb1c3e2b0050cf24df3c9b2036882b3d2`），实际导出合成备份后用当前同步 WASM 预览、合入，保留标题、备注、标签、置顶和二次验证；错文件密码拒绝。复现：将该提交用 `git archive` 解到临时目录，运行 `wasm-pack build <临时源码>/crates/vault-core --target web --release`，再在当前仓库运行 `node scripts/test-legacy-vaultpack.cjs <旧版 pkg 目录>`。
+- T34：Raivo 原格式字符串 `pinned` 不再丢失。[兼容夹具](agents/authenticator-backup-fixtures.md#raivo)用独立 7-Zip 生成合成 AES ZIP，并对照 TOTP/HOTP；不算原生 iOS 导出验收。
+- 在同一解压包和新浏览器配置分别测原生 Popup 亮码／暗码首扫候选完成绘制：Helium **122.5 / 126.6 ms**，均低于 200 ms；Edge 亮码 **210.5 ms**，不是 Helium 门槛。两轮迁移回归亦通过公开 2FAS v4 加密样本。
+- **同包功能回归通过**：安装、备份防丢、网盘恢复码合入、原生侧栏、自动填充、二期、迁移（双端亮码及 Helium 暗码）、主密码轮换／设备认领、Passkey／历史恢复，十轮均退出 0。KeePassXC CLI 2.8.0 样本在两款浏览器均通过原公钥验签。阶段包曾在 Helium 内置过滤器启动检测处超时；最终夹具在原等待期限内重新查找后台目标，仍要求内置拦截器到达就绪状态，没有停用过滤器。
+
+千条原生 Popup 冷开与已认证 WASM 恢复仍未达标。最近独立同机批次见[轮换候选记录](#主密码轮换与设备认领候选2026-11-20)：原生 Popup 中位 Edge 584.27 / Helium 586.79 ms，WASM 71.90 / 68.10 ms，分别高于 `<50 ms` 和 `<5 ms`，不是当前包重测。实体设备、真实站点／网盘及仍缺独立来源的第三方互通按用户要求跳过人工验收。未上架、未推送、未改工单状态。
 
 ### 外部夹具
 

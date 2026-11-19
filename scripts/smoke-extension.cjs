@@ -3,12 +3,59 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const { waitForSetupTab } = require('./browser-fixtures.cjs');
+const { webdavFixture } = require('./webdav-fixture.cjs');
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const candidates = {
   edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   helium: 'C:/Program Files/imput/Helium/Application/chrome.exe',
 };
+async function verifyReadOnlySetup(page) {
+  const dav = await webdavFixture();
+  const storedConnection = () => page.evaluate(async () => {
+    const keys = ['webDavSealed', 'webDavClock'];
+    return [await chrome.storage.local.get(keys), await chrome.storage.session.get(keys)];
+  });
+  try {
+    assert.deepEqual(await storedConnection(), [{}, {}]);
+    assert.deepEqual(dav.requests, [], 'The installation tab must not contact WebDAV before a test');
+    const folder = page.getByLabel('同步目录名', { exact: true });
+    const test = page.getByRole('button', { name: '测试连接', exact: true });
+    await page.getByLabel('服务商', { exact: true }).selectOption('custom');
+    await page.getByLabel('WebDAV 根地址', { exact: true }).fill(dav.config.base);
+    await page.getByLabel('网盘账号', { exact: true }).fill(dav.config.username);
+    await page.getByLabel('应用专用密码', { exact: true }).fill(dav.config.password);
+    await page.getByRole('checkbox', { name: /允许本机 HTTP 调试/ }).check();
+    const probe = async (directory, outcome, expectedPath) => {
+      const start = dav.requests.length;
+      const prior = [...dav.objects];
+      const folders = [...dav.folders];
+      await folder.fill(directory);
+      await test.click();
+      await expect(page.getByRole('status')).toContainText(outcome);
+      await expect(test).toBeEnabled();
+      assert.deepEqual(dav.requests.slice(start), [{ method: 'PROPFIND', path: expectedPath, ifMatch: undefined }]);
+      assert.deepEqual([...dav.objects], prior);
+      assert.deepEqual([...dav.folders], folders);
+    };
+    await probe('vault', /目录还不存在/, '/dav/vault/');
+    await probe('scratch', /目标目录为空/, '/dav/scratch/');
+    const file = { bytes: Buffer.from('synthetic directory marker'), tag: '"fixture-probe-only"' };
+    dav.objects.set('/dav/scratch/head.bin', file);
+    await probe('scratch', /没有找到完整的密码库/, '/dav/scratch/');
+    dav.objects.set('/dav/scratch/snap_fixture.bin', file);
+    dav.folders.add('/dav/scratch/wal/');
+    await probe('scratch', /找到已有密码库/, '/dav/scratch/');
+    const result = await page.evaluate(() => chrome.runtime.sendMessage({ target: 'vault', type: 'webdav-status' }));
+    assert.equal(result?.ok, true);
+    assert.equal(result.value.saved, false, 'Setup probe must not save the application password');
+  } finally { await dav.close(); }
+  await page.getByRole('button', { name: '测试连接', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('无法连接 WebDAV');
+  assert.deepEqual(await storedConnection(), [{}, {}]);
+}
+
 async function run(name) {
   const executablePath = process.env.VAULT_BROWSER_PATH || candidates[name];
   await fs.access(executablePath);
@@ -20,10 +67,17 @@ async function run(name) {
   try {
     const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 20000 });
     const id = new URL(worker.url()).host;
-    const page = await context.newPage();
+    const page = await waitForSetupTab(context, worker.url());
+    const setupUrl = page.url();
     page.on('pageerror', error => errors.push(error.message));
     page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
-    await page.goto('chrome-extension://' + id + '/sidepanel.html');
+    await expect(page.getByRole('heading', { name: '连接网盘', exact: true })).toBeVisible();
+    const providers = page.getByLabel('服务商', { exact: true });
+    await expect(providers).toHaveValue('nutstore');
+    await expect(providers.locator('option')).toHaveText(['坚果云', 'Koofr', '自定义 WebDAV']);
+    result.openedSetupOnInstall = true;
+    await verifyReadOnlySetup(page);
+    result.readOnlySetupProbe = true;
     await page.getByRole('button', { name: '暂不配置，创建本地密码库', exact: true }).click();
     await page.getByLabel('主密码', { exact: true }).fill('Browser-Test-Master#2026');
     await page.getByLabel('再次输入主密码').fill('Browser-Test-Master#2026');
@@ -173,6 +227,9 @@ async function run(name) {
     const running = versions.find(entry => entry.scriptURL.startsWith('chrome-extension://' + id) && entry.runningStatus === 'running');
     if (running) await cdp.send('ServiceWorker.stopWorker', { versionId: running.versionId });
     assert.equal((await send({ type: 'status' })).unlocked, false);
+    assert.deepEqual(context.pages().filter(candidate => candidate.url() === setupUrl), [page]);
+    errors.push(...(await page.pageErrors()).map(error => error.message),
+      ...(await page.consoleMessages()).filter(message => message.type() === 'error').map(message => message.text()));
     assert.deepEqual(errors, []);
     result.consoleErrors = errors;
     result.passed = true;

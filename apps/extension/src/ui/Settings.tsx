@@ -10,13 +10,14 @@ import BrowserCsv from './BrowserCsv';
 import EnteAuth from './EnteAuth';
 import { AreaField } from './components';
 import type { AutofillSettings } from '../autofill-policy';
+import type { DavConnectionStatus } from '../sync/connection';
 import Migration from './Migration';
 import WebDav from './WebDav';
 import AuthMigration from './AuthMigration';
 import PortableMigration from './PortableMigration';
 
-export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'csv' | 'ente' | 'browser' | 'domains' | 'bitwarden' | 'mapped-csv' | 'webdav' | 'auth-migration' | 'portable-migration';
-const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置', domains: '关联域名', bitwarden: 'Bitwarden 密码库迁移', 'mapped-csv': 'CSV 字段映射与导出', webdav: '网盘连接', 'auth-migration': '导入其他验证器', 'portable-migration': '其他密码库与 CXF' };
+export type SettingsPage = 'home' | 'security' | 'password' | 'backup' | 'backup-import' | 'csv' | 'ente' | 'browser' | 'domains' | 'bitwarden' | 'mapped-csv' | 'webdav' | 'auth-migration' | 'portable-migration';
+const titles: Record<SettingsPage, string> = { home: '设置', security: '解锁与自动锁定', password: '更改主密码', backup: '备份与恢复', 'backup-import': '备份与恢复', csv: '导入浏览器密码', ente: 'Ente Auth 验证器迁移', browser: '浏览器设置', domains: '关联域名', bitwarden: 'Bitwarden 密码库迁移', 'mapped-csv': 'CSV 字段映射与导出', webdav: '网盘连接', 'auth-migration': '导入其他验证器', 'portable-migration': '其他密码库与 CXF' };
 export default function Settings({ status, page, setPage, refresh }: {
   status: VaultStatus; page: SettingsPage; setPage(page: SettingsPage): void; refresh(): Promise<void>;
 }) {
@@ -42,7 +43,7 @@ export default function Settings({ status, page, setPage, refresh }: {
       : <div className="view-head"><button type="button" className="icon-btn" aria-label="返回设置" onClick={() => setPage('home')}><Ico of={ArrowLeft} /></button><h1>{titles[page]}</h1></div>}
     {page === 'security' && <Security status={status} refresh={refresh} />}
     {page === 'password' && <ChangePassword refresh={refresh} />}
-    {page === 'backup' && <Backup refresh={refresh} />}
+    {(page === 'backup' || page === 'backup-import') && <Backup key={page} refresh={refresh} initialMode={page === 'backup-import' ? 'import' : 'export'} />}
     {page === 'csv' && <BrowserCsv refresh={refresh} />}
     {page === 'ente' && <EnteAuth refresh={refresh} />}
     {page === 'auth-migration' && <AuthMigration refresh={refresh} />}
@@ -133,10 +134,10 @@ function ChangePassword({ refresh }: { refresh(): Promise<void> }) {
   </form>;
 }
 
-function Backup({ refresh }: { refresh(): Promise<void> }) {
+function Backup({ refresh, initialMode }: { refresh(): Promise<void>; initialMode: 'export' | 'import' }) {
   const { busy, work, notify } = useOps();
   const dialogs = useDialogs();
-  const [mode, setMode] = useState<'export' | 'import'>('export');
+  const [mode, setMode] = useState(initialMode);
   const [password, setPassword] = useState('');
   const [again, setAgain] = useState('');
   const [file, setFile] = useState<File>();
@@ -153,27 +154,29 @@ function Backup({ refresh }: { refresh(): Promise<void> }) {
     </div>
     <p className="lede">{mode === 'export' ? '导出需要验证当前主密码；备份使用独立文件密码加密。' : '已有密码和条目字段不会被备份覆盖。'}</p>
     {!receipt && <form className="form" onSubmit={event => { event.preventDefault(); void work(async () => {
-      if (mode === 'export' && password !== again) throw new Error('两次备份密码输入不一致。');
-      if (mode === 'import') {
-        if (!file) throw new Error('请先选择备份文件。');
-        if (file.size > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
-      }
-      const proof = await dialogs.proof({ masterOnly: true });
-      try {
-        if (mode === 'export') {
+      if (mode === 'export') {
+        if (password !== again) throw new Error('两次备份密码输入不一致。');
+        const proof = await dialogs.proof({ masterOnly: true });
+        try {
           const { bytes, receipt } = await request<BackupExport>({ type: 'export', password, proof });
           download('Vault-' + new Date().toISOString().slice(0, 10) + '.vaultpack', new Uint8Array(bytes), 'application/octet-stream');
           setPendingBackup(receipt);
-        } else {
-          const bytes = Array.from(new Uint8Array(await file!.arrayBuffer()));
+        } finally { proof.secret = ''; }
+      } else {
+        if (!file) throw new Error('请先选择备份文件。');
+        if (file.size > MAX_VAULTPACK_BYTES) throw new Error('备份不能超过 16 MiB。');
+        const connection = await request<DavConnectionStatus>({ type: 'webdav-status' });
+        const proof = await dialogs.backupImportProof(connection.linked === true);
+        try {
+          const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
           if (!preview) { setPreview(await request<VaultPackPreview>({ type: 'preview-vaultpack', bytes, password, proof })); return; }
           const stamp = preview.stamp;
           setPreview(undefined);
           const count = await request<number>({ type: 'import', bytes, password, proof, stamp });
           setFile(undefined); setInputVersion(value => value + 1); notify('已合并 ' + count + ' 条凭证。');
-        }
-        setPassword(''); setAgain(''); await refresh();
-      } finally { proof.secret = ''; }
+        } finally { proof.secret = ''; }
+      }
+      setPassword(''); setAgain(''); await refresh();
     }); }}>
       {mode === 'import' && <label className="field">导入加密备份<input key={inputVersion} className="input" type="file" accept=".vaultpack" required disabled={busy}
         onChange={event => { setFile(event.target.files?.[0]); setPreview(undefined); }} /></label>}

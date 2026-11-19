@@ -41,16 +41,16 @@ const tabs: { id: Tab; label: string; icon: LucideIcon }[] = [
 ];
 const COPIED = '已复制，将在约 30 秒后检查并清理。';
 
-interface WorkspaceProps { status: VaultStatus; refresh(): Promise<void>; initialItems?: ItemSummary[] }
+interface WorkspaceProps { status: VaultStatus; refresh(): Promise<void>; initialItems?: ItemSummary[]; startBackupImport?: boolean }
 export default function Main(props: WorkspaceProps) {
   return <DialogHost pinEnabled={props.status.pinEnabled}><Workspace {...props} /></DialogHost>;
 }
 
-function Workspace({ status, refresh, initialItems }: WorkspaceProps) {
+function Workspace({ status, refresh, initialItems, startBackupImport }: WorkspaceProps) {
   const dialogs = useDialogs();
-  const [tab, setTab] = useState<Tab>('vault');
+  const [tab, setTab] = useState<Tab>(startBackupImport ? 'settings' : 'vault');
   const [screen, setScreen] = useState<Screen>({ name: 'list' });
-  const [settingsPage, setSettingsPage] = useState<SettingsPage>('home');
+  const [settingsPage, setSettingsPage] = useState<SettingsPage>(startBackupImport ? 'backup-import' : 'home');
   const [items, setItems] = useState(initialItems);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');

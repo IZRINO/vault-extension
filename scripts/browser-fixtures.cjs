@@ -1,19 +1,34 @@
 const { expect } = require('@playwright/test');
+
+class BrowserTargetTimeout extends Error {}
+
+async function waitForSetupTab(context, workerUrl) {
+  const url = new URL('/sidepanel.html?view=setup', workerUrl).href;
+  const matches = () => context.pages().filter(page => page.url() === url);
+  await expect.poll(() => matches().length, { timeout: 15000, message: 'Fresh installation must open one Vault setup tab' }).toBe(1);
+  return matches()[0];
+}
+
 async function waitForBuiltInFilters(context, name) {
   if (name !== 'helium') return;
   const cdp = await context.browser().newBrowserCDPSession();
-  let target;
   try {
+    // Helium can replace the background target during initial startup.
     await expect.poll(async () => {
       const { targetInfos } = await cdp.send('Target.getTargets');
-      target = targetInfos.find(target => target.type === 'background_page' && target.title === 'uBlock Origin');
-      return !!target;
-    }, { timeout: 20000, message: 'Wait for Helium built-in content blocker to start' }).toBe(true);
-    // Helium's first-run UI can replace tabs while the built-in background page is already alive.
-    await expect.poll(() => evaluateBrowserTarget(cdp, target.targetId,
-      `globalThis.µBlock?.readyToFilter === true && globalThis.µBlock?.supportStats?.allReadyAfter !== '?' &&
-       globalThis.vAPI?.net?.suspendDepth === 0`),
-    { timeout: 60000, message: 'Wait for the Helium content blocker to finish initializing' }).toBe(true);
+      const target = targetInfos.find(target => target.type === 'background_page' && target.title === 'uBlock Origin');
+      if (!target) return 'no background page';
+      try {
+        const ready = await evaluateBrowserTarget(cdp, target.targetId,
+          `globalThis.µBlock?.readyToFilter === true && globalThis.µBlock?.supportStats?.allReadyAfter !== '?' &&
+           globalThis.vAPI?.net?.suspendDepth === 0`);
+        return ready ? 'ready' : 'initializing';
+      } catch (error) {
+        if (error instanceof BrowserTargetTimeout || /(?:No target|Session) with given id (?:not )?found|Target closed/.test(String(error)))
+          return 'background page unresponsive';
+        throw error;
+      }
+    }, { timeout: 60000, message: 'Wait for the Helium content blocker to finish initializing' }).toBe('ready');
     console.log('Helium built-in filters ready');
   } finally { await cdp.detach(); }
 }
@@ -32,7 +47,7 @@ async function evaluateBrowserTarget(cdp, targetId, expression) {
         else resolve(message.result.result.value);
       };
       cdp.on('Target.receivedMessageFromTarget', listener);
-      timer = setTimeout(() => reject(new Error('Browser target did not respond')), 4000);
+      timer = setTimeout(() => reject(new BrowserTargetTimeout('Browser target did not respond')), 4000);
     });
     const [, value] = await Promise.all([
       cdp.send('Target.sendMessageToTarget', {
@@ -47,4 +62,4 @@ async function evaluateBrowserTarget(cdp, targetId, expression) {
     await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => undefined);
   }
 }
-module.exports = { waitForBuiltInFilters, evaluateNativePopup: evaluateBrowserTarget };
+module.exports = { waitForBuiltInFilters, waitForSetupTab, evaluateNativePopup: evaluateBrowserTarget };

@@ -56,7 +56,7 @@ async function webdavFixture() {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
-    state, requests, objects,
+    state, requests, objects, folders,
     config: { provider: 'custom', base: `http://127.0.0.1:${server.address().port}/dav/`, folder: 'vault',
       username: 'fixture-user', password: 'fixture-app-password', confirmHttp: true },
     close: () => new Promise(resolve => server.close(resolve)),

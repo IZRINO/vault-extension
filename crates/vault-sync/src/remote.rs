@@ -95,6 +95,18 @@ pub fn wasm_sync_unlock_head(wire: &[u8], session_key: Vec<u8>, secret: String, 
 }
 
 #[wasm_bindgen]
+pub fn wasm_sync_verify_recovery(local_head: &[u8], session_key: Vec<u8>, wrap: Vec<u8>, code: String) -> bool {
+    let (key, wrap, code) = (Zeroizing::new(session_key), Zeroizing::new(wrap), Zeroizing::new(code));
+    (|| -> Result<bool, VaultError> {
+        let (vault_id, epoch, current) = super::keys(&key, &wrap)?;
+        let head = VaultHead::from_bytes(local_head)?;
+        if head.vault_id != vault_id || head.key_epoch != epoch { return Ok(false); }
+        let recovered = head.unlock_with_recovery_secret(&RecoveryCode::parse(&code)?)?;
+        Ok(recovered.master_dek().as_bytes().ct_eq(current.master_dek().as_bytes()).unwrap_u8() == 1)
+    })().unwrap_or(false)
+}
+
+#[wasm_bindgen]
 pub fn wasm_sync_authenticate_head(wire: &[u8], session_key: Vec<u8>, wrap: Vec<u8>) -> Result<RemoteHead, JsValue> {
     let (session_key, wrap) = (Zeroizing::new(session_key), Zeroizing::new(wrap));
     let (vault_id, _, keys) = super::keys(&session_key, &wrap)?;

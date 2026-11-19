@@ -5,7 +5,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
-const { evaluateNativePopup, waitForBuiltInFilters } = require('./browser-fixtures.cjs');
+const { evaluateNativePopup, waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -138,8 +138,7 @@ async function run(name, artifact) {
     const worker = context.serviceWorkers()[0] || await context.waitForEvent('serviceworker', { timeout: 20000 });
     const id = new URL(worker.url()).host;
     await waitForBuiltInFilters(context, name);
-    const setup = await context.newPage();
-    await setup.goto(`chrome-extension://${id}/sidepanel.html`);
+    const setup = await waitForSetupTab(context, worker.url());
     await addFixture(setup);
     await setup.close();
 

@@ -289,6 +289,81 @@ async function verifyDeviceClaim(edge, helium, dav, resources) {
   }
 }
 
+async function verifyBackupImport(edge, receiver, dav, resources, kit) {
+  const source = await browserFixture('edge', resources);
+  const sourceMaster = 'Lifecycle-Independent-Backup-Source#2026';
+  const filePassword = 'Lifecycle-Independent-Backup-File#2026';
+  const sourceKit = await source.send({ type: 'create', masterPassword: sourceMaster, calibrate: false });
+  const title = 'Credential from independent encrypted backup';
+  await add(source, title);
+  const { bytes } = await source.send({ type: 'export', password: filePassword, proof: masterProof(sourceMaster) });
+  await source.close();
+
+  await edge.send({ type: 'lock' });
+  const before = [...dav.objects];
+  const firstRequest = dav.requests.length;
+  const joining = { type: 'webdav-join', input: dav.config, method: 'recovery' };
+  await assert.rejects(receiver.send({ ...joining, secret: filePassword }), /核对该库自己的主密码或恢复码/);
+  assert.equal((await status(receiver)).configured, false);
+  await receiver.send({ ...joining, secret: kit.recoveryCode });
+  const target = await status(receiver);
+  assert.equal(target.vaultId, kit.vaultId);
+  assert.notEqual(target.vaultId, sourceKit.vaultId);
+  const initialTitles = await titles(receiver);
+
+  const { view } = receiver;
+  await view.reload();
+  await view.getByRole('button', { name: '设置', exact: true }).click();
+  await view.getByRole('button', { name: /^备份与恢复/ }).click();
+  await view.getByRole('button', { name: '导入备份', exact: true }).click();
+  await view.getByLabel('导入加密备份').setInputFiles({
+    name: 'independent.vaultpack', mimeType: 'application/octet-stream', buffer: Buffer.from(bytes),
+  });
+  const verify = async (action, code) => {
+    await view.getByRole('button', { name: action, exact: true }).click();
+    const dialog = view.getByRole('dialog');
+    const method = dialog.getByLabel('验证方式', { exact: true });
+    await expect(method).toHaveValue('master');
+    await method.selectOption('recovery');
+    await dialog.getByLabel('目标库应急恢复码', { exact: true }).fill(code);
+    await dialog.getByRole('button', { name: '验证', exact: true }).click();
+  };
+  const secret = view.getByLabel('备份密码', { exact: true });
+  await secret.fill(filePassword);
+  await verify('验证并预览', sourceKit.recoveryCode);
+  await expect(view.getByRole('alert')).toContainText('目标库恢复码验证失败');
+  await secret.fill('Wrong-Lifecycle-File-Password#2026');
+  await verify('验证并预览', kit.recoveryCode);
+  await expect(view.getByRole('alert')).toContainText('无法读取此备份');
+  await secret.fill(filePassword);
+  await verify('验证并预览', kit.recoveryCode);
+  await expect(view.getByRole('status').filter({ hasText: '新增 1 条' })).toBeVisible();
+  assert.deepEqual(await titles(receiver), initialTitles);
+  await view.getByRole('button', { name: '取消', exact: true }).click();
+  assert.deepEqual(await titles(receiver), initialTitles);
+  await secret.fill(filePassword);
+  await verify('验证并预览', kit.recoveryCode);
+  await verify('确认合入', kit.recoveryCode);
+  await expect(view.getByText('已合并 1 条凭证。', { exact: true })).toBeVisible();
+  assert((await titles(receiver)).includes(title));
+  assert.equal((await sync(receiver)).kind, 'read-only');
+  assert.deepEqual(writes(dav, firstRequest), []);
+  assert.deepEqual([...dav.objects], before);
+
+  await receiver.send({ type: 'lock' });
+  await receiver.send({ type: 'unlock', password: originalMaster });
+  const after = await status(receiver);
+  assert.equal(after.vaultId, target.vaultId);
+  assert.equal(after.keyEpoch, target.keyEpoch);
+  await enableWrites(receiver, originalMaster);
+  assert.equal((await sync(receiver)).pending, false);
+  await edge.send({ type: 'unlock', password: originalMaster });
+  await sync(edge);
+  assert.deepEqual(await titles(edge), await titles(receiver));
+  console.log(JSON.stringify({ joinedWithTargetRecovery: true, filePasswordDidNotGrantRemoteIdentity: true, sourceRecoveryRejected: true,
+    wrongFilePasswordAndCancelDidNotImport: true, retainedTargetIdentity: true, initiallyReadOnly: true, syncedAfterWriteProof: true }));
+}
+
 async function run() {
   const dav = await webdavFixture();
   const resources = { profiles: new Set(), contexts: new Set() };
@@ -299,6 +374,10 @@ async function run() {
     await add(edge, 'Lifecycle baseline', randomBytes(12000).toString('hex'));
     await edge.send({ type: 'webdav-create', input: dav.config, scratchFolder: 'scratch', masterPassword: originalMaster, deviceName: edgeAlias });
     const helium = await browserFixture('helium', resources);
+    if (process.argv.includes('--backup-only')) {
+      await verifyBackupImport(edge, helium, dav, resources, kit);
+      return;
+    }
     await join(helium, dav, originalMaster);
     await enableWrites(helium, originalMaster);
     const resumed = await verifyRotation(edge, helium, dav, resources, kit);

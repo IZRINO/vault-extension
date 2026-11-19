@@ -19,7 +19,9 @@ function StrengthMeter({ strength }: { strength: Strength }) {
   </div>;
 }
 
-export default function Welcome({ status, refresh, onCreated }: { status: VaultStatus; refresh(): Promise<void>; onCreated(kit: EmergencyKit): void }) {
+export default function Welcome({ status, refresh, onCreated }: {
+  status: VaultStatus; refresh(): Promise<void>; onCreated(kit: EmergencyKit, restoreBackup?: boolean): void;
+}) {
   const [mode, setMode] = useState<'master' | 'pin' | 'recovery'>('master');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -28,7 +30,7 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
   const [error, setError] = useState('');
   const [calibrate, setCalibrate] = useState(true);
   const [strength, setStrength] = useState<Strength>();
-  const [local, setLocal] = useState(false);
+  const [local, setLocal] = useState<'create' | 'restore'>();
   const creating = !status.configured;
   const choosing = !status.remoteKeyUpdate && ((creating && local) || mode === 'recovery');
 
@@ -51,7 +53,7 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
         if (password !== confirmPassword) throw new Error('两次主密码输入不一致。');
         const output = await request<EmergencyKit>({ type: 'create', masterPassword: password, calibrate });
         setPassword(''); setConfirmPassword('');
-        onCreated(output);
+        onCreated(output, local === 'restore');
       } else {
         if (status.remoteKeyUpdate) {
           await request({ type: 'webdav-update-key', password });
@@ -83,11 +85,14 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
     <div className="band-top"><span className="wordmark">Vault</span><ShellActions onError={e => setError(errorText(e))} /></div>
     <div className="door-head"><h1>连接网盘</h1><p>已有密码库时，先测试它所在的 WebDAV 目录。也可以只使用本地密码库。</p></div>
     <div className="door-panel">{error && <ErrorBanner text={error} />}<WebDav onboarding refresh={refresh} onCreated={onCreated}
-      stayLocal={() => { setError(''); setLocal(true); }} /></div>
+      stayLocal={next => { setError(''); setLocal(next); }} /></div>
   </div>;
 
-  const heading = creating ? '先设一个主密码' : status.remoteKeyUpdate ? '验证新的主密码' : mode === 'recovery' ? '用恢复码重设主密码' : '解锁密码库';
-  const lede = creating ? '以后只用记住这一个密码，其余的账号和密码都交给 Vault 保管。'
+  const restoring = creating && local === 'restore';
+  const heading = creating ? (restoring ? '先设置新的主密码' : '先设一个主密码')
+    : status.remoteKeyUpdate ? '验证新的主密码' : mode === 'recovery' ? '用恢复码重设主密码' : '解锁密码库';
+  const lede = creating ? (restoring ? '恢复到新的本地密码库。备份文件密码不会成为这个库的主密码。'
+    : '以后只用记住这一个密码，其余的账号和密码都交给 Vault 保管。')
     : status.remoteKeyUpdate ? '另一台设备已更新主密码。验证新密码后，需重新设置本机 PIN 和系统解锁。'
     : mode === 'recovery' ? '输入应急恢复包里的恢复码，再设一个新的主密码。'
       : mode === 'pin' ? '输入本机 PIN。连续输错 5 次后，需要改用主密码。'
@@ -100,7 +105,7 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
       <ShellActions onError={e => setError(errorText(e))} />
     </div>
     <div className="door-head">
-      {creating && <div className="steps"><span aria-current="step"><i>1</i>设置主密码</span><hr /><span><i>2</i>保存恢复包</span></div>}
+      {creating && <SetupSteps restoreBackup={restoring} />}
       <h1>{heading}</h1>
       <p>{lede}</p>
     </div>
@@ -126,7 +131,7 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
         <button className="btn btn-primary btn-l btn-wide" disabled={busy}>
           {busy ? (creating ? '正在创建，请稍候…' : '正在验证…') : creating ? '创建本地密码库' : mode === 'recovery' ? '重设主密码' : '解锁'}
         </button>
-        {creating && <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => { setLocal(false); setPassword(''); setConfirmPassword(''); setError(''); }}>返回网盘连接</button>}
+        {creating && <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => { setLocal(undefined); setPassword(''); setConfirmPassword(''); setError(''); }}>返回网盘连接</button>}
       </form>
     </div>
     {!creating && !status.remoteKeyUpdate && <div className="door-alt">
@@ -142,7 +147,14 @@ export default function Welcome({ status, refresh, onCreated }: { status: VaultS
   </div>;
 }
 
-export function KitScreen({ kit, onDone }: { kit: EmergencyKit; onDone(): void }) {
+function SetupSteps({ kit = false, restoreBackup = false }: { kit?: boolean; restoreBackup?: boolean }) {
+  return <div className="steps"><span aria-current={kit ? undefined : 'step'}><i>1</i>设置主密码</span><hr />
+    <span aria-current={kit ? 'step' : undefined}><i>2</i>保存恢复包</span>
+    {restoreBackup && <><hr /><span><i>3</i>导入备份</span></>}
+  </div>;
+}
+
+export function KitScreen({ kit, restoreBackup, onDone }: { kit: EmergencyKit; restoreBackup?: boolean; onDone(): void }) {
   const [downloaded, setDownloaded] = useState(false);
   const save = () => {
     download('Vault-Emergency-Kit.txt', 'Vault 应急恢复包\n密码库编号：' + kit.vaultId + '\n恢复码：' + kit.recoveryCode + '\n请离线保存；恢复码仅能恢复对应密码库，不能替代数据备份。\n', 'text/plain;charset=utf-8');
@@ -151,7 +163,7 @@ export function KitScreen({ kit, onDone }: { kit: EmergencyKit; onDone(): void }
   return <div className="door">
     <div className="band-top"><span className="wordmark">Vault</span></div>
     <div className="door-head">
-      <div className="steps"><span><i>1</i>设置主密码</span><hr /><span aria-current="step"><i>2</i>保存恢复包</span></div>
+      <SetupSteps kit restoreBackup={restoreBackup} />
       <h1>保存应急恢复包</h1>
       <p>忘记主密码时，只有这串恢复码能帮你重设。请下载后存到 U 盘或打印出来，不要和这台电脑放在一起。</p>
     </div>
@@ -161,10 +173,11 @@ export function KitScreen({ kit, onDone }: { kit: EmergencyKit; onDone(): void }
         <pre className="recovery-code" aria-labelledby="recovery-code-label">{kit.recoveryCode}</pre>
       </div>
       <button type="button" className="btn btn-primary btn-l btn-wide" onClick={save}><Ico of={Download} />下载应急恢复包</button>
-      {downloaded && <div className="banner banner-ok" role="status"><Ico of={CircleCheck} /><span className="grow">已下载，文件名是 Vault-Emergency-Kit.txt。请确认它已经存到安全的地方。</span></div>}
-      <button type="button" className="btn btn-l btn-wide" disabled={!downloaded} onClick={onDone}>我已保存，进入密码库</button>
-      {!downloaded && <p className="hint">下载恢复包之后，才能进入密码库。</p>}
+      {downloaded && <div className="banner banner-ok" role="status"><Ico of={CircleCheck} /><span className="grow">已发起下载，文件名是 Vault-Emergency-Kit.txt。请确认它已经存到安全的地方。</span></div>}
+      <button type="button" className="btn btn-l btn-wide" disabled={!downloaded} onClick={onDone}>
+        {restoreBackup ? '我已保存，选择备份文件' : '我已保存，进入密码库'}</button>
+      {!downloaded && <p className="hint">{restoreBackup ? '下载恢复包之后，再选择要导入的备份文件。' : '下载恢复包之后，才能进入密码库。'}</p>}
     </div>
-    <p className="door-foot">恢复码只能重设主密码，不能代替数据备份。之后可以在“设置”里另存一份加密备份。</p>
+    <p className="door-foot">恢复码不能代替数据备份。之后可以在“设置”里另存一份加密备份。</p>
   </div>;
 }

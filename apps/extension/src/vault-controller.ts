@@ -210,10 +210,10 @@ export class VaultController {
     const locking = store.clearSessionState().then(async () => {
       await browser.alarms.clear(LOCK_ALARM);
       await browser.alarms.clear(DAV_ALARM);
-      void browser.runtime.sendMessage({ target: 'vault-event', type: 'locked' }).catch(() => undefined);
     });
     // Requests arriving after lock began must not read the session being erased.
     this.locking = locking;
+    void browser.runtime.sendMessage({ target: 'vault-event', type: 'locked' }).catch(() => undefined);
     void locking.then(() => {
       if (this.locking === locking) this.locking = undefined;
     }, () => undefined);
@@ -1196,8 +1196,18 @@ export class VaultController {
             !Array.isArray(message.bytes) || !message.bytes.length || message.bytes.length > MAX_VAULTPACK_BYTES ||
             !message.bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255))
           throw new Error('请选择不超过 16 MiB 的备份，并输入文件密码。');
-        await this.verifyMaster(message.proof, check);
-        const bytes = new Uint8Array(message.bytes), now = Date.now(), files = this.files;
+        const files = this.files;
+        if (message.proof?.method === 'recovery') {
+          const anchor = await store.loadRemoteAnchor(files.vaultId);
+          check();
+          if (anchor?.vaultId !== files.vaultId) throw new Error('只有已验证的网盘目标库支持用恢复码合入备份。');
+          const code = message.proof.secret;
+          if (typeof code !== 'string' || !code || code.length > 1024 ||
+              !await derive<boolean>('sync:verify-recovery', [files.head, session.key, session.wrap, code]))
+            throw new Error('目标库恢复码验证失败。');
+          check();
+        } else await this.verifyMaster(message.proof, check);
+        const bytes = new Uint8Array(message.bytes), now = Date.now();
         try {
           const stamp = (await Promise.all([digestHex(bytes), digestHex(new Uint8Array(files.head)), digestHex(new Uint8Array(files.snap))])).join(':');
           const confirm = message.type === 'import';

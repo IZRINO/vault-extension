@@ -90,6 +90,8 @@ export async function testDav(input: WebDavInput | undefined, remember: boolean,
     context.check?.();
     if (result.kind !== 'empty' && result.kind !== 'existing' && !(input && result.kind === 'missing')) return result;
     const stored = await read();
+    // A 404 does not establish that the server accepted the application credentials.
+    if (result.kind === 'missing' && pauseStatus(stored)) return result;
     if (remember || !input) {
       if (remember) {
         await saveDavConnection(config, session!, vaultId!, result.offsetSeconds, () => context.check?.());

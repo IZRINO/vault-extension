@@ -33,7 +33,7 @@ const syncText: Record<SyncResult['kind'], string> = {
 };
 
 export default function WebDav({ onboarding = false, stayLocal, onCreated, refresh }: {
-  onboarding?: boolean; stayLocal?(): void; onCreated?(kit: EmergencyKit): void; refresh?(): Promise<void>;
+  onboarding?: boolean; stayLocal?(next: 'create' | 'restore'): void; onCreated?(kit: EmergencyKit): void; refresh?(): Promise<void>;
 }) {
   const [provider, setProvider] = useState<WebDavInput['provider']>('nutstore');
   const [base, setBase] = useState('');
@@ -214,6 +214,9 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     {status?.saved && <SwitchRow label="补偿时间验证码偏差" checked={status.compensation} disabled={busy || (!status.compensation && (status.paused != null || status.offsetSeconds == null))}
       onChange={enabled => void run(async () => setStatus({ ...await request<DavConnectionStatus>({ type: 'webdav-clock', enabled }),
         linked: status.linked, conflicts: status.conflicts }))} />}
-    {stayLocal && <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={stayLocal}>暂不配置，创建本地密码库</button>}
+    {stayLocal && <>
+      <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => stayLocal('create')}>暂不配置，创建本地密码库</button>
+      <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => stayLocal('restore')}>从本地备份恢复</button>
+    </>}
   </div>;
 }

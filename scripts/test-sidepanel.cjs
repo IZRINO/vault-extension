@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
+const { waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -218,6 +218,8 @@ async function run(name) {
     assert.notEqual(await worker.evaluate(() => chrome.idle.queryState(60)), 'locked',
       'Unlock the Windows desktop before running the native side panel test.');
     const origin = 'chrome-extension://' + new URL(worker.url()).host;
+    const panelUrl = origin + '/sidepanel.html';
+    await (await waitForSetupTab(context, worker.url())).close();
     const popup = await context.newPage();
     await popup.goto(origin + '/popup.html');
     await popup.evaluate(async masterPassword => {
@@ -227,7 +229,6 @@ async function run(name) {
     await popup.reload();
     await popup.getByRole('button', { name: '打开浏览器侧栏', exact: true }).click();
 
-    const panelUrl = origin + '/sidepanel.html';
     await expect.poll(async () => {
       const contexts = await worker.evaluate(documentUrl => chrome.runtime.getContexts({
         contextTypes: ['SIDE_PANEL'], documentUrls: [documentUrl],

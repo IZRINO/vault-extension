@@ -1,4 +1,5 @@
 export type Proof = { method: 'master' | 'pin'; secret: string };
+export type BackupImportProof = Proof | { method: 'recovery'; secret: string };
 export const MAX_VAULTPACK_BYTES = 16 * 1024 * 1024;
 export const MAX_BROWSER_CSV_BYTES = 2 * 1024 * 1024;
 export const MAX_ENTE_BYTES = 2 * 1024 * 1024;
@@ -114,8 +115,8 @@ export type VaultMessage =
   | { type: 'copy-sensitive'; value: string }
   | { type: 'export'; password: string; proof: Proof }
   | { type: 'backup-saved'; receipt: BackupReceipt }
-  | { type: 'preview-vaultpack'; bytes: number[]; password: string; proof: Proof }
-  | { type: 'import'; bytes: number[]; password: string; proof: Proof; stamp: string }
+  | { type: 'preview-vaultpack'; bytes: number[]; password: string; proof: BackupImportProof }
+  | { type: 'import'; bytes: number[]; password: string; proof: BackupImportProof; stamp: string }
   | { type: 'preview-browser-csv'; bytes: number[] }
   | { type: 'import-browser-csv'; bytes: number[]; stamp: string; proof: Proof }
   | { type: 'preview-ente'; bytes: number[] }

@@ -6,22 +6,24 @@ import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente
 import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import initPreferences, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav,
   wasm_sign_authorization, wasm_verify_authorization } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
-import initSync, { wasm_make_local_wal, wasm_sync_import_pack, wasm_verify_local_wal } from '../../../crates/vault-sync/pkg/vault_sync.js';
+import initSync, { wasm_make_local_wal, wasm_sync_import_pack, wasm_sync_verify_recovery, wasm_verify_local_wal } from '../../../crates/vault-sync/pkg/vault_sync.js';
 import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
 import { VaultController } from './vault-controller';
 import { offscreen } from './bridge';
-import type { BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
+import type { BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
 import type { JournalCommit, LocalSettings, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
   failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown>,
-  observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined }));
+  observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined,
+  remoteVaultId: undefined as string | undefined }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
-  loadRemoteAnchor: async () => structuredClone(state.observedKeyUpdate),
+  loadRemoteAnchor: async (vaultId: string) => structuredClone(state.observedKeyUpdate ??
+    (state.remoteVaultId === vaultId ? { vaultId } : undefined)),
   loadJournal: async () => ({ clock: structuredClone(state.pendingWal.at(-1)?.state), legacy: state.legacy }),
   saveVaultFiles: async (files: VaultFiles, change?: JournalCommit) => {
     if (state.failSave) throw new Error('Test disk write failed');
@@ -45,6 +47,7 @@ vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
   derive: async (operation: string, args: unknown[]) => {
     if (operation === 'sync:local-wal') return Array.from(wasm_make_local_wal(...args as Parameters<typeof wasm_make_local_wal>));
+    if (operation === 'sync:verify-recovery') return wasm_sync_verify_recovery(...args as Parameters<typeof wasm_sync_verify_recovery>);
     if (operation === 'sync:import-pack') {
       const result = wasm_sync_import_pack(...args as Parameters<typeof wasm_sync_import_pack>);
       try { return { head: Array.from(result.head), snap: Array.from(result.snap), added: result.added, updated: result.updated, skipped: result.skipped }; }
@@ -118,6 +121,7 @@ beforeEach(() => {
   state.legacy = false;
   state.local = {};
   state.observedKeyUpdate = undefined;
+  state.remoteVaultId = undefined;
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
     idle: { queryState: async () => state.idleState },
@@ -146,6 +150,9 @@ describe('real WASM + background session integration', () => {
       fetchMock.mockResolvedValueOnce(new Response(null, { status: 429 }));
       await expect(controller.handle({ type: 'webdav-test', input, remember: true })).rejects.toThrow('请求过于频繁');
       const restarted = new VaultController();
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: false, paused: 429 });
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }));
+      await expect(restarted.handle({ type: 'webdav-test', input, remember: true })).resolves.toMatchObject({ kind: 'missing', writeAllowed: false });
       await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: false, paused: 429 });
       await expect(restarted.handle({ type: 'webdav-test', input, remember: true })).resolves.toMatchObject({ writeAllowed: false });
       await expect(restarted.handle({ type: 'webdav-status' })).resolves.toEqual({ saved: true, paused: undefined, offsetSeconds: 45, compensation: false });
@@ -349,6 +356,21 @@ describe('real WASM + background session integration', () => {
     expect(state.files).toEqual(previousFiles);
     expect(state.pendingWal).toEqual(pending);
   });
+  it('notifies panels and keeps operations locked when persistent session cleanup fails', async () => {
+    const controller = await unlocked();
+    const notify = vi.spyOn(browser.runtime, 'sendMessage');
+    state.pauseSessionClear = Promise.reject(new Error('Test session storage cleanup failed'));
+    try {
+      await expect(controller.lock()).rejects.toThrow('Test session storage cleanup failed');
+      expect(notify).toHaveBeenCalledWith({ target: 'vault-event', type: 'locked' });
+      await expect(controller.handle({ type: 'open' })).rejects.toThrow('Test session storage cleanup failed');
+    } finally {
+      notify.mockRestore();
+      state.pauseSessionClear = undefined;
+      await controller.lock();
+    }
+  });
+
   it('leaves the vault locked when a new worker finds Windows already locked', async () => {
     await unlocked();
     state.idleState = 'locked';
@@ -498,6 +520,46 @@ describe('real WASM + background session integration', () => {
     await expect(controller.handle({ type: 'get', id: saved!.id, proof: pin })).resolves.toMatchObject({ title: item.title });
     expect(state.files!.changesSinceBackup).toBe(1);
   });
+  it('imports a backup with the linked target recovery code without changing target identity or granting export', async () => {
+    const source = await unlocked();
+    const backupPassword = 'Separate-Pack-Password#2026';
+    await source.handle({ type: 'upsert', itemJson: JSON.stringify(record()) });
+    const { bytes } = await source.handle({ type: 'export', password: backupPassword, proof }) as BackupExport;
+    await source.lock();
+    state.files = undefined;
+    state.pendingWal = [];
+    const target = new VaultController();
+    const targetPassword = 'Separate-Target-Master#2026';
+    const kit = await target.handle({ type: 'create', masterPassword: targetPassword, calibrate: false }) as { vaultId: string; recoveryCode: string };
+    try {
+      const { keyEpoch } = await target.handle({ type: 'status' }) as VaultStatus;
+      state.remoteVaultId = kit.vaultId;
+      const targetProof = { method: 'recovery' as const, secret: kit.recoveryCode };
+      const message = { type: 'preview-vaultpack' as const, bytes, password: backupPassword, proof: targetProof };
+      const before = structuredClone(state.files);
+      const preview = await target.handle(message) as VaultPackPreview;
+      expect(preview).toMatchObject({ added: 1, updated: 0 });
+      expect(state.files).toEqual(before);
+      expect(state.pendingWal).toHaveLength(0);
+      const confirm = { ...message, type: 'import' as const, stamp: preview.stamp };
+      for (const secret of [recoveryCode, backupPassword]) {
+        await expect(target.handle({ ...confirm, proof: { method: 'recovery', secret } })).rejects.toThrow('恢复码验证失败');
+      }
+      await expect(target.handle({ ...message, password: 'Wrong file password' })).rejects.toBeDefined();
+      await expect(target.handle({ type: 'export', password: backupPassword, proof: targetProof } as unknown as VaultMessage)).rejects.toThrow('主密码');
+      state.remoteVaultId = fixture.vaultId;
+      await expect(target.handle(confirm)).rejects.toThrow('目标');
+      expect(state.files).toEqual(before);
+      expect(state.pendingWal).toHaveLength(0);
+      state.remoteVaultId = kit.vaultId;
+      await expect(target.handle(confirm)).resolves.toBe(1);
+      expect(state.pendingWal).toHaveLength(1);
+      await target.lock();
+      await expect(target.handle({ type: 'unlock', password: targetPassword })).resolves.toMatchObject({ vaultId: kit.vaultId, keyEpoch, unlocked: true });
+      await expect(target.handle(message)).resolves.toMatchObject({ added: 0, updated: 0 });
+    } finally { await target.lock(); }
+  });
+
   it('retains the reminder without an authentic export receipt and never clears edits made after exporting', async () => {
     const controller = await unlocked();
     const exportBackup = async () => await controller.handle({ type: 'export', password: 'Test-Backup-Password#2026', proof }) as BackupExport;
