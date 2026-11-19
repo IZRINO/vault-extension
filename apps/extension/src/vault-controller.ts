@@ -660,7 +660,8 @@ export class VaultController {
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
       const client = new WebDavClient(config, { check, signal: this.davAbort.signal, stop: pauseDav });
-      if (message.type === 'webdav-history') return listHistory(client, anchor, session, files);
+      // Keep the connection credentials until the last request in the operation finishes.
+      if (message.type === 'webdav-history') return await listHistory(client, anchor, session, files);
       if (await store.hasPendingWal(files.vaultId)) throw new Error('本机仍有待上传的编辑，请先同步再恢复历史。');
       const prepared = await prepareRestore(client, anchor, session, files, message.id);
       check();
@@ -674,7 +675,7 @@ export class VaultController {
         void browser.runtime.sendMessage({ target: 'vault-event', type: 'sync-changed' }).catch(() => undefined);
       };
       if (message.destination === 'local') {
-        return restoreHistoryLocally(client, anchor, files, prepared, message.stamp, check, async (next, committed) => {
+        return await restoreHistoryLocally(client, anchor, files, prepared, message.stamp, check, async (next, committed) => {
           await this.persistMutation(committed, check, next);
           reload(committed);
         });

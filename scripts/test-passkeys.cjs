@@ -95,7 +95,7 @@ async function fixture() {
     if (req.url === '/favicon.ico') { res.writeHead(204).end(); return; }
     ++served;
     const challenge = randomBytes(32).toString('base64url');
-    if (/^\/keepassxc\/[a-f0-9]{32}$/.test(req.url)) challenges.set(req.url, challenge);
+    if (/^\/issued\/[a-f0-9]{32}$/.test(req.url)) challenges.set(req.url, challenge);
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }).end(html(challenge));
   };
   const listen = (server, host, port) => new Promise((resolve, reject) => {
@@ -119,11 +119,11 @@ async function fixture() {
     assert(challenge, 'The local RP must have issued this challenge');
     challenges.delete(endpoint);
     return challenge;
-  }, async page(local, keepassxc = false) {
+  }, async page(local, trackChallenge = false) {
     const page = await local.context.newPage();
     await page.bringToFront();
     const before = served;
-    const url = keepassxc ? `${origin}/keepassxc/${randomBytes(16).toString('hex')}` : origin;
+    const url = trackChallenge ? `${origin}/issued/${randomBytes(16).toString('hex')}` : origin;
     const response = await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(error => {
       throw new Error(`Local WebAuthn verifier did not load (HTTP requests served: ${served - before})`, { cause: error });
     });
@@ -418,6 +418,199 @@ async function verifyConflictReview(first, second) {
   await review.close();
 }
 
+async function runHistoryRecovery() {
+  const dav = await webdavFixture();
+  const locals = [];
+  let site;
+  const currentMaster = 'Rotated-History-E2E-Fixture#2026';
+  const headPath = '/dav/vault/head.bin';
+  const head = () => dav.objects.get(headPath);
+  const writes = since => dav.requests.slice(since).filter(({ method }) => !['GET', 'PROPFIND'].includes(method));
+  const walNames = () => [...dav.objects.keys()].filter(name => name.startsWith('/dav/vault/wal/'));
+  const sync = local => local.send({ type: 'webdav-sync' });
+  const history = local => local.send({ type: 'webdav-history' });
+  const list = local => local.send({ type: 'list' });
+  const identities = items => items.map(({ id, title }) => `${id}:${title}`).sort();
+  const join = (local, secret) => local.send({ type: 'webdav-join', input: dav.config, method: 'master', secret });
+  const addLocal = async (name, password) => {
+    const local = await open(name, password);
+    locals.push(local);
+    return local;
+  };
+  const add = (local, title, data = {}, note = '') => local.send({ type: 'upsert', itemJson: JSON.stringify({
+    id: '', title, note, data: { kind: 'login', username: 'fixture', password: 'fixture-only', uris: [], ...data },
+  }) });
+  const preview = (local, id) => local.send({ type: 'webdav-history-preview', id });
+  const restore = (local, prepared, destination, secret = currentMaster) => local.send({
+    type: 'webdav-history-restore', id: prepared.id, stamp: prepared.stamp, destination, proof: { method: 'master', secret },
+  });
+  const assertFresh = async (local, key, count) => {
+    const page = await site.page(local, true);
+    try { await sign(local, page, key, false, 0x19, count, site.consumeChallenge(page.url())); }
+    finally { await page.close(); }
+  };
+  const assertUnchanged = async (local, since, items, changeCount) => {
+    assert.deepEqual(writes(since), [], 'No WebDAV mutation before an authorized restore');
+    assert.deepEqual(await list(local), items);
+    assert.equal((await local.send({ type: 'status' })).changesSinceBackup, changeCount);
+  };
+
+  try {
+    site = await fixture();
+    const first = await addLocal('edge', master);
+    const hotpTitle = 'History HOTP fixture';
+    await add(first, hotpTitle, { totpUri: 'otpauth://hotp/History?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=0' });
+    const hotpId = (await list(first)).find(row => row.title === hotpTitle)?.id;
+    assert(hotpId);
+    const registration = await site.page(first);
+    const incremental = [await register(first, registration, -7, true), await register(first, registration, -8, true)];
+    const zero = await register(first, registration, -8);
+    await registration.close();
+    const originalItems = identities(await list(first));
+    await first.send({ type: 'webdav-create', input: dav.config, scratchFolder: 'scratch', masterPassword: master,
+      deviceName: 'History Edge fixture' });
+    const [original] = await history(first);
+    assert.equal(original.epoch, 1);
+    assert.equal(original.count, 4);
+    assert(original.current && original.time > 0);
+    const genesisTag = head().tag;
+    assert.deepEqual(await first.send({ type: 'next-hotp', id: hotpId }), { value: '755224', counter: '0', kind: 'hotp' });
+    for (const key of incremental) await assertFresh(first, key, 1);
+    // Make the first batch large enough to compact; the later single edit should not trigger another compaction.
+    for (let index = 1; index <= 5; index++) await add(first, `Added after history ${index}`, {}, randomBytes(1200).toString('hex'));
+    assert.equal((await sync(first)).pending, false);
+    await first.send({ type: 'open' }); // Normal opening schedules the idle compaction path.
+    await expect.poll(() => head()?.tag, { timeout: 20000, message: 'Idle compaction published a history entry' }).not.toBe(genesisTag);
+    await expect.poll(() => walNames().length, { timeout: 15000, message: 'Compaction finished cleaning its WALs' }).toBe(0);
+    assert.equal((await sync(first)).pending, false);
+    const [latest] = await history(first);
+    assert(latest.epoch > original.epoch && latest.count === 9);
+
+    await first.send({ type: 'change-password', currentPassword: master, newPassword: currentMaster });
+    assert.equal((await sync(first)).pending, false);
+    const second = await addLocal('helium', null);
+    await join(second, currentMaster);
+    const readOnly = await preview(second, original.id);
+    assert.deepEqual([readOnly.readOnly, readOnly.bulk, readOnly.blocked, readOnly.before, readOnly.after, readOnly.removed],
+      [true, true, false, 9, 4, 5]);
+    await second.send({ type: 'webdav-enable-write', scratchFolder: 'scratch', masterPassword: currentMaster });
+    const baseline = await list(second);
+    const changeCount = (await second.send({ type: 'status' })).changesSinceBackup;
+    const beforePreview = dav.requests.length;
+    const canceled = await preview(second, original.id);
+    assert(!canceled.readOnly && canceled.bulk);
+    await assertUnchanged(second, beforePreview, baseline, changeCount);
+
+    await add(first, 'Legitimate concurrent edit');
+    assert.equal((await sync(first)).pending, false);
+    await first.send({ type: 'lock' });
+    assert.equal((await sync(second)).pending, false);
+    const beforeItems = await list(second);
+    assert(beforeItems.some(row => row.title === 'Legitimate concurrent edit'));
+    const beforeChanges = (await second.send({ type: 'status' })).changesSinceBackup;
+    const stale = dav.requests.length;
+    await assert.rejects(restore(second, canceled, 'remote'), /重新预览/);
+    await assertUnchanged(second, stale, beforeItems, beforeChanges);
+
+    const headBeforeRestore = head();
+    const [beforeVersion] = await history(second);
+    const oldPath = `/dav/vault/${original.id}.bin`;
+    const historicalObject = dav.objects.get(oldPath);
+    assert(historicalObject, 'History is retained remotely');
+    const absent = dav.requests.length;
+    try {
+      dav.objects.delete(oldPath); // Fault only the synthetic server's historical object.
+      await assert.rejects(preview(second, original.id), /找不到/);
+      dav.objects.set(oldPath, { ...historicalObject, bytes: Buffer.concat([historicalObject.bytes, Buffer.from([0])]) });
+      await assert.rejects(preview(second, original.id), /CryptoAuthFailed|Invalid|无法验证/);
+    } finally { dav.objects.set(oldPath, historicalObject); }
+    await assertUnchanged(second, absent, beforeItems, beforeChanges);
+
+    const beforeConfirm = dav.requests.length;
+    const prepared = await preview(second, original.id);
+    assert.deepEqual([prepared.bulk, prepared.before, prepared.after, prepared.removed], [true, 10, 4, 6]);
+    await assert.rejects(restore(second, prepared, 'remote', master), /主密码/);
+    await assertUnchanged(second, beforeConfirm, beforeItems, beforeChanges);
+
+    const beforeRejectedWrite = dav.requests.length;
+    const retainedNames = [...dav.objects.keys()].sort();
+    dav.state.rejectNextHeadWrite = true;
+    await assert.rejects(restore(second, prepared, 'remote'), /重新预览/);
+    assert.equal(dav.state.rejectNextHeadWrite, false);
+    const rejected = writes(beforeRejectedWrite);
+    assert.equal(rejected.length, 3);
+    assert.deepEqual(rejected[1], { method: 'PUT', path: headPath, ifMatch: headBeforeRestore.tag });
+    assert.equal(rejected[0].method, 'PUT');
+    assert.equal(rejected[2].method, 'DELETE');
+    assert.equal(rejected[0].path, rejected[2].path, 'Only the unpublished snapshot may be deleted');
+    assert.deepEqual([...dav.objects.keys()].sort(), retainedNames);
+    assert.equal(head().tag, headBeforeRestore.tag);
+    assert.deepEqual(await list(second), beforeItems);
+    assert.equal((await second.send({ type: 'status' })).changesSinceBackup, beforeChanges);
+    assert.equal((await sync(second)).pending, false);
+
+    const beforePublish = dav.requests.length;
+    assert.equal(await restore(second, await preview(second, original.id), 'remote'), 4);
+    const headAfterRestore = head();
+    assert.notEqual(headAfterRestore.tag, headBeforeRestore.tag);
+    const [published] = await history(second);
+    assert.deepEqual([published.epoch, published.count, published.current], [beforeVersion.epoch + 1, 4, true]);
+    assert.notEqual(published.id, original.id);
+    const [snapshotPut, headPut, ...cleanup] = writes(beforePublish);
+    assert.deepEqual([snapshotPut.method, snapshotPut.path], ['PUT', `/dav/vault/${published.id}.bin`]);
+    assert.deepEqual([headPut.method, headPut.path, headPut.ifMatch], ['PUT', headPath, headBeforeRestore.tag]);
+    assert(cleanup.every(({ method }) => method === 'DELETE'));
+
+    await first.send({ type: 'unlock', password: currentMaster });
+    assert.equal((await sync(first)).kind, 'synced');
+    const recovered = await list(second);
+    assert.deepEqual(identities(recovered), originalItems);
+    assert.deepEqual(await list(first), recovered);
+    const replay = dav.requests.length;
+    try {
+      dav.objects.set(headPath, headBeforeRestore);
+      await assert.rejects(sync(first), /RollbackDetected/);
+      assert.deepEqual(await list(first), recovered);
+    } finally { dav.objects.set(headPath, headAfterRestore); }
+    assert.deepEqual(writes(replay), []);
+
+    const noWrites = dav.requests.length;
+    await assertFresh(second, zero, 0);
+    assert.equal((await sync(second)).pending, false);
+    assert.deepEqual(writes(noWrites), [], 'A zero-count assertion must not publish a WAL');
+    assert.deepEqual(await second.send({ type: 'next-hotp', id: hotpId }), { value: '287082', counter: '1', kind: 'hotp' });
+    for (const key of incremental) await assertFresh(second, key, 2);
+    await second.send({ type: 'lock' });
+    await first.send({ type: 'lock' });
+
+    const reader = await addLocal('edge', null);
+    const readStart = dav.requests.length;
+    await assert.rejects(join(reader, master));
+    assert.equal((await reader.send({ type: 'status' })).configured, false);
+    await join(reader, currentMaster);
+    const localOnly = await preview(reader, latest.id);
+    assert(localOnly.readOnly);
+    assert.equal(await restore(reader, localOnly, 'local'), 9);
+    assert.equal((await list(reader)).length, 9);
+    assert((await reader.send({ type: 'webdav-status' })).localRestoreHeld);
+    await sync(reader);
+    assert.equal((await list(reader)).length, 9);
+    assert.equal(head().tag, headAfterRestore.tag);
+    assert.deepEqual(writes(readStart), []);
+    console.log(JSON.stringify({ historyRecovery: ['Helium published a new epoch', 'Edge received the restored records'],
+      previewAndFailedConfirmNoWrites: true, missingAndCorruptHistoryRejected: true, staleConfirmRejected: true, head412Declined: true,
+      rollbackRejected: true, currentMasterWrapRetained: true, readOnlyRestore: true, hotpFrom: 0, hotpAfter: 1,
+      es256AndEd25519SignCountAfter: 2, defaultCountNoWal: true }));
+  } finally {
+    const browsersClosed = await Promise.allSettled(locals.reverse().map(local => local.close()));
+    const serversClosed = await Promise.allSettled([site?.done(), dav.close()]);
+    for (const cleanup of [...browsersClosed, ...serversClosed]) if (cleanup.status === 'rejected') {
+      console.error('History fixture cleanup failed:', cleanup.reason);
+      process.exitCode = 1;
+    }
+  }
+}
+
 async function run() {
   const site = await fixture();
   const dav = await webdavFixture();
@@ -520,4 +713,8 @@ async function run() {
     await dav.close();
   }
 }
-run().catch(error => { console.error(error); process.exitCode = 1; });
+const regress = async () => {
+  if (!process.argv.includes('--history-only')) await run();
+  await runHistoryRecovery();
+};
+regress().catch(error => { console.error(error); process.exitCode = 1; });

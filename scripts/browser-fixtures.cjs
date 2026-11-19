@@ -9,19 +9,16 @@ async function waitForBuiltInFilters(context, name) {
       target = targetInfos.find(target => target.type === 'background_page' && target.title === 'uBlock Origin');
       return !!target;
     }, { timeout: 20000, message: 'Wait for Helium built-in content blocker to start' }).toBe(true);
-  } finally { await cdp.detach(); }
-  if (!target) return;
-  const dashboard = await context.newPage();
-  try {
-    await dashboard.goto(new URL('/dashboard.html', target.url).href);
-    await dashboard.waitForFunction(() => new Promise(resolve => chrome.runtime.getBackgroundPage(background =>
-      resolve(background.µBlock?.readyToFilter === true && background.µBlock?.supportStats?.allReadyAfter !== '?' && background.vAPI?.net?.suspendDepth === 0))),
-    undefined, { timeout: 60000 });
+    // Helium's first-run UI can replace tabs while the built-in background page is already alive.
+    await expect.poll(() => evaluateBrowserTarget(cdp, target.targetId,
+      `globalThis.µBlock?.readyToFilter === true && globalThis.µBlock?.supportStats?.allReadyAfter !== '?' &&
+       globalThis.vAPI?.net?.suspendDepth === 0`),
+    { timeout: 60000, message: 'Wait for the Helium content blocker to finish initializing' }).toBe(true);
     console.log('Helium built-in filters ready');
-  } finally { await dashboard.close(); }
+  } finally { await cdp.detach(); }
 }
-// Toolbar Popups have CDP targets but are not exposed as Playwright Pages.
-async function evaluateNativePopup(cdp, targetId, expression) {
+// Toolbar Popups and the built-in filter background page are not exposed as Playwright Pages.
+async function evaluateBrowserTarget(cdp, targetId, expression) {
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: false });
   let listener, timer;
   try {
@@ -31,11 +28,11 @@ async function evaluateNativePopup(cdp, targetId, expression) {
         const message = JSON.parse(event.message);
         if (message.id !== 1) return;
         const error = message.error?.message ?? message.result?.exceptionDetails?.exception?.description ?? message.result?.exceptionDetails?.text;
-        if (error) reject(new Error(`Could not read the native Popup: ${error}`));
+        if (error) reject(new Error(`Could not evaluate the browser target: ${error}`));
         else resolve(message.result.result.value);
       };
       cdp.on('Target.receivedMessageFromTarget', listener);
-      timer = setTimeout(() => reject(new Error('Native Popup did not respond')), 4000);
+      timer = setTimeout(() => reject(new Error('Browser target did not respond')), 4000);
     });
     const [, value] = await Promise.all([
       cdp.send('Target.sendMessageToTarget', {
@@ -50,4 +47,4 @@ async function evaluateNativePopup(cdp, targetId, expression) {
     await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => undefined);
   }
 }
-module.exports = { waitForBuiltInFilters, evaluateNativePopup };
+module.exports = { waitForBuiltInFilters, evaluateNativePopup: evaluateBrowserTarget };

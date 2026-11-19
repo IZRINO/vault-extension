@@ -6,7 +6,7 @@ async function webdavFixture() {
   const folders = new Set(['/dav/', '/dav/scratch/']);
   const requests = [];
   let generation = 0;
-  const state = { failWal: false };
+  const state = { failWal: false, rejectNextHeadWrite: false };
   const row = (path, folder, obj = objects.get(path)) => `<D:response><D:href>${path}</D:href><D:propstat>` +
     `<D:prop><D:resourcetype>${folder ? '<D:collection/>' : ''}</D:resourcetype>` +
     (obj ? `<D:getetag>${obj.tag}</D:getetag><D:getcontentlength>${obj.bytes.length}</D:getcontentlength>` : '') +
@@ -17,8 +17,7 @@ async function webdavFixture() {
     if (!/^\/dav\/[a-zA-Z0-9_./-]*$/.test(path) || url.search) { res.writeHead(404).end(); return; }
     const auth = 'Basic ' + Buffer.from('fixture-user:fixture-app-password').toString('base64');
     if (req.headers.authorization !== auth) { res.writeHead(401).end(); return; }
-    requests.push({ method: req.method, path });
-    const existing = objects.get(path);
+    requests.push({ method: req.method, path, ifMatch: req.headers['if-match'] });
     if (req.method === 'PROPFIND') {
       req.resume();
       if (req.headers.depth !== '1' || !folders.has(path)) { res.writeHead(404).end(); return; }
@@ -31,6 +30,7 @@ async function webdavFixture() {
       if (folders.has(path)) { res.writeHead(405).end(); return; }
       folders.add(path); res.writeHead(201).end();
     } else if (req.method === 'GET') {
+      const existing = objects.get(path);
       if (!existing) res.writeHead(404).end();
       else if (req.headers['if-none-match'] === existing.tag) res.writeHead(304).end();
       else res.writeHead(200, { ETag: existing.tag }).end(existing.bytes);
@@ -40,8 +40,14 @@ async function webdavFixture() {
       for await (const chunk of req) bytes.push(chunk);
       const match = req.headers['if-match'];
       const absent = req.headers['if-none-match'] === '*';
+      const existing = objects.get(path); // Compare and commit against the state after the request body arrives.
       if ((match && match !== existing?.tag) || (absent && existing)) { res.writeHead(412).end(); return; }
       if (!match && (!absent || req.method === 'DELETE')) { res.writeHead(400).end(); return; }
+      if (state.rejectNextHeadWrite && req.method === 'PUT' && match && path === '/dav/vault/head.bin') {
+        state.rejectNextHeadWrite = false;
+        res.writeHead(412).end();
+        return;
+      }
       if (req.method === 'DELETE') { objects.delete(path); res.writeHead(204).end(); return; }
       objects.set(path, { bytes: Buffer.concat(bytes), tag: `"fixture-${++generation}"` });
       res.writeHead(201).end();

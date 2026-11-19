@@ -35,6 +35,8 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 
 可把 `VAULT_EXTENSION_PATH` 指向同一个解压目录，再跑 `test:smoke`、`test:phase-2`、`test:autofill`、`test:migration`、`test:data-safety`、`test:sidepanel`、`test:passkeys`。`test:migration` 加 `VAULT_QR_NATIVE=1` 才会操作原生工具栏 Popup 并测到候选可操作且完成绘制；`VAULT_QR_FIRST=dark` 会在新配置中先扫暗码。`test:wakeup` 需可启动原生窗口，`VAULT_WAKE_ITEMS=1000` 另写 `test-results/wakeup-1000.json`。HTTP 可见预览只查界面，不作为浏览器扩展权限或数据证明。
 
+`node scripts/test-passkeys.cjs --history-only` 只跑双端 WebDAV 历史恢复；不带参数时也会执行它。使用独立配置、本机 HTTP WebDAV 和双栈回环 RP，不连接真实网盘。
+
 ## 本机记录
 
 - 归档：`test-results/Vault-2026-11-20-6043489c46a1-chrome.zip`，5,985,824 B。SHA-256：`6043489c46a1191d7cc417d16a80654c4963a38f61372fabbbfe186d2810315b`。解压目录：`test-results/release-unpacked-6043489c46a1`。
@@ -57,6 +59,14 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 - Edge `157.0.4341.60`、Helium `157.0.8103.78` 从同一解压树通过安装冒烟、二期、迁移、备份防丢、自动填充、原生侧栏和 Passkey 回归。原生 Popup 亮码首扫候选完成绘制：Edge 229.8 ms，Helium **108.3 ms**（T03 只以 Helium 的 `<200 ms` 为门槛）；这份包未单独重测暗码，先前暗码数据见[冷开补测记录](cold-wake-diagnostics.md)。
 - T28 使用 Authenticode 验签有效的 KeePassXC CLI 2.8.0 写加密 4.1 文件，核对分组、密码历史、TOTP 和不透明用户句柄。两种 PKCS#8 PEM 写法及 StrongBox 字段优先级均已覆盖；Edge、Helium 从同一解压包导入后分别用原公钥通过 3 次本机 RP 验签，覆盖 ES256、Ed25519，不把源 `BS` 当目标备份证据。两种 AES-KDF 标识使用原 500 万轮上限，官方 128 MiB Argon2d Demo 在解密前按 96 MiB 预算拒绝。[样本来源和复现](agents/keepassxc-passkey-research.md#当前回归入口)。
 - 规范轴审查确认厂商字段按来源限长、备份只协调相关凭证、浏览器测试只用合成数据和回环服务。规格轴将本机验签和真实网站/设备验收分开；实体设备、真实网盘及其它应用互通仍按约定未签收。
+
+### 双端历史恢复候选（2026-11-20）
+
+- ZIP：`test-results/Vault-2026-11-20-3723977d3a21-chrome.zip`（5,994,963 B），SHA-256 `3723977d3a21c374e556b08307df209badd7d59102d4f0c803249d361cf29510`。解压目录：`test-results/release-unpacked-3723977d3a21`，52 个文件，树摘要 `7abbf7b574d4ac97bd6f3cc50942adcdb52e221daaf2d194a90151604d4002fb`。和上一包相比仅 `background.js` 内容变化：历史列表和只读恢复等待全部请求完成后才清除连接凭据。生产 MV3 `0.0.0` 清单、CSP 通过，主 WASM 255,677 B。
+- Rust 57 项、Vitest 80 项、TypeScript 通过。Edge `157.0.4341.60`、Helium `157.0.8103.78` 从同一解压目录通过冒烟、二期、迁移、备份防丢、填充、原生侧栏、Passkey 和官方 KeePassXC 夹具回归。两次 Passkey 启动在 Helium 过滤器仪表盘关闭时中断；改为从同一内置后台页读取原就绪条件后，全套通过。未关闭或跳过拦截器。
+- T18 从正常建库和空闲压实生成历史。Helium 以当前主密码条件写发布新 epoch，Edge 重拉后逐条匹配恢复结果，旧主密码不能加入。预览、错密、过期确认、缺失或损坏历史，以及重放已被替代的 head 均不更改凭证或远端对象；服务端返回 `412` 时只清理本次尚未发布的快照。另验证只读配置可恢复到本机，后续同步不写网盘。
+- T18/T23 在 Edge 用掉 HOTP 计数 0 及两种 Passkey 的计数 1，Helium 恢复后得到 RFC 4226 的计数 1 动态码、并用原公钥验两种算法的新挑战和计数 2。默认零计数断言不增加待备份变更，立即同步无 WAL 上传；缺可信计数暂停另有 Rust/WASM 覆盖。以上是合成凭证和本机服务证据，不替代真实第三方服务或实体认证器操作。
+- 同包亮、暗码分别用新配置运行原生 Popup 首扫。可操作候选完成绘制：Helium **109.9 / 122.7 ms**，Edge **239.0 / 235.0 ms**；两项 Helium 实测达 T03 的 `<200 ms`。本轮不重测千条库冷开，仍引用[独立冷开记录](cold-wake-diagnostics.md)，正式发布门槛未达。
 
 同步快照新增的来源记录在认证密文内，当前版可读没有来源的旧快照。旧客户端读不懂新字段时会停止同步写回；先升级各设备再试用新版同步。
 
