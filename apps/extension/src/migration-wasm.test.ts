@@ -36,8 +36,8 @@ function aesSeal(key: Buffer, nonce: Buffer, body: Buffer) {
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
   return { body: Buffer.concat([cipher.update(body), cipher.final()]), tag: cipher.getAuthTag() };
 }
-function twofasSeal(n: number, bytes: Buffer) {
-  const salt = Buffer.alloc(32, 10 + n), nonce = Buffer.alloc(12, 12 + n);
+function twofasSeal(n: number, bytes: Buffer, saltLength = 32) {
+  const salt = Buffer.alloc(saltLength, 10 + n), nonce = Buffer.alloc(12, 12 + n);
   const encrypted = aesSeal(pbkdf2Sync(filePassword, salt, 10_000, 32, 'sha256'), nonce, bytes);
   return [Buffer.concat([encrypted.body, encrypted.tag]), salt, nonce].map(b64).join(':');
 }
@@ -103,6 +103,37 @@ describe('authenticator migration with independently generated fixtures', () => 
     expect(parseAuth('2fas', bin({ schemaVersion: 4, services })).rows).toHaveLength(1);
     expect(() => parseAuth('2fas', bin(outer), 'not-correct')).toThrow();
     expect(() => parseAuth('2fas', bin({ ...outer, reference: 'x:y:z' }), filePassword)).toThrow();
+  });
+  it('accepts the 256-byte salt used by 2FAS exports without accepting larger salts', () => {
+    const services = [{ name: 'Service', secret: base32, otp: { tokenType: 'HOTP', algorithm: 'SHA1', digits: 8, counter: 7 } }];
+    const input = { schemaVersion: 4, reference: twofasSeal(1, Buffer.from('reference'), 256),
+      servicesEncrypted: twofasSeal(2, bin(services), 256) };
+    const result = parseAuth('2fas', bin(input), filePassword);
+    expect(result.rows.map(codeAt)).toEqual([independentCode('sha1', 7, 8)]);
+    expect(() => parseAuth('2fas', bin(input), 'incorrect')).toThrow(/认证失败/);
+    expect(() => parseAuth('2fas', bin({ ...input, servicesEncrypted: twofasSeal(2, bin(services), 257) }), filePassword)).toThrow(/上限/);
+  });
+  it('reads schema 2 2FAS services without mistaking the service type for an OTP type', () => {
+    const service = { name: 'Service', secret: base32, type: 'Unknown',
+      otp: { account: 'fixture-user', algorithm: 'SHA256', digits: 8, period: 50 } };
+    const result = parseAuth('2fas', bin({ schemaVersion: 2, services: [
+      service, { ...service, otp: { ...service.otp, tokenType: 'unsupported' } },
+    ] }));
+    expect(result.rows.map(codeAt)).toEqual([independentCode('sha256', Math.floor(now / 50), 8)]);
+    expect(result.rows[0].data.username).toBe('fixture-user');
+    expect(result.unsupported).toBe(1);
+  });
+  it('does not coerce malformed 2FAS OTP metadata to a TOTP credential', () => {
+    const service = { name: 'Service', secret: base32, type: 'Unknown' };
+    const malformed = [null, { tokenType: false }, { tokenType: '' }].map(otp => ({ ...service, otp }));
+    const result = parseAuth('2fas', bin({ schemaVersion: 2, services: malformed }));
+    expect(result.rows).toHaveLength(0);
+    expect(result.invalid).toBe(malformed.length);
+  });
+  it('does not import plaintext services from an incomplete encrypted 2FAS backup', () => {
+    const services = [{ name: 'Service', secret: base32, otp: { tokenType: 'TOTP' } }];
+    const input = { schemaVersion: 4, reference: twofasSeal(1, Buffer.from('reference')), services };
+    expect(() => parseAuth('2fas', bin(input), filePassword)).toThrow(/格式无效/);
   });
   it('authenticates Aegis password slots and database before retaining group and HOTP counter', () => {
     const outer = aegisSeal();

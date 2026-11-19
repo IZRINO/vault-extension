@@ -116,6 +116,37 @@ async function verifyGoogleImages(page, send, reply) {
   assert.deepEqual(await send({ type: 'next-hotp', id: hotp.id }), { kind: 'hotp', value: '162583', counter: '7' });
   assert.deepEqual(await send({ type: 'next-hotp', id: hotp.id }), { kind: 'hotp', value: '399871', counter: '8' });
 }
+async function verifyEncrypted2fas(send, reply) {
+  const file = process.env.VAULT_2FAS_FIXTURE_PATH;
+  if (!file) return 'skipped';
+  // Public synthetic Aegis importer fixture; see docs/agents/authenticator-backup-fixtures.md.
+  const bytes = await fs.readFile(file);
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), '0e769224ea2778f9b2d6467d9185efdcba2e4914541c3d3f36b687018bf789c9');
+  const ids = async () => (await send({ type: 'list' })).map(row => row.id).sort();
+  const original = await ids();
+  const input = { format: '2fas', bytes: [...bytes], password: 'test' };
+  const preview = await send({ ...input, type: 'preview-auth-backup' });
+  assert.equal(preview.ready, 5);
+  assert(preview.sample.every(row => !Object.hasOwn(row, 'data')));
+  const confirm = { ...input, type: 'import-auth-backup', stamp: preview.stamp, proof: { method: 'master', secret: master } };
+  assert.equal((await reply({ ...confirm, password: 'incorrect' })).ok, false);
+  assert.deepEqual(await ids(), original, 'Preview and failed authentication must not modify the vault');
+  await send(confirm);
+  const added = (await ids()).filter(id => !original.includes(id));
+  assert.equal(added.length, 5);
+  const rows = await Promise.all(added.map(id => send({ type: 'get', id })));
+  assert(rows.every(row => row.otp && !Object.hasOwn(row.data, 'totpUri')));
+  const codes = [];
+  for (const row of rows.filter(row => row.otp.kind === 'hotp')) codes.push(await send({ type: 'next-hotp', id: row.id }));
+  // Independently derived from the upstream file using Node AES-GCM and HMAC.
+  assert.deepEqual(codes.sort((a, b) => Number(a.counter) - Number(b.counter)), [
+    { kind: 'hotp', counter: '1', value: '253717' },
+    { kind: 'hotp', counter: '50', value: '4444976' },
+    { kind: 'hotp', counter: '10300', value: '24622277' },
+  ]);
+  assert.equal((await send({ ...input, type: 'preview-auth-backup' })).ready, 0);
+  return true;
+}
 async function nativePopupQr(cdp, id, existingTargets) {
   let target;
   await expect.poll(async () => {
@@ -367,11 +398,12 @@ async function run(name, server) {
     await website.close();
     await page.bringToFront();
     await verifyGoogleImages(page, send, reply);
+    const encrypted2fasFixture = await verifyEncrypted2fas(send, reply);
     assert.deepEqual(errors, []);
     const result = { browser: name, version: context.browser().version(), portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,
       fourTypesAndPreservedFields: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrFirstColor: firstColor,
       first, following, popup, switchedTabInvalidated: true, canceledScanAndChoice: true, noSaveUntilConfirmed: true,
-      noActiveTabRejected: true, canvasOverrideIgnored: true, googleBatchImages: true, errors };
+      noActiveTabRejected: true, canvasOverrideIgnored: true, googleBatchImages: true, encrypted2fasFixture, errors };
     console.log(JSON.stringify(result));
     return result;
   } finally {

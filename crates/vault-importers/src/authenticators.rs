@@ -214,7 +214,8 @@ fn aegis(bytes: &[u8], password: &str) -> Result<Batch> {
 fn twofas_open(text: &str, password: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut iter = text.split(':');
     let (encrypted, salt, nonce) = (b64(iter.next().ok_or(INVALID)?)?, b64(iter.next().ok_or(INVALID)?)?, b64(iter.next().ok_or(INVALID)?)?);
-    if iter.next().is_some() || !(16..=64).contains(&salt.len()) { return Err(INVALID); }
+    // The app generates 256-byte salts; continue accepting the previously supported shorter salts.
+    if iter.next().is_some() || (salt.len() != 256 && !(16..=64).contains(&salt.len())) { return Err(INVALID); }
     let mut key = Zeroizing::new([0; 32]);
     pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), &salt, 10_000, key.as_mut());
     gcm(key.as_ref(), &nonce, encrypted)
@@ -223,22 +224,36 @@ fn twofas_open(text: &str, password: &str) -> Result<Zeroizing<Vec<u8>>> {
 fn twofas(bytes: &[u8], password: &str) -> Result<Batch> {
     let root = Json::read(bytes)?;
     if !matches!(number(&root.0, "schemaVersion"), Some(2..=4)) { return Err("不支持该 2FAS 备份版本。"); }
+    let field = |name| match &root.0[name] {
+        Value::String(text) => Ok(text.as_str()),
+        Value::Null => Ok(""),
+        _ => Err(INVALID),
+    };
+    let (reference, encrypted) = (field("reference")?, field("servicesEncrypted")?);
     let decrypted;
-    let services = if let Some(encrypted) = root.0["servicesEncrypted"].as_str().filter(|value| !value.is_empty()) {
+    let services = if reference.is_empty() && encrypted.is_empty() { &root.0["services"] } else {
+        if reference.is_empty() || encrypted.is_empty() { return Err(INVALID); }
         if password.is_empty() { return Err(PASSWORD); }
-        let reference = str_at(&root.0, "reference");
-        if reference.is_empty() { return Err(INVALID); }
         twofas_open(reference, password)?;
         decrypted = Json::read(&twofas_open(encrypted, password)?)?;
         &decrypted.0
-    } else { &root.0["services"] };
+    };
     let groups: BTreeMap<&str, &str> = root.0["groups"].as_array().into_iter().flatten()
         .map(|group| (str_at(group, "id"), str_at(group, "name"))).collect();
     let mut batch = Batch::default();
     for row in array(services)? {
-        let otp = &row["otp"];
+        let Some(otp) = row.get("otp").filter(|value| value.is_object()) else {
+            batch.invalid += 1;
+            continue;
+        };
+        // The outer type describes the service, not the OTP; schema 2 may omit tokenType.
+        let kind = match otp.get("tokenType") {
+            None | Some(Value::Null) => "totp",
+            Some(Value::String(text)) if !text.trim().is_empty() => text.as_str(),
+            _ => { batch.invalid += 1; continue; },
+        };
         let tag = groups.get(str_at(row, "groupId")).filter(|s| !s.is_empty()).map(|s| (*s).to_owned());
-        batch.push(Mapping { kind: first(&[str_at(otp, "tokenType"), str_at(row, "type"), "totp"]),
+        batch.push(Mapping { kind,
             account: first(&[str_at(otp, "account"), str_at(otp, "label")]), issuer: str_at(otp, "issuer"),
             title: str_at(row, "name"), secret: str_at(row, "secret"), algorithm: str_at(otp, "algorithm"),
             digits: number(otp, "digits"), period: number(otp, "period"), counter: number(otp, "counter"),

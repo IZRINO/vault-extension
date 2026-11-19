@@ -2,7 +2,7 @@
 
 2026-11-20。对应[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)与[工单 T01–T38](development-tickets.md)。生产 ZIP 不等于正式准出；不代签，也不把模拟证据当作系统设备、第三方服务或应用互通的证据。
 
-当前可安装包见[主密码轮换与设备认领候选](#主密码轮换与设备认领候选2026-11-20)。正式准出仍未通过。
+当前可安装包见[2FAS 备份兼容候选](#2fas-备份兼容候选2026-11-20)。正式准出仍未通过。
 
 ## 实现范围
 
@@ -13,7 +13,7 @@
 | T13–T18、T20 | 三方字段合并、加密待裁决区、全页裁决、落选密码历史、主密码旋转、设备认领和加密来源记录、滚动五份历史、历史预览/恢复、异库合入。 | 一个离线登录命中多个远端候选时一同展示；更晚的重叠草稿加密留在本机，无关项仍可同步。双份继承二次验证，同一递增凭证只保留一份可用计数。自动覆盖并发 WAL、条件提交、两处压实中断、30 天回收站边界、历史重放拒绝、计数恢复、不同身份合入。找不到祖先或不能保留新字段时停止写回；两家真实 WebDAV 尚未验收。 |
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
 | T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey、KeePass KDBX、1Password 1PUX、Proton JSON/ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。未代签 KeePassXC-Browser 或其他厂商应用与外部网站的真实互通。 |
-| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。 | 独立算法生成的合成测试核对 TOTP/HOTP、批次、错密和重复，原生应用导出样本尚未齐备；不能等同厂家验收。 |
+| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。 | 有独立合成回归，以及 [2FAS、Aegis、andOTP、Stratum 公开夹具](agents/authenticator-backup-fixtures.md)；原生来源样本尚未齐备，不等同厂家或设备验收。 |
 | T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 冷开 `<50 ms` 未达，正式发布准出和真实站点/设备验收不能签收。 |
 
 ### 格式限制
@@ -81,6 +81,12 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 - Edge `157.0.4341.60` 与 Helium `157.0.8103.78` 从同一解压包通过安装冒烟、主密码轮换、设备认领与历史恢复。T15 的改密码和恢复码重置均只条件更新 `head.bin`；两个客户端锁定期间零新 WebDAV 请求。Helium 重启保留待验证标记和一笔本地 WAL，验证新主密码后续传给 Edge，旧包装、旧口令及旧头均被拒绝；用新主密码重新配置 PIN 和合成 PRF 后可用。合成 PRF 不等同实体 Hello。
 - T16：同系统、同浏览器只提示候选，不自动认领。错密不写远端；通过主密码认领后保留原逻辑身份和初次登记时间。原实例仍在线，各自的 WAL 使用不同短码，旧对象不变，各端收到两份编辑且不重复。设备别名与标识不出现在远端文件名或对象明文字节；移除设备元数据不删凭证、不宣称撤销密钥。
 - 同系列的 `c236bd5459ff` 阶段包在双端各测 10 次千条库原生冷开：Popup DOM 中位数 Edge **584.27 ms**、Helium **586.79 ms**；WASM 恢复 **71.90 / 68.10 ms**，仍超出 `<50 / <5 ms`。报告为 `test-results/wakeup-1000.key-update-c236bd5459ff.json`。相对[此前补测](cold-wake-diagnostics.md)，差异主要出现在 Worker 时间原点之前；两边认证与解码仍约 17 ms。这不是同次 A/B，不能从两批结果归因。最终包未重复这一同机测量，仍不签收 T01/T36 性能。
+
+### 2FAS 备份兼容候选（2026-11-20）
+
+- ZIP：`test-results/Vault-2026-11-20-fd83a6c5d193-chrome.zip`（5,995,533 B），SHA-256 `fd83a6c5d1938dc071460fc2718bdcc5a8144bbcbceda987cc33dcd27d7fca69`；解压目录 `test-results/release-unpacked-fd83a6c5d193`，52 个文件，树摘要 `09d3b55bcb8e7cd3d1ea7b275edefd27219949487ad66af9ad5763ffd754079d`。相对轮换候选只变 CSV、Ente 与迁移 Worker；修复的导入 WASM（2,396,643 B）按内容哈希确认只位于这三个按需 Worker。生产 MV3、CSP 及权限通过，主核未变（255,677 B）。Rust 57 项，Vitest 86 项，TypeScript 通过。
+- T32：原应用的 256 字节盐不再误拒；旧版没有 OTP 类型的条目不再被外层服务类型挡掉。错密、超限、缺段及任一段认证失败仍拒绝，畸形 OTP 元数据不会变成可用的 TOTP。6 份 Aegis 上游公开 `.2fas`（schema 2/3/4 明文、加密）逐条比对账号、参数和独立出码。Aegis、andOTP、Stratum 的另外 5 个夹具经相同测试入口验证解析；原样本分组和未测变体的边界见[复现文档](agents/authenticator-backup-fixtures.md)。
+- Edge `157.0.4341.60`、Helium `157.0.8103.78` 从本解压包通过迁移回归：公开 2FAS v4 加密样本预览和错密不写库，确认导入 5 条，以原计数对照 3 个 HOTP，无种子及重复。中间包 `b460fb791b2a` 另通过双端二期、备份防丢；随后只收紧畸形 OTP 字段，最终包不把前一包的二期证据当成同包全量准出。
 
 ### 外部夹具
 
