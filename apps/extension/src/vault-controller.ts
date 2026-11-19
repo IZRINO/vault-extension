@@ -220,6 +220,10 @@ export class VaultController {
     return locking;
   }
 
+  private needsRemoteKey(files: store.VaultFiles) {
+    return files.remoteKeyUpdate ?? store.loadRemoteAnchor(files.vaultId).then(anchor => !!anchor?.observedHead);
+  }
+
   private async prepare() {
     const generation = this.generation;
     if (!this.core) performance.mark('vault:prepare');
@@ -241,6 +245,17 @@ export class VaultController {
       if (!saved) return;
       const now = Date.now();
       if (!files || idle === 'locked' || saved.lastActivityMs > now || now - saved.lastActivityMs >= settings.autoLockMinutes * 60000) {
+        await this.lock(false);
+        return;
+      }
+      // An interrupted sync can persist a new remote wrap before clearing storage.session.
+      let needsRemoteKey = files.remoteKeyUpdate;
+      if (!memorySession && needsRemoteKey === undefined) {
+        needsRemoteKey = await this.needsRemoteKey(files);
+        if (generation !== this.generation) return;
+        this.files = { ...files, remoteKeyUpdate: needsRemoteKey };
+      }
+      if (needsRemoteKey) {
         await this.lock(false);
         return;
       }
@@ -487,7 +502,7 @@ export class VaultController {
       });
       const { authenticated, head, snap, objects, result } = restored;
       const files: store.VaultFiles = { vaultId: authenticated.vaultId, keyEpoch: authenticated.keyEpoch, head: new Uint8Array(result.head),
-        snap: new Uint8Array(result.snap), updatedAtMs: Date.now(), changesSinceBackup: 0 };
+        snap: new Uint8Array(result.snap), updatedAtMs: Date.now(), changesSinceBackup: 0, remoteKeyUpdate: false };
       const anchor: store.RemoteAnchor = { vaultId: files.vaultId, endpoint: await endpointFingerprint(config.url), head: head.bytes, snap: snap.bytes,
         etag: head.etag, objects, appliedHead: files.head, appliedSnap: files.snap, hasRecords: result.count > 0, checkedAt: Date.now(),
         conflicts: new Uint8Array(result.conflicts), conflictCount: result.conflictCount, draftCount: result.draftCount };
@@ -565,7 +580,7 @@ export class VaultController {
       delete settings.pinWrap; delete settings.prf; settings.pinFailures = 0;
       await store.saveSettings(settings);
       check();
-      const nextFiles = { ...files, head: nextHead, keyEpoch: remote.keyEpoch };
+      const nextFiles = { ...files, head: nextHead, keyEpoch: remote.keyEpoch, remoteKeyUpdate: false };
       await store.saveRemoteAnchor({ ...anchor, observedHead: undefined, observedKeyEpoch: undefined, rotationFrom: undefined, checkedAt: undefined },
         nextFiles, undefined, false, false);
       this.files = nextFiles;
@@ -758,7 +773,8 @@ export class VaultController {
     const settings = this.settings!;
     if (message.type === 'status') {
       const status = this.status();
-      if (!status.unlocked && this.files && (await store.loadRemoteAnchor(this.files.vaultId))?.observedHead) return { ...status, remoteKeyUpdate: true };
+      if (!status.unlocked && this.files && await this.needsRemoteKey(this.files))
+        return { ...status, remoteKeyUpdate: true };
       return status;
     }
     if (message.type === 'webdav-update-key') return this.remoteKeyUpdate(message.password, check);
@@ -780,7 +796,8 @@ export class VaultController {
     }
     if (message.type === 'open') {
       const opening: VaultOpening = { status: this.status() };
-      if (!opening.status.unlocked && this.files && (await store.loadRemoteAnchor(this.files.vaultId))?.observedHead) opening.status.remoteKeyUpdate = true;
+      if (!opening.status.unlocked && this.files && await this.needsRemoteKey(this.files))
+        opening.status.remoteKeyUpdate = true;
       if (opening.status.unlocked) {
         const touch = this.touch();
         try {
@@ -809,7 +826,7 @@ export class VaultController {
         const output = await derive<Created>('wasm_create_new_vault', [message.masterPassword, params.mCostKib, params.tCost, params.pCost, key, Date.now()]);
         check();
         this.files = { head: new Uint8Array(output.head), snap: new Uint8Array(output.snap), vaultId: output.vaultId,
-          keyEpoch: output.keyEpoch, updatedAtMs: Date.now(), changesSinceBackup: 0 };
+          keyEpoch: output.keyEpoch, updatedAtMs: Date.now(), changesSinceBackup: 0, remoteKeyUpdate: false };
         await store.saveVaultFiles(this.files);
         await this.activate(key, output.wrap, check);
         return { recoveryCode: output.recoveryCode, vaultId: output.vaultId };
@@ -817,7 +834,7 @@ export class VaultController {
     }
     if (!this.files) throw new Error('请先创建密码库。');
     if (['unlock', 'unlock-pin', 'unlock-prf', 'recover', 'change-password'].includes(message.type) &&
-        (await store.loadRemoteAnchor(this.files.vaultId))?.observedHead) throw new Error('请先用远端库的新主密码验证。');
+        await this.needsRemoteKey(this.files)) throw new Error('请先用远端库的新主密码验证。');
     if (message.type === 'unlock-pin') { await this.withPinAttempt(message.pin, check); return this.status(); }
     if (message.type === 'unlock' || message.type === 'unlock-prf') {
       const key = randomBytes(32);

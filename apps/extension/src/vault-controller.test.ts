@@ -17,10 +17,11 @@ import type { JournalCommit, LocalSettings, SessionState, VaultFiles } from './v
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
-  failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown> }));
+  failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown>,
+  observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
-  loadRemoteAnchor: async () => undefined,
+  loadRemoteAnchor: async () => structuredClone(state.observedKeyUpdate),
   loadJournal: async () => ({ clock: structuredClone(state.pendingWal.at(-1)?.state), legacy: state.legacy }),
   saveVaultFiles: async (files: VaultFiles, change?: JournalCommit) => {
     if (state.failSave) throw new Error('Test disk write failed');
@@ -116,6 +117,7 @@ beforeEach(() => {
   state.pendingWal = [];
   state.legacy = false;
   state.local = {};
+  state.observedKeyUpdate = undefined;
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
     idle: { queryState: async () => state.idleState },
@@ -323,6 +325,29 @@ describe('real WASM + background session integration', () => {
     await lock;
     expect(await status).toMatchObject({ configured: true, unlocked: false });
     await expect(recreated.handle({ type: 'list' })).rejects.toThrow('解锁');
+  });
+
+  it.each([true, undefined])('requires the new master password if rotation was durably observed before session cleanup (%s)', async remoteKeyUpdate => {
+    const controller = await unlocked();
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Offline edit')) });
+    state.files = { ...state.files!, remoteKeyUpdate };
+    const previousFiles = structuredClone(state.files);
+    const pending = structuredClone(state.pendingWal);
+    const observation = {
+      // Only the durable observation is needed here; sync bootstrap tests authenticate the actual remote head.
+      observedHead: new Uint8Array([1]),
+      observedKeyEpoch: fixture.keyEpoch + 1,
+    };
+    state.observedKeyUpdate = observation;
+    const restarted = new VaultController();
+    await expect(restarted.handle({ type: 'open' })).resolves.toEqual({
+      status: expect.objectContaining({ configured: true, unlocked: false, remoteKeyUpdate: true }),
+    });
+    expect(state.session).toBeUndefined();
+    await expect(restarted.handle({ type: 'list' })).rejects.toThrow('先解锁');
+    await expect(restarted.handle({ type: 'unlock', password })).rejects.toThrow('新主密码');
+    expect(state.files).toEqual(previousFiles);
+    expect(state.pendingWal).toEqual(pending);
   });
   it('leaves the vault locked when a new worker finds Windows already locked', async () => {
     await unlocked();

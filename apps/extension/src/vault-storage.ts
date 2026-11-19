@@ -31,6 +31,8 @@ export interface RemoteAnchor {
 export interface VaultFiles {
   head: Uint8Array; snap: Uint8Array; vaultId: string; keyEpoch: number;
   updatedAtMs: number; changesSinceBackup: number;
+  /** Saved with the remote anchor so a cold worker can reject an obsolete session without loading the anchor. */
+  remoteKeyUpdate?: boolean;
   /** Absolute change count covered by the latest confirmed backup; absent on older vaults. */
   backedUpChangeCount?: number;
   everHadRecords?: boolean;
@@ -86,7 +88,8 @@ export async function saveRemoteAnchor(anchor: RemoteAnchor, files: VaultFiles, 
     for (let cursor = await pending.openCursor(); cursor; cursor = await cursor.continue())
       if (cursor.value.vaultId === anchor.vaultId) await cursor.delete();
   }
-  await Promise.all([tx.objectStore('remoteState').put(anchor, anchor.vaultId), vault.put(files, 'active'),
+  await Promise.all([tx.objectStore('remoteState').put(anchor, anchor.vaultId),
+    vault.put({ ...files, remoteKeyUpdate: !!anchor.observedHead }, 'active'),
     consume ? tx.objectStore('pendingChanges').delete('hotp-snapshot') : undefined,
     clock ? tx.objectStore('journal').put(clock, anchor.vaultId) : undefined, tx.done]);
 }

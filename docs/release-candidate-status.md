@@ -2,6 +2,8 @@
 
 2026-11-20。对应[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)与[工单 T01–T38](development-tickets.md)。生产 ZIP 不等于正式准出；不代签，也不把模拟证据当作系统设备、第三方服务或应用互通的证据。
 
+当前可安装包见[主密码轮换与设备认领候选](#主密码轮换与设备认领候选2026-11-20)。正式准出仍未通过。
+
 ## 实现范围
 
 | 工单 | 本轮实现或继承 | 证据与边界 |
@@ -37,6 +39,8 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 
 `node scripts/test-passkeys.cjs --history-only` 只跑双端 WebDAV 历史恢复；不带参数时也会执行它。使用独立配置、本机 HTTP WebDAV 和双栈回环 RP，不连接真实网盘。
 
+`node scripts/test-sync-lifecycle.cjs` 验证远端主密码轮换、重新配置本机包装及重装设备认领；使用相同的本机故障服务和独立配置。
+
 ## 本机记录
 
 - 归档：`test-results/Vault-2026-11-20-6043489c46a1-chrome.zip`，5,985,824 B。SHA-256：`6043489c46a1191d7cc417d16a80654c4963a38f61372fabbbfe186d2810315b`。解压目录：`test-results/release-unpacked-6043489c46a1`。
@@ -69,6 +73,14 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 - 同包亮、暗码分别用新配置运行原生 Popup 首扫。可操作候选完成绘制：Helium **109.9 / 122.7 ms**，Edge **239.0 / 235.0 ms**；两项 Helium 实测达 T03 的 `<200 ms`。本轮不重测千条库冷开，仍引用[独立冷开记录](cold-wake-diagnostics.md)，正式发布门槛未达。
 
 同步快照新增的来源记录在认证密文内，当前版可读没有来源的旧快照。旧客户端读不懂新字段时会停止同步写回；先升级各设备再试用新版同步。
+
+### 主密码轮换与设备认领候选（2026-11-20）
+
+- ZIP：`test-results/Vault-2026-11-20-383f3f37b3d4-chrome.zip`（5,995,074 B），SHA-256 `383f3f37b3d40d340f017d1bb38efc36f3b3aca72dcf611ecae990eb144c2012`。解压目录：`test-results/release-unpacked-383f3f37b3d4`，52 个文件，树摘要 `da40147b53f2f821322a53d048e0764c28282afa5f9c79adbfade67d8a2da552`。相对上一历史恢复候选只变 `background.js`；MV3 `0.0.0`、CSP、权限检查通过。主 WASM 未变，255,677 B，57 项 Rust 回归通过；最终 TypeScript 和 82 项 Vitest 通过。
+- T15：已认证的新包装与待验证标记同一个 IndexedDB 事务提交，不消费未上传 WAL。模拟 Worker 在事务完成后、旧会话清理前退出，含新标记或旧版缺字段的两种记录都不恢复旧会话；不返回条目、拒绝旧密码且不改本机密文。中断点使用真实 WASM 和持久化状态夹具，不是实机断点强杀。
+- Edge `157.0.4341.60` 与 Helium `157.0.8103.78` 从同一解压包通过安装冒烟、主密码轮换、设备认领与历史恢复。T15 的改密码和恢复码重置均只条件更新 `head.bin`；两个客户端锁定期间零新 WebDAV 请求。Helium 重启保留待验证标记和一笔本地 WAL，验证新主密码后续传给 Edge，旧包装、旧口令及旧头均被拒绝；用新主密码重新配置 PIN 和合成 PRF 后可用。合成 PRF 不等同实体 Hello。
+- T16：同系统、同浏览器只提示候选，不自动认领。错密不写远端；通过主密码认领后保留原逻辑身份和初次登记时间。原实例仍在线，各自的 WAL 使用不同短码，旧对象不变，各端收到两份编辑且不重复。设备别名与标识不出现在远端文件名或对象明文字节；移除设备元数据不删凭证、不宣称撤销密钥。
+- 同系列的 `c236bd5459ff` 阶段包在双端各测 10 次千条库原生冷开：Popup DOM 中位数 Edge **584.27 ms**、Helium **586.79 ms**；WASM 恢复 **71.90 / 68.10 ms**，仍超出 `<50 / <5 ms`。报告为 `test-results/wakeup-1000.key-update-c236bd5459ff.json`。相对[此前补测](cold-wake-diagnostics.md)，差异主要出现在 Worker 时间原点之前；两边认证与解码仍约 17 ms。这不是同次 A/B，不能从两批结果归因。最终包未重复这一同机测量，仍不签收 T01/T36 性能。
 
 ### 外部夹具
 
