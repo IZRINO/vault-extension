@@ -159,8 +159,10 @@
 | **全功能密码库** | **1Password** | `.1pux` | 登录、OTP、卡片、身份地址、开发者凭证。Passkey 需随源文件提供可用私钥，普通桌面 1PUX 不包含私钥 |
 | **全功能密码库** | **Proton Pass** | 明文 `.zip` / `.json` | 登录、OTP、备注、可导出的 ES256 / Ed25519 Passkey。PGP ZIP 须从来源重新导出 |
 | **主流密码库与浏览器** | **Edge / Chrome / Firefox / Brave / Safari / Dashlane / NordPass / Enpass / LastPass** | 登录 `.csv` | 密码、网址、备注及可识别的 OTP，提供自动识别与手动映射 |
+| **主流密码库** | **Dashlane** | 明文 CSV ZIP | 登录和安全备注 |
 | **二步验证** | **Ente Auth** | 纯文本 `.txt`，双向 | TOTP、HOTP、Steam、置顶、标签、备注、回收站。可合入已有密码项 |
-| **二步验证** | **Google Authenticator / 2FAS / Aegis / Raivo / andOTP / Stratum** | Google 多张二维码或迁移 URI，2FAS / Aegis 明文与加密备份，Raivo AES ZIP 或 JSON，andOTP / Stratum 明文备份 | 导入受支持的 TOTP、HOTP、Steam 参数及可映射元数据 |
+| **二步验证** | **Google Authenticator / 2FAS / Aegis / Raivo** | Google 多张二维码或迁移 URI，2FAS / Aegis 明文与加密备份，Raivo AES ZIP 或 JSON | 导入受支持的 TOTP、HOTP、Steam 参数及可映射元数据 |
+| **二步验证** | **andOTP / Stratum** | andOTP 明文 JSON 或 v0.9 格式 `.json.aes`，Stratum 明文或新版加密备份 | 保留受支持的 OTP 参数、HOTP 计数和分组标签 |
 
 **当前导出格式**：原生加密备份（`.vaultpack`）、FIDO CXF 1.0 JSON、Bitwarden JSON、Ente Auth 文本及通用 CSV。所有整库导出（含 `.vaultpack`）均须重新验证当前库主密码，PIN 和独立文件密码不可替代；明文另需风险确认（[#37](https://github.com/IZRINO/vault-extension/issues/37)）。日常看码和网页填码只交付动态码，显式编辑及已授权导出才会读取种子（[#38](https://github.com/IZRINO/vault-extension/issues/38)）。
 

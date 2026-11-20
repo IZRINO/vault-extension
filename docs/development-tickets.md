@@ -293,6 +293,8 @@
 - [ ] 每个来源至少一个该应用产生的合成样本；为每种实测格式核对账号、算法、时间步长或计数及生成结果，保留可映射元数据。
 - [ ] 对加密变体、未知记录与部分无法映射的字段逐项说明支持边界；只有提示“不支持”不算完成该来源的导入。
 
+候选包已支持 Raivo JSON 和 AES ZIP、andOTP 明文 JSON 和 v0.9 格式 AES、Stratum 明文和新版认证加密备份。合成与公开夹具已通过加密、出码、预览及去重回归。旧版加密写法的处理和原厂应用待验收项见样本记录。[验证器格式与夹具](agents/authenticator-backup-fixtures.md)
+
 ### T35 自动识别常见密码管理器的 CSV · [#35](https://github.com/IZRINO/vault-extension/issues/35)
 前置：T20
 

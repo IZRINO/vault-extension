@@ -208,6 +208,132 @@ it('restores the legacy Dashlane TOTP URL emitted without a label', () => {
 });
 
 describe('authenticator migration with independently generated fixtures', () => {
+  it('authenticates Stratum strong backups and preserves tags and HOTP counters', () => {
+    const backup = {
+      Authenticators: [
+        { Type: 2, Username: 'fixture-user', Issuer: 'Example', Secret: base32, Algorithm: 1, Period: 45, Digits: 8 },
+        { Type: 1, Username: 'fixture-hotp', Issuer: 'Example', Secret: base32, Algorithm: 0, Counter: 11, Digits: 6 },
+      ],
+      Categories: [{ Id: 'fixture', Name: 'Fixture Group' }],
+      AuthenticatorCategories: [{ CategoryId: 'fixture', AuthenticatorSecret: base32 }],
+    };
+    const password = 'Stratum 合成文件口令';
+    const header = Buffer.from('AUTHENTICATORPRO');
+    const salt = Buffer.alloc(16, 5), nonce = Buffer.alloc(12, 7);
+    // Node 26 crypto.argon2Sync vector for this synthetic UTF-8 password and salt.
+    const key = Buffer.from('5047c1223961e2b83e97f3df8bace2c41a80fdaa02c84f3322ea873800c576f1', 'hex');
+    const cipher = createCipheriv('aes-256-gcm', key, nonce);
+    const encrypted = Buffer.concat([header, salt, nonce, cipher.update(bin(backup)), cipher.final(), cipher.getAuthTag()]);
+    key.fill(0);
+    const report = parseAuth('stratum', encrypted, password);
+    expect(report).toEqual(parseAuth('stratum', bin(backup)));
+    expect(report.rows[0]).toMatchObject({ tags: ['Fixture Group'], data: { username: 'fixture-user' } });
+    expect(report.rows.map(codeAt)).toEqual([independentCode('sha256', Math.floor(now / 45), 8), independentCode('sha1', 11, 6)]);
+    expect(() => parseAuth('stratum', encrypted)).toThrow(/文件密码/);
+    expect(() => parseAuth('stratum', encrypted, 'Incorrect file password')).toThrow(/认证失败/);
+    const tampered = Buffer.from(encrypted);
+    tampered[tampered.length - 1]! ^= 1;
+    expect(() => parseAuth('stratum', tampered, password)).toThrow(/认证失败/);
+    expect(() => parseAuth('stratum', encrypted.subarray(0, header.length + 16), password)).toThrow(/上限/);
+  });
+  it('does not retype native Stratum OTPs or reset unverified counters', () => {
+    const row = { Username: 'fixture-user', Secret: base32, Algorithm: 1, Period: 45, Digits: 8 };
+    const backup = bin({ Authenticators: [
+      { ...row, Type: 4, Issuer: 'Example' },
+      { ...row, Type: 2, Issuer: 'Steam' },
+      { ...row, Type: 2, Username: 'Steam:generic-user' },
+      { ...row, Type: 1, Counter: 0 }, { ...row, Type: 1 }, { ...row, Type: 1, Counter: -1 },
+      { ...row, Type: 1, Counter: 1.5 },
+    ] });
+    const result = parseAuth('stratum', backup);
+    expect(result).toMatchObject({ unsupported: 2, invalid: 3 });
+    expect(result.rows.map(codeAt)).toEqual(['R87JJ', independentCode('sha256', 0, 8)]);
+  });
+  it('rejects Stratum classifications exceeding the total label budget', () => {
+    const row = { Username: 'fixture-user', Secret: base32, Type: 2 };
+    const categories = Array.from({ length: 32 }, (_, i) => ({ Id: `${i}`, Name: `${i}`.padStart(256, 'x') }));
+    const bytes = bin({ Authenticators: Array.from({ length: 513 }, () => row), Categories: categories,
+      AuthenticatorCategories: categories.map(({ Id }) => ({ CategoryId: Id, AuthenticatorSecret: base32 })) });
+    expect(() => parseAuth('stratum', bytes)).toThrow(/上限/);
+  });
+  it.skipIf(!process.env.VAULT_AUTH_FIXTURE_DIR)('imports the pinned Stratum strong backup from the upstream test suite', async () => {
+    const dir = process.env.VAULT_AUTH_FIXTURE_DIR!;
+    const readPinned = async (name: string, digest: string) => {
+      const bytes = await readFile(join(dir, name));
+      expect(createHash('sha256').update(bytes).digest('hex')).toBe(digest);
+      return bytes;
+    };
+    const strong = await readPinned('backup.strong.authpro', 'e8b5f262cde2ddef20db3867d628f0c5533d0adee755f2cd3f6c70821caebbd8');
+    const report = parseAuth('stratum', strong, 'test');
+    expect(report.rows.map(codeAt)).toEqual(['440725', '414410', '228515', '651512', '548791', '961004']);
+    expect(report.rows[0]).toMatchObject({ title: 'Long', data: { username: 'Period', totpUri: expect.stringContaining('period=60') } });
+    expect(report.rows[1].data.totpUri).toContain('algorithm=SHA256');
+    expect(report.rows[2].data.totpUri).toContain('algorithm=SHA512');
+    expect(report.unsupported).toBe(1); // Source sample includes a nine-digit TOTP.
+    expect(report.rows.filter((row: { data: { totpUri: string } }) => row.data.totpUri.startsWith('otpauth://hotp/')))
+      .toEqual([expect.objectContaining({ data: expect.objectContaining({ totpUri: expect.stringContaining('counter=10') }) })]);
+    const legacy = await readPinned('backup.legacy.authpro', 'b541ec0d1b7c767442d292107d5a94deb3f987cc3e77a51abc02243415345593');
+    expect(() => parseAuth('stratum', legacy, 'test')).toThrow(/旧版/);
+    const plaintext = await readPinned('backup.unencrypted.authpro', 'ab49c51b3d3809d45e7677c8889504149c342600cb25c138084c0ae3605aaca8');
+    const clear = parseAuth('stratum', plaintext);
+    expect(clear.rows).toHaveLength(2);
+    expect(clear.invalid).toBe(12); // Test placeholders do not satisfy Vault's Base32 seed checks.
+    expect(clear.unsupported).toBe(1);
+    expect(clear.rows).toMatchObject([
+      { title: 'DigitalOcean', tags: ['Work'], data: { username: 'john@example.com' } },
+      { tags: ['Banking'], data: { username: 'john@example.com', totpUri: expect.stringContaining('counter=4') } },
+    ]);
+    expect(clear.rows.map(codeAt)).toEqual(['591127', '391367']);
+  });
+  it('decrypts native andOTP AES backup bytes and rejects wrong passwords and out-of-range work', () => {
+    const iterations = 150_000;
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(iterations);
+    const password = 'andOTP 合成文件口令';
+    const salt = Buffer.alloc(12, 2), nonce = Buffer.alloc(12, 3);
+    const plaintext = bin([{ type: 'HOTP', label: 'fixture-user', issuer: 'Example', secret: base32,
+      algorithm: 'SHA256', counter: 19, digits: 8, tags: ['Fixture Group'] }]);
+    const key = pbkdf2Sync(password, salt, iterations, 32, 'sha1');
+    const cipher = createCipheriv('aes-256-gcm', key, nonce);
+    const encrypted = Buffer.concat([header, salt, nonce, cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+    key.fill(0);
+    const report = parseAuth('andotp', encrypted, password);
+    expect(report).toEqual(parseAuth('andotp', plaintext));
+    expect(report.rows[0]).toMatchObject({ tags: ['Fixture Group'], data: { username: 'fixture-user' } });
+    expect(report.rows.map(codeAt)).toEqual([independentCode('sha256', 19, 8)]);
+    expect(() => parseAuth('andotp', encrypted)).toThrow(/文件密码/);
+    expect(() => parseAuth('andotp', encrypted, 'Incorrect file password')).toThrow(/认证失败/);
+    const tampered = Buffer.from(encrypted);
+    tampered[tampered.length - 1]! ^= 1;
+    expect(() => parseAuth('andotp', tampered, password)).toThrow(/认证失败/);
+    expect(() => parseAuth('andotp', encrypted.subarray(0, 28), password)).toThrow(/上限/);
+    tampered.writeUInt32BE(160_001);
+    expect(() => parseAuth('andotp', tampered, password)).toThrow(/参数/);
+  });
+  it('does not silently replace nonstandard andOTP Steam parameters or reset HOTP counters', () => {
+    const row = { label: 'fixture-user', issuer: 'Example', secret: base32, algorithm: 'SHA1', type: 'STEAM', digits: 5, period: 30 };
+    const result = parseAuth('andotp', bin([
+      row, { ...row, period: 60 }, { ...row, digits: 7 }, { ...row, digits: undefined }, { ...row, algorithm: 'SHA256' },
+      { ...row, issuer: '', label: 'Steam:generic-user', type: undefined, digits: 6 },
+      { ...row, type: 'HOTP', digits: 6 }, { ...row, type: 'HOTP', digits: 6, counter: 0 },
+    ]));
+    expect(result).toMatchObject({ unsupported: 5, invalid: 1 });
+    expect(result.rows.map(codeAt)).toEqual(['R87JJ', independentCode('sha1', 0, 6)]);
+  });
+  it.skipIf(!process.env.VAULT_AUTH_FIXTURE_DIR)('imports the pinned andOTP backup from the upstream interoperability tests', async () => {
+    const dir = process.env.VAULT_AUTH_FIXTURE_DIR!;
+    const source = await readFile(join(dir, 'andotp.encrypted.bin'));
+    expect(createHash('sha256').update(source).digest('hex')).toBe('d7274dae68b819536c62bfc1ab6edd614d6789e9e9a7a87f90b8a15a89d804ae');
+    const result = parseAuth('andotp', source, 'testtest');
+    expect(result).toMatchObject({ invalid: 0, unsupported: 2 });
+    expect(result.rows.map(codeAt)).toEqual(['440725', '961004', '414410', '228515', '651512', '548791', 'J5JV8']);
+    expect(result.rows[0]).toMatchObject({ title: 'Long', data: { username: 'Period', totpUri: expect.stringContaining('period=60') } });
+    expect(result.rows[4].data.totpUri).toContain('counter=10');
+    expect(result.rows[6]).toMatchObject({ tags: ['Tag'], data: { username: 'Steam' } });
+    const clear = await readFile(join(dir, 'andotp.unencrypted.json'));
+    expect(createHash('sha256').update(clear).digest('hex')).toBe('b5ca6ff1ec1e3ab22c0a54f50117e1eb023cc0407be3b6c5bbf86c69635b77d8');
+    expect(parseAuth('andotp', clear)).toEqual(result);
+  });
   it('reassembles Google exports before activation and validates HOTP and TOTP', () => {
     const parts = [googleUri(1, 2), googleUri(0, 1), googleUri(1, 2)].join('\n');
     const report = parseAuth('google', Buffer.from(parts));

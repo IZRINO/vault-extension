@@ -51,13 +51,14 @@ export function offscreen<T>(operation: string, payload: unknown, signal?: Abort
   return result.promise;
 }
 export function derive<T>(operation: string, args: unknown[], signal?: AbortSignal): Promise<T> {
+  const wipeCopies = operation === 'audit-snapshot' || operation === 'parse-authenticator-backup';
   const copies: number[][] = [];
   const prepare = () => ({ operation, args: args.map(value => {
     if (!(value instanceof Uint8Array)) return value;
     const bytes = Array.from(value);
-    if (operation === 'audit-snapshot') copies.push(bytes);
+    if (wipeCopies) copies.push(bytes);
     return { bytes };
   }) });
   const result = offscreen<T>('derive', signal ? prepare : prepare(), signal);
-  return operation === 'audit-snapshot' ? result.finally(() => { for (const bytes of copies) bytes.fill(0); }) : result;
+  return wipeCopies ? result.finally(() => { for (const bytes of copies) bytes.fill(0); }) : result;
 }

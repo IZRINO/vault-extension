@@ -9,8 +9,10 @@ const formats: Record<AuthBackupFormat, { label: string; accept: string; passwor
   '2fas': { label: '2FAS', accept: '.2fas,.json', password: true },
   aegis: { label: 'Aegis', accept: '.json', password: true },
   raivo: { label: 'Raivo OTP', accept: '.zip,.json', password: true },
-  andotp: { label: 'andOTP', accept: '.json', hint: '支持明文 JSON。' },
-  stratum: { label: 'Stratum / Authenticator Pro', accept: '.stratum,.authpro,.json', hint: '支持未加密的备份。' },
+  andotp: { label: 'andOTP', accept: '.json,.aes,.bin', password: true,
+    hint: '支持明文 JSON 和密码保护的 AES 备份。' },
+  stratum: { label: 'Stratum / Authenticator Pro', accept: '.stratum,.authpro,.json', password: true,
+    hint: '支持明文和新版加密备份。旧版加密备份请在 Stratum 重新导出。' },
   'freeotp-plus': { label: 'FreeOTP+', accept: '.json,.txt', hint: '在 FreeOTP+ 中选择导出 JSON 或密钥 URI。' },
   winauth: { label: 'WinAuth', accept: '.txt,.zip', password: true, hint: '请选择 WinAuth 导出的 TXT 或 ZIP。仅导入验证码设置，不导入 Steam 会话或应用配置。' },
 };

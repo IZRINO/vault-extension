@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
 import initCsv, { wasm_parse_browser_csv, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv,
   wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
@@ -1114,6 +1115,46 @@ describe('phase two migration transactions and autofill reads', () => {
     expect(item).toMatchObject({ title, requireReprompt: true, devSubtype: 'secure_note' });
     await expect(controller.handle({ type: 'get', id: item!.id })).rejects.toThrow('再次验证');
     expect(await controller.handle({ type: 'get', id: item!.id, proof })).toMatchObject({ note });
+  });
+  for (const [format, filename, filePassword, ready] of [
+    ['stratum', 'backup.strong.authpro', 'test', 6],
+    ['andotp', 'andotp.encrypted.bin', 'testtest', 7],
+  ] as const) {
+    it.skipIf(!process.env.VAULT_AUTH_FIXTURE_DIR)(`authenticates ${format} before saving and preserves the HOTP counter`, async () => {
+      const controller = await unlocked();
+      const bytes = Array.from(await readFile(join(process.env.VAULT_AUTH_FIXTURE_DIR!, filename)));
+      const entry = { type: 'preview-auth-backup', format, bytes, password: filePassword } as const;
+      const before = structuredClone(state.files);
+      const preview = await controller.handle(entry) as AuthBackupPreview;
+      expect(preview.ready).toBe(ready);
+      expect(JSON.stringify(preview)).not.toContain('otpauth:');
+      const commit = { ...entry, type: 'import-auth-backup', stamp: preview.stamp, proof } as const;
+      await expect(controller.handle({ ...commit, password: 'Wrong source password' })).rejects.toThrow('认证失败');
+      expect(state.files).toEqual(before);
+      expect(state.pendingWal).toHaveLength(0);
+      expect(await controller.handle(commit)).toBe(ready);
+      const summaries = await controller.handle({ type: 'list' }) as ItemSummary[];
+      const details = await Promise.all(summaries.map(({ id }) => controller.handle({ type: 'get', id }) as Promise<ItemDetailData>));
+      const hotp = details.find(row => row.otp?.kind === 'hotp');
+      expect(hotp).toBeDefined();
+      expect(hotp!.data).not.toHaveProperty('totpUri');
+      expect(await controller.handle({ type: 'next-hotp', id: hotp!.id })).toMatchObject({ counter: '10', value: '651512' });
+      expect(await controller.handle(entry)).toMatchObject({ ready: 0, skipped: ready });
+    });
+  }
+  it('deduplicates a native HOTP with the Steam issuer even after its account label changes', async () => {
+    const controller = await unlocked();
+    const source = (label: string, counter: number) => Array.from(Buffer.from(JSON.stringify([{
+      type: 'HOTP', label, issuer: 'Steam', secret: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',
+      algorithm: 'SHA1', digits: 6, counter,
+    }])));
+    const entry = { type: 'preview-auth-backup', format: 'andotp', bytes: source('Original account', 10) } as const;
+    const preview = await controller.handle(entry) as AuthBackupPreview;
+    expect(preview.ready).toBe(1);
+    expect(await controller.handle({ ...entry, type: 'import-auth-backup', stamp: preview.stamp, proof })).toBe(1);
+    const [item] = await controller.handle({ type: 'list' }) as ItemSummary[];
+    expect(await controller.handle({ type: 'next-hotp', id: item!.id })).toMatchObject({ counter: '10' });
+    expect(await controller.handle({ ...entry, bytes: source('Former label', 1) })).toMatchObject({ ready: 0, skipped: 1 });
   });
   it('binds preview to source and snapshot and rolls back a failed batch without partial data', async () => {
     const controller = await unlocked();

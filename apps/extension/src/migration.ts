@@ -14,7 +14,8 @@ function otpIdentity(raw: unknown) {
   const clean = (value: string) => value.toUpperCase().replace(/[\s=-]/g, '');
   try {
     const url = new URL(raw);
-    const kind = url.hostname === 'steam' || url.searchParams.get('issuer')?.toLowerCase() === 'steam' ? 'steam' : url.hostname;
+    const steamTotp = url.hostname === 'totp' && url.searchParams.get('issuer')?.toLowerCase() === 'steam';
+    const kind = steamTotp ? 'steam' : url.hostname;
     return [kind, clean(url.searchParams.get('secret') ?? ''), url.searchParams.get('algorithm')?.toUpperCase() ?? 'SHA1',
       url.searchParams.get('digits') ?? (kind === 'steam' ? '5' : '6'), kind === 'hotp' ? '' : url.searchParams.get('period') ?? '30'].join(':');
   } catch { return ['totp', clean(raw), 'SHA1', '6', '30'].join(':'); }

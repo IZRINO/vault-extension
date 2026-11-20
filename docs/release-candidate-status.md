@@ -6,6 +6,13 @@
 
 ## 当前候选包 0.1.0
 
+- ZIP `test-results/Vault-2026-11-20-c0a407c7245d-chrome.zip`，6,210,723 B，SHA-256 `c0a407c7245d268013231302d32ba8f376e1c1ef31f3180961c506409ef649be`。解压 `test-results/release-unpacked-c0a407c7245d`，54 个文件与生产构建逐字节一致，树摘要 `d3dc40f9d5e509af2eef9a8fffd25226c6b4ed265800ee6bd17826ae9c25ea96`。
+- T34 新增 andOTP v0.9 格式 AES 与 Stratum 新版加密备份。本机验证文件认证、分组、实际出码、错密零写、HOTP 原计数及重导去重。包含前一阶段验证过的 Dashlane 明文 CSV ZIP。[验证码样本与格式限制](agents/authenticator-backup-fixtures.md#andotp-与-stratum-加密备份)
+- Rust **80** 项（含 vendored 3 项）、Vitest **154** 项、TypeScript、Raivo 兼容 AES ZIP、公开 KDBX 3.1/4.0 和旧 `.vaultpack` 恢复通过。主核 WASM **250,848 B**，导入 WASM **3,576,225 B**，只打入两条按需 Worker。生产包九个 WASM 模块的 11 份载荷、清单、CSP 和权限均已核对。证据位于 `test-results/release-checks-c0a407c7245d/`。
+- 当前包解锁态双浏览器回归待验收。本机上一包验证时 Windows 报告 `idle=locked`。最近千条库测量仍超过 Popup `<50 ms` 与 WASM 恢复 `<5 ms`，数值与口径保留在冷开诊断。真实设备、网盘和厂商应用留待日常试用。[冷开诊断](cold-wake-diagnostics.md)
+
+## Dashlane ZIP 候选包 0.1.0
+
 - ZIP `test-results/Vault-2026-11-20-e44c78fb385a-chrome.zip`，6,207,232 B，SHA-256 `e44c78fb385a21d689d27a8bddd3fb22ae3fb9d474b1070ab4f6247559075e4c`。解压 `test-results/release-unpacked-e44c78fb385a`，54 个文件与生产构建逐字节一致，树摘要 `759fdde224124e3b90c9f3ec6eb5dcf72aa55879e04ccebe5e56bd65b5845489`。
 - T35 可直接从「设置 → 其他密码库与 CXF」选择 Dashlane 明文 CSV ZIP。固定公开样本恢复 8 条登录和 3 条安全备注，另外 4 条支付或身份记录计入暂不支持。回归覆盖无网址或密码的登录项、附加用户名、旧 OTP、多行内容、损坏 ZIP、预览不写、错密拒绝、二次验证和重新导入。原厂应用试用待验收。[CSV 来源与样本](agents/vendor-csv-sources.md#dashlane)
 - Rust **80** 项（含 vendored 3 项）、Vitest **144** 项、TypeScript、九个 WASM、生产 ZIP、KDBX 3.1/4.0、旧加密 `.vaultpack` 恢复通过。主核 **250,848 B**，导入模块 **3,575,440 B**，由两条按需迁移路径加载。已比对包内 11 份 WASM 与清单、CSP、权限。证据位于 `test-results/release-checks-e44c78fb385a/`。
@@ -82,7 +89,7 @@
 | T13–T18、T20 | 三方字段合并、加密待裁决区、全页裁决、落选密码历史、主密码旋转、设备认领和加密来源记录、滚动五份历史、历史预览/恢复、异库合入。 | 一个离线登录命中多个远端候选时一同展示；更晚的重叠草稿加密留在本机，无关项仍可同步。双份继承二次验证，同一递增凭证只保留一份可用计数。自动覆盖并发 WAL、条件提交、两处压实中断、30 天回收站边界、历史重放拒绝、计数恢复、不同身份合入。找不到祖先或不能保留新字段时停止写回；两家真实 WebDAV 尚未验收。 |
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
 | T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey 与原生 SSH 对象、KeePass KDBX/XML/CSV、1Password 1PUX、Proton JSON/ZIP 与受支持的 PGP ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。厂商应用与真实网站互通待验收。 |
-| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。原厂 Dashlane 明文 CSV ZIP、Enpass 桌面 JSON、Dashlane 及 LastPass CLI JSON 已接入。 | 有独立合成回归与公开夹具。原厂应用日常试用待验收。[验证器样本](agents/authenticator-backup-fixtures.md) · [厂商 JSON 边界](agents/vendor-json-sources.md) |
+| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth。Raivo AES ZIP、andOTP v0.9 格式 AES 和 Stratum 新版加密备份可预览导入。Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。原厂 Dashlane 明文 CSV ZIP、Enpass 桌面 JSON、Dashlane 及 LastPass CLI JSON 已接入。 | 有独立合成回归与公开夹具。原厂应用日常试用待验收。[验证器样本](agents/authenticator-backup-fixtures.md) · [厂商 JSON 边界](agents/vendor-json-sources.md) |
 | T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 冷开 `<50 ms` 未达，正式发布准出和真实站点/设备验收不能签收。 |
 
 ### 格式限制
@@ -96,7 +103,8 @@
 ## 复现
 
 ```powershell
-pnpm run build
+pnpm install --frozen-lockfile
+pnpm run build:wasm
 pnpm --filter ./apps/extension zip
 cargo test --workspace
 pnpm run test:extension

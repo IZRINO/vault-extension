@@ -71,7 +71,8 @@ export default defineBackground(() => {
     // levels are being applied. Vault/session reads still wait for that protection.
     if (message.type === 'open') void loadVaultCore().catch(() => undefined);
     const handle = ready.then(() => vault.handle(message as VaultMessage));
-    const isMigrationInput = message.type === 'preview-migration' || message.type === 'import-migration' || message.type === 'csv-headers';
+    const isMigrationInput = message.type === 'preview-migration' || message.type === 'import-migration' || message.type === 'csv-headers'
+      || message.type === 'preview-auth-backup' || message.type === 'import-auth-backup';
     // Chrome delivers an independent JSON copy to this listener.
     const completed = isMigrationInput ? handle.finally(() => {
       if (Array.isArray(message.bytes)) message.bytes.fill(0);

@@ -33,7 +33,8 @@ export default defineUnlistedScript(() => {
       const format = data.args[0];
       if (memory && ((data.operation === 'portable-import'
         && (format === 'bitwarden' || format === 'proton' || format === 'dashlane-zip' || (VENDOR_JSON_FORMATS as readonly unknown[]).includes(format)))
-        || (data.operation === 'portable-export' && format === 'bitwarden'))) {
+        || (data.operation === 'portable-export' && format === 'bitwarden')
+        || (data.operation === 'parse-authenticator-backup' && (format === 'stratum' || format === 'andotp')))) {
         new Uint8Array(memory.buffer).fill(0);
       }
       for (const arg of data.args) if (arg instanceof Uint8Array) arg.fill(0);

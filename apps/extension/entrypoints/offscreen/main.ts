@@ -62,6 +62,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
     if (message.operation === 'derive') {
       const { operation } = message.payload;
       const audit = operation === 'audit-snapshot';
+      const wipeCopies = audit || operation === 'parse-authenticator-backup';
       if (audit && auditLocked) {
         for (const arg of message.payload.args) if (Array.isArray(arg?.bytes)) arg.bytes.fill(0);
         throw new Error(auditLockError);
@@ -89,7 +90,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
           if (!v || typeof v !== 'object' || !('bytes' in v)) return v;
           const bytes = (v as { bytes: number[] }).bytes;
           const copy = new Uint8Array(bytes);
-          if (audit) bytes.fill(0);
+          if (wipeCopies) bytes.fill(0);
           return copy;
         });
         try { worker.postMessage({ operation, args }); }

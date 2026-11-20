@@ -278,19 +278,58 @@ fn raivo_zip(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(out)
 }
 
+fn andotp_json(bytes: &[u8], password: &str) -> Result<Json> {
+    let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    if text.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
+        return Json::read(bytes);
+    }
+    const SALT_END: usize = 16;
+    const NONCE_END: usize = 28;
+    const TAG_BYTES: usize = 16;
+    if bytes.len() <= NONCE_END + TAG_BYTES { return Err(INVALID); }
+    let iterations = u32::from_be_bytes(bytes[..4].try_into().map_err(|_| INVALID)?);
+    if !(140_000..=160_000).contains(&iterations) {
+        return Err("andOTP 备份的加密格式或迭代参数不受支持，请选择原应用导出的密码保护 AES 文件。");
+    }
+    if password.is_empty() { return Err(PASSWORD); }
+    let mut key = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), &bytes[4..SALT_END], iterations, key.as_mut());
+    let plaintext = gcm(key.as_ref(), &bytes[SALT_END..NONCE_END], Zeroizing::new(bytes[NONCE_END..].to_vec()))?;
+    Json::read(&plaintext)
+}
+
 fn raivo_or_andotp(bytes: &[u8], password: &str, raivo: bool) -> Result<Batch> {
-    let unzipped;
-    let input = if raivo && bytes.starts_with(b"PK\x03\x04") { unzipped = raivo_zip(bytes, password)?; unzipped.as_slice() }
-        else if !raivo && bytes.iter().copied().find(|c| !c.is_ascii_whitespace()).is_some_and(|c| c != b'[' && c != 0xef) {
-            return Err("此路径支持 andOTP 明文 JSON；加密或 OpenPGP 备份请在原应用中先导出 JSON。");
-        } else { bytes };
-    let root = Json::read(input)?;
+    let root = if !raivo {
+        andotp_json(bytes, password)?
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        Json::read(&raivo_zip(bytes, password)?)?
+    } else {
+        Json::read(bytes)?
+    };
     let mut batch = Batch::default();
     for row in array(&root.0)? {
-        batch.push(Mapping { kind: str_at(row, if raivo { "kind" } else { "type" }),
-            account: str_at(row, if raivo { "account" } else { "label" }), issuer: str_at(row, "issuer"), title: "",
-            secret: str_at(row, "secret"), algorithm: str_at(row, "algorithm"), digits: number(row, "digits"),
-            period: number(row, if raivo { "timer" } else { "period" }), counter: number(row, "counter"),
+        let kind = str_at(row, if raivo { "kind" } else { "type" });
+        let account = str_at(row, if raivo { "account" } else { "label" });
+        let issuer = str_at(row, "issuer");
+        let algorithm = str_at(row, "algorithm");
+        let digits = number(row, "digits");
+        let period = number(row, if raivo { "timer" } else { "period" });
+        let counter = number(row, "counter");
+        if !raivo {
+            if kind.eq_ignore_ascii_case("hotp") && counter.is_none_or(|n| n > i64::MAX as u64) {
+                batch.invalid += 1;
+                continue;
+            }
+            let unsupported_steam = kind.eq_ignore_ascii_case("steam")
+                && (digits != Some(5) || (row.get("period").is_some() && period != Some(30))
+                    || (!algorithm.is_empty() && !algorithm.eq_ignore_ascii_case("sha1")));
+            if unsupported_steam || unsupported_native_otp(kind, account, issuer, digits) {
+                batch.unsupported += 1;
+                continue;
+            }
+        }
+        batch.push(Mapping { kind, account, issuer, title: "",
+            secret: str_at(row, "secret"), algorithm, digits, period, counter,
             tags: row["tags"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).take(32).collect(),
             note: "", pinned: raivo && (str_at(row, "pinned") == "true" || row["pinned"].as_bool() == Some(true)) });
     }
@@ -299,32 +338,103 @@ fn raivo_or_andotp(bytes: &[u8], password: &str, raivo: bool) -> Result<Batch> {
 
 fn field<'a>(row: &'a Value, upper: &str, lower: &str) -> &'a Value { row.get(upper).or_else(|| row.get(lower)).unwrap_or(&Value::Null) }
 fn txt<'a>(row: &'a Value, upper: &str, lower: &str) -> &'a str { field(row, upper, lower).as_str().unwrap_or("") }
-fn stratum(bytes: &[u8]) -> Result<Batch> {
-    let root = Json::read(bytes).map_err(|_| "此路径支持 Stratum 明文备份；加密备份请在原应用中先导出。")?;
-    let root = &root.0;
-    let groups: BTreeMap<&str, &str> = field(root, "Categories", "categories").as_array().into_iter().flatten()
-        .map(|group| (txt(group, "Id", "id"), txt(group, "Name", "name"))).collect();
-    let map = field(root, "AuthenticatorCategories", "authenticatorCategories");
-    let mut tags: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for category in map.as_array().into_iter().flatten() {
-        if let Some(name) = groups.get(txt(category, "CategoryId", "categoryId")) {
-            let entry = tags.entry(txt(category, "AuthenticatorSecret", "authenticatorSecret")).or_default();
-            if entry.len() < 32 { entry.push((*name).to_owned()); }
+fn stratum_json(bytes: &[u8], password: &str) -> Result<Json> {
+    let Some(encrypted) = bytes.strip_prefix(b"AUTHENTICATORPRO") else {
+        if bytes.starts_with(b"AuthenticatorPro") {
+            return Err("此 Stratum 旧版加密备份缺少完整性校验，请在原应用重新导出新版加密备份。");
+        }
+        return Json::read(bytes);
+    };
+    const SALT_BYTES: usize = 16;
+    const NONCE_BYTES: usize = 12;
+    const TAG_BYTES: usize = 16;
+    if encrypted.len() <= SALT_BYTES + NONCE_BYTES + TAG_BYTES { return Err(INVALID); }
+    if password.is_empty() { return Err(PASSWORD); }
+    let (salt, encrypted) = encrypted.split_at(SALT_BYTES);
+    let (nonce, ciphertext_and_tag) = encrypted.split_at(NONCE_BYTES);
+    // Stratum's strong export has fixed Argon2id costs and a 16-byte salt.
+    let params = argon2::Params::new(65_536, 3, 4, Some(32)).map_err(|_| INVALID)?;
+    let mut memory = Zeroizing::new(vec![argon2::Block::default(); params.block_count()]);
+    let mut key = Zeroizing::new([0u8; 32]);
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into_with_memory(password.as_bytes(), salt, key.as_mut(), memory.as_mut_slice())
+        .map_err(|_| INVALID)?;
+    drop(memory);
+    let plaintext = gcm(key.as_ref(), nonce, Zeroizing::new(ciphertext_and_tag.to_vec()))?;
+    Json::read(&plaintext)
+}
+
+fn unsupported_native_otp(kind: &str, account: &str, issuer: &str, digits: Option<u64>) -> bool {
+    let totp = kind.is_empty() || kind.eq_ignore_ascii_case("totp");
+    // Ordinary URI compatibility infers Steam from the issuer. Do not
+    // change the output method when the source explicitly specified TOTP.
+    let steam_issuer = issuer.eq_ignore_ascii_case("Steam")
+        || (issuer.is_empty() && account.split_once(':').is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case("Steam")));
+    (totp && steam_issuer)
+        || ((totp || kind.eq_ignore_ascii_case("hotp")) && digits.is_some_and(|n| !(6..=8).contains(&n)))
+}
+
+fn stratum_metadata(root: &Value) -> Result<BTreeMap<&str, Vec<&str>>> {
+    let categories = field(root, "Categories", "categories");
+    let mut groups = BTreeMap::new();
+    if !categories.is_null() {
+        for group in array(categories)? {
+            let id = txt(group, "Id", "id");
+            let name = txt(group, "Name", "name");
+            if name.len() > 256 || groups.insert(id, name).is_some() { return Err(INVALID); }
         }
     }
+    let relations = field(root, "AuthenticatorCategories", "authenticatorCategories");
+    let mut tags = BTreeMap::<&str, Vec<&str>>::new();
+    if !relations.is_null() {
+        let relations = relations.as_array().filter(|rows| rows.len() <= MAX_ROWS * 32).ok_or(INVALID)?;
+        for category in relations {
+            if let Some(&name) = groups.get(txt(category, "CategoryId", "categoryId")) {
+                let entry = tags.entry(txt(category, "AuthenticatorSecret", "authenticatorSecret")).or_default();
+                if entry.len() < 32 && !entry.contains(&name) { entry.push(name); }
+            }
+        }
+    }
+    Ok(tags)
+}
+
+fn stratum(bytes: &[u8], password: &str) -> Result<Batch> {
+    let root = stratum_json(bytes, password)?;
+    let root = &root.0;
+    let tags = stratum_metadata(root)?;
+    let mut tag_budget = MAX_FILE;
     let mut batch = Batch::default();
     for row in array(field(root, "Authenticators", "authenticators"))? {
         let kind = match field(row, "Type", "type") { Value::Number(num) => match num.as_u64() {
             Some(1) => "hotp", Some(2) => "totp", Some(4) => "steam", _ => "unsupported",
         }, Value::String(s) => s.as_str(), _ => "unsupported" };
-        let algorithm = match field(row, "Algorithm", "algorithm") {
-            Value::Number(num) => match num.as_u64() { Some(0) => "SHA1", Some(1) => "SHA256", Some(2) => "SHA512", _ => "unsupported" },
-            Value::String(s) => s.as_str(), _ => "SHA1",
+        let algorithm = if kind.eq_ignore_ascii_case("steam") || kind.eq_ignore_ascii_case("steamotp") {
+            "SHA1" // Always SHA-1 in Stratum, even if the saved algorithm was from another type.
+        } else {
+            match field(row, "Algorithm", "algorithm") {
+                Value::Number(num) => match num.as_u64() { Some(0) => "SHA1", Some(1) => "SHA256", Some(2) => "SHA512", _ => "unsupported" },
+                Value::String(s) => s.as_str(), _ => "SHA1",
+            }
         };
+        let account = txt(row, "Username", "username");
+        let issuer = txt(row, "Issuer", "issuer");
+        let digits = field(row, "Digits", "digits").as_u64();
+        let counter = field(row, "Counter", "counter").as_u64().filter(|&n| n <= i64::MAX as u64);
+        if kind.eq_ignore_ascii_case("hotp") && counter.is_none() {
+            batch.invalid += 1;
+            continue;
+        }
+        if unsupported_native_otp(kind, account, issuer, digits) {
+            batch.unsupported += 1;
+            continue;
+        }
         let secret = txt(row, "Secret", "secret");
-        batch.push(Mapping { kind, account: txt(row, "Username", "username"), issuer: txt(row, "Issuer", "issuer"),
-            title: "", secret, algorithm, digits: field(row, "Digits", "digits").as_u64(), period: field(row, "Period", "period").as_u64(),
-            counter: field(row, "Counter", "counter").as_u64(), tags: tags.get(secret).cloned().unwrap_or_default(), note: "", pinned: false });
+        let labels = tags.get(secret).map(Vec::as_slice).unwrap_or_default();
+        let label_bytes: usize = labels.iter().map(|name| name.len()).sum();
+        tag_budget = tag_budget.checked_sub(label_bytes).ok_or(INVALID)?;
+        batch.push(Mapping { kind, account, issuer,
+            title: "", secret, algorithm, digits, period: field(row, "Period", "period").as_u64(),
+            counter, tags: labels.iter().map(|name| (*name).to_owned()).collect(), note: "", pinned: false });
     }
     Ok(batch)
 }
@@ -341,7 +451,7 @@ fn read_backup(format: &str, bytes: &[u8], password: &str) -> Result<Batch> {
     match format {
         "google" => google(bytes), "aegis" => aegis(bytes, password), "2fas" => twofas(bytes, password),
         "raivo" => raivo_or_andotp(bytes, password, true), "andotp" => raivo_or_andotp(bytes, password, false),
-        "stratum" => stratum(bytes), "freeotp-plus" => legacy::freeotp_plus(bytes, password),
+        "stratum" => stratum(bytes, password), "freeotp-plus" => legacy::freeotp_plus(bytes, password),
         "winauth" => legacy::winauth(bytes, password), _ => Err(INVALID),
     }
 }
