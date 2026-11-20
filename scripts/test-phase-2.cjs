@@ -90,7 +90,7 @@ async function verify(name) {
       return reply.value;
     }, message);
     await send({ type: 'create', masterPassword: password, calibrate: false });
-    assert(!wasmRequests.some(url => /vault_(?:ente_auth|importers)/.test(url)), 'Unlock must not load the optional importers');
+    assert(!wasmRequests.some(url => /vault_(?:ente_auth|importers|audit)/.test(url)), 'Unlock must not load the optional importers or audit');
     await send({ type: 'upsert', itemJson: JSON.stringify({
       title: 'Existing login', data: { kind: 'login', username: 'old', password: 'Existing-Test-Secret', uris: [{ uri: 'https://existing.example' }] },
     }) });
@@ -151,12 +151,14 @@ async function verify(name) {
     await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe(fixtureCode(fixtureTime + 1000));
     await verifyEnte(page, send, name, () => setClock(fixtureTime + 30000), fixtureTime + 30000);
     await verifyEncryptedEnte(page, send, name);
+    await verifyAuditReminders(page, send, name);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
-      totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true, errors }));
+      totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true,
+      offlineAuditAndDeveloperExpiry: true, errors }));
   } finally {
     try { await context?.close(); }
     finally {
@@ -372,6 +374,100 @@ async function verifyEncryptedEnte(page, send, name) {
   await expect(filePassword).toHaveCount(0);
 }
 
+async function verifyAuditReminders(page, send, name) {
+  const day = 86400000;
+  const today = Math.floor(await page.evaluate(() => Date.now()) / day) * day;
+  const secret = 'Synthetic-Expiry-Token#23';
+  const add = (title, data, fields = {}) => send({
+    type: 'upsert', itemJson: JSON.stringify({ title, data, ...fields }),
+  });
+  for (const [title, host, protectedItem] of [
+    ['Sensitive login fixture', 'accounts.google.com', false],
+    ['Protected login fixture', 'portal.example', true],
+    ['Ordinary login fixture', 'ordinary.example', false],
+  ]) {
+    await add(title, { kind: 'login', username: 'fixture', password: 'Synthetic-Audit-Ab49#Secret',
+      uris: [{ uri: 'https://' + host }] }, { requireReprompt: protectedItem });
+  }
+  for (const [title, time, trashed] of [
+    ['Expiring API token', today + 7 * day, false],
+    ['Expired license', today - day, false],
+    ['Undated SSH key', null, false],
+    ['Trashed API token', today - day, true],
+  ]) {
+    const subtype = title.includes('license') ? 'license_key' : title.includes('SSH') ? 'ssh_key' : 'api_token';
+    await add(title, { kind: 'developer', subtype, serviceOrProduct: 'Example service',
+      expiresAtMs: time, tokenOrLicense: secret }, { trashed });
+  }
+  const items = await send({ type: 'list' });
+  const id = title => items.find(item => item.title === title).id;
+  assert.equal(items.find(item => item.title === 'Expiring API token').expiresAtMs, today + 7 * day);
+  assert(!JSON.stringify(items).includes(secret), 'Developer summaries must not expose tokens');
+  const external = [];
+  const extensionOrigin = `chrome-extension://${new URL(page.url()).host}/`;
+  const onRequest = request => {
+    if (!/^https?:/.test(request.url())) return;
+    // Only count requests attributable to Vault; the browser can make its own network requests.
+    let source = request.serviceWorker()?.url();
+    if (!source) { try { source = request.frame().url(); } catch { return; } }
+    if (source.startsWith(extensionOrigin)) external.push(request.url());
+  };
+  const context = page.context();
+  context.on('request', onRequest);
+  let first;
+  try { first = await send({ type: 'audit' }); }
+  finally { context.off('request', onRequest); }
+  assert.deepEqual(external, [], 'Local audit must not send an external request');
+  assert.deepEqual(first.missing2faItemIds.toSorted(), ['Sensitive login fixture', 'Protected login fixture'].map(id).sort());
+  assert(!JSON.stringify(first).includes('Synthetic-Audit-Ab49#Secret'));
+
+  await page.reload();
+  const start = page.getByRole('button', { name: '开始本地检查' });
+  const findings = page.locator('section').filter({ has: page.getByRole('heading', { name: /^高敏登录项未关联验证器/ }) });
+  await page.getByRole('button', { name: '体检', exact: true }).click();
+  await start.click();
+  await expect(findings.getByRole('heading')).toHaveText('高敏登录项未关联验证器 · 2');
+  await expect(findings).toContainText('无法判断网站是否已启用两步验证');
+  await screenshot(page, name, 'offline-two-factor');
+  await findings.getByRole('button', { name: /Protected login fixture/ }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  await findings.getByRole('button', { name: /Sensitive login fixture/ }).click();
+  await page.getByRole('button', { name: '编辑', exact: true }).click();
+  await page.getByText('两步验证码（可选）', { exact: true }).click();
+  await page.getByLabel('验证码设置密钥', { exact: true }).fill(setupKey);
+  await page.getByRole('button', { name: '保存凭证', exact: true }).click();
+  await expect(page.getByText('凭证已保存。')).toBeVisible();
+  await page.getByRole('button', { name: '体检', exact: true }).click();
+  await start.click();
+  await expect(findings.getByRole('heading')).toHaveText('高敏登录项未关联验证器 · 1');
+  await expect(findings.getByRole('button', { name: /Sensitive login fixture/ })).toHaveCount(0);
+  assert(!(await page.locator('body').innerText()).includes(setupKey));
+
+  await page.getByRole('button', { name: '密码库', exact: true }).click();
+  await page.getByRole('button', { name: '开发', exact: true }).click();
+  const row = title => page.getByRole('button', { name: new RegExp('^' + title) });
+  await expect(row('Expired license')).toContainText('已到期');
+  await expect(row('Undated SSH key')).not.toContainText('到期');
+  await expect(row('Trashed API token')).toHaveCount(0);
+  await expect(row('Expiring API token')).toContainText('30 天内到期');
+  const copy = page.getByRole('button', { name: '复制“Expiring API token”的令牌', exact: true });
+  const actions = await copy.boundingBox(), content = await page.locator('.content').boundingBox();
+  assert(actions && content && actions.x + actions.width <= content.x + content.width,
+    'The developer row’s quick action must not be clipped in the side panel');
+  await row('Expiring API token').click();
+  await expect(page.getByText(/30 天内到期。请在来源服务/)).toBeVisible();
+  await expect(page.locator('time')).toHaveText(new Date(today + 7 * day).toISOString().slice(0, 10));
+  assert(!(await page.locator('body').innerText()).includes(secret));
+  await screenshot(page, name, 'developer-expiry');
+  await page.getByRole('button', { name: '编辑', exact: true }).click();
+  await page.getByLabel('到期日期', { exact: true }).fill(new Date(today + 60 * day).toISOString().slice(0, 10));
+  await page.getByRole('button', { name: '保存凭证', exact: true }).click();
+  await expect(row('Expiring API token')).not.toContainText('30 天内到期');
+  await row('Expiring API token').click();
+  await expect(page.getByText(/30 天内到期。请在来源服务/)).toHaveCount(0);
+}
+
 async function screenshot(page, name, stage) {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   await page.screenshot({ path: path.join(output, `phase-2-${name}-${stage}.png`), animations: 'disabled' });
@@ -379,12 +475,13 @@ async function screenshot(page, name, stage) {
 
 (async () => {
   const readBundle = entry => fs.readFile(path.join(extension, entry), 'utf8');
-  const [background, kdf, csv, otp, ente] = await Promise.all(['background.js', 'kdf-worker.js', 'csv-worker.js', 'otp-worker.js', 'ente-worker.js'].map(readBundle));
-  const optionalExports = /wasm_parse_browser_csv|wasm_validate_totp|wasm_totp_at|wasm_parse_ente_auth/;
+  const [background, kdf, csv, otp, ente, audit] = await Promise.all(['background.js', 'kdf-worker.js', 'csv-worker.js', 'otp-worker.js', 'ente-worker.js', 'audit-worker.js'].map(readBundle));
+  const optionalExports = /wasm_parse_browser_csv|wasm_validate_totp|wasm_totp_at|wasm_parse_ente_auth|wasm_audit_snapshot/;
   assert.doesNotMatch(background, optionalExports);
   assert.doesNotMatch(kdf, optionalExports);
   assert.match(csv, /wasm_parse_browser_csv/);
   assert.match(otp, /wasm_validate_totp/);
   assert.match(ente, /wasm_parse_ente_auth/);
+  assert.match(audit, /wasm_audit_snapshot/);
   for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys(browsers)) await verify(name);
 })().catch(error => { console.error(error); process.exitCode = 1; });

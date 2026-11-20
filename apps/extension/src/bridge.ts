@@ -11,7 +11,7 @@ async function send<T>(operation: string, payload: unknown): Promise<T> {
 
 // Serialize the shared document's lifecycle and worker jobs. Clipboard expiry
 // can join the open document while a worker computes; teardown waits for it.
-export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
+export function offscreen<T>(operation: string, payload: unknown, signal?: AbortSignal): Promise<T> {
   if (operation === 'clear-clipboard' && activeDocument) {
     const active = activeDocument;
     const run = active.clipboardCleanup.then(() => active.opening).then(() => send<T>(operation, payload));
@@ -20,6 +20,7 @@ export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
   }
   const result = Promise.withResolvers<T>();
   const run = tail.then(async () => {
+    if (signal?.aborted) { result.reject(signal.reason); return; }
     const opening = (async () => {
       if (!await browser.offscreen.hasDocument()) {
         await browser.offscreen.createDocument({ url: operation === 'scan-otp' ? 'offscreen.html?scan' : 'offscreen.html', reasons: ['WORKERS', 'CLIPBOARD'],
@@ -29,8 +30,11 @@ export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
     const active = { opening, clipboardCleanup: Promise.resolve() as Promise<unknown> };
     activeDocument = active;
     try {
+      // A session-bound task must not copy its inputs until the receiver is ready.
+      if (signal) { await opening; signal.throwIfAborted(); }
       // Capture can run while the privileged document starts. All lifecycle work remains serialized.
       const [, prepared] = await Promise.all([opening, typeof payload === 'function' ? payload() : payload]);
+      signal?.throwIfAborted();
       // Deliver the completed task without paying document teardown latency.
       // `tail` still includes teardown, so the next operation cannot race it.
       result.resolve(await send<T>(operation, prepared));
@@ -46,7 +50,14 @@ export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
   tail = run.catch(() => undefined);
   return result.promise;
 }
-export function derive<T>(operation: string, args: unknown[]): Promise<T> {
-  return offscreen<T>('derive', { operation, args: args.map(value =>
-    value instanceof Uint8Array ? { bytes: Array.from(value) } : value) });
+export function derive<T>(operation: string, args: unknown[], signal?: AbortSignal): Promise<T> {
+  const copies: number[][] = [];
+  const prepare = () => ({ operation, args: args.map(value => {
+    if (!(value instanceof Uint8Array)) return value;
+    const bytes = Array.from(value);
+    if (operation === 'audit-snapshot') copies.push(bytes);
+    return { bytes };
+  }) });
+  const result = offscreen<T>('derive', signal ? prepare : prepare(), signal);
+  return operation === 'audit-snapshot' ? result.finally(() => { for (const bytes of copies) bytes.fill(0); }) : result;
 }

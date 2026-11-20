@@ -144,6 +144,7 @@ export interface ItemSummary {
   primaryDomain?: string | null; tags: string[]; pinned: boolean;
   requireReprompt: boolean; trashed: boolean; cardLast4?: string | null;
   trashedAtMs?: number | null;
+  expiresAtMs?: number;
   cardBrand?: string | null; devSubtype?: string | null; hasTotp?: boolean; updatedAtMs?: number;
 }
 export interface VaultItem {

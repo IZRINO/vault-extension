@@ -80,6 +80,7 @@ export class VaultController {
   private generation = 0;
   private lastCaptureMs = -Infinity;
   private autofill?: AutofillSettings;
+  private auditAbort = new AbortController();
   private davAbort = new AbortController();
   private davClock?: Promise<Awaited<ReturnType<typeof readDavClock>>>;
   private davTimer?: ReturnType<typeof setTimeout>;
@@ -207,6 +208,8 @@ export class VaultController {
     this.session?.wrap.fill(0);
     this.session = undefined;
     this.autofill = undefined;
+    this.auditAbort.abort(new Error('密码库已锁定，请重新解锁。'));
+    this.auditAbort = new AbortController();
     this.davAbort.abort();
     this.davAbort = new AbortController();
     clearTimeout(this.davTimer);
@@ -1168,7 +1171,11 @@ export class VaultController {
         }
         return this.saveMutation(() => engine.empty_trash(Date.now()), check);
       }
-      case 'audit': return JSON.parse(engine.run_security_audit_json());
+      case 'audit': {
+        const report = await derive<string>('audit-snapshot', [session.key, session.wrap, this.files.head, this.files.snap], this.auditAbort.signal);
+        check();
+        return JSON.parse(report);
+      }
       case 'generate-password': return core.wasm_generate_password(message.optionsJson);
       case 'generate-passphrase': return core.wasm_generate_passphrase(message.optionsJson);
       case 'create-pin':

@@ -4,6 +4,7 @@ import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
 import initCsv, { wasm_parse_browser_csv, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv,
   wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
 import initEnte, { wasm_export_ente_auth, wasm_parse_ente_auth } from '../../../crates/vault-ente-auth/pkg/vault_ente_auth.js';
+import initAudit, { wasm_audit_snapshot } from '../../../crates/vault-audit/pkg/vault_audit.js';
 import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import initPreferences, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav,
   wasm_sign_authorization, wasm_verify_authorization } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
@@ -20,6 +21,7 @@ import type { JournalCommit, LocalSettings, RemoteAnchor, SessionState, VaultFil
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
   pauseEnte: undefined as (() => Promise<void>) | undefined,
+  pauseAudit: undefined as ((signal: AbortSignal | undefined) => Promise<void>) | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
   failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown>,
   observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined,
@@ -50,7 +52,7 @@ vi.mock('./vault-storage', () => ({
 vi.mock('./vault-core', () => ({ loadVaultCore: async () => wasm, randomBytes: (length: number) => crypto.getRandomValues(new Uint8Array(length)) }));
 vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
-  derive: async (operation: string, args: unknown[]) => {
+  derive: async (operation: string, args: unknown[], signal?: AbortSignal) => {
     if (operation === 'sync:local-wal') return Array.from(wasm_make_local_wal(...args as Parameters<typeof wasm_make_local_wal>));
     if (operation === 'sync:verify-recovery') return wasm_sync_verify_recovery(...args as Parameters<typeof wasm_sync_verify_recovery>);
     if (operation === 'sync:import-pack') {
@@ -80,6 +82,11 @@ vi.mock('./bridge', () => ({
       return wasm_parse_ente_auth(args[0] as Uint8Array, args[1] as string, args[2] as string | undefined);
     }
     if (operation === 'export-ente') return wasm_export_ente_auth(args[0] as string);
+    if (operation === 'audit-snapshot') {
+      const report = wasm_audit_snapshot(...args as Parameters<typeof wasm_audit_snapshot>);
+      await state.pauseAudit?.(signal);
+      return report;
+    }
     if (operation === 'generate-hotp' || operation === 'generate-otp') return wasm_otp_at(args[0] as string, args[1] as number ?? 0, args[2] as number ?? 0);
     if (operation === 'validate-totp') {
       try { wasm_validate_totp(args[0] as string); }
@@ -113,6 +120,7 @@ beforeAll(async () => {
   await init({ module_or_path: await readFile(new URL('../../../crates/vault-core/pkg/vault_core_bg.wasm', import.meta.url)) });
   await initCsv({ module_or_path: await readFile(new URL('../../../crates/vault-importers/pkg/vault_importers_bg.wasm', import.meta.url)) });
   await initEnte({ module_or_path: await readFile(new URL('../../../crates/vault-ente-auth/pkg/vault_ente_auth_bg.wasm', import.meta.url)) });
+  await initAudit({ module_or_path: await readFile(new URL('../../../crates/vault-audit/pkg/vault_audit_bg.wasm', import.meta.url)) });
   await initOtp({ module_or_path: await readFile(new URL('../../../crates/vault-otp/pkg/vault_otp_bg.wasm', import.meta.url)) });
   await initPreferences({ module_or_path: await readFile(new URL('../../../crates/vault-preferences/pkg/vault_preferences_bg.wasm', import.meta.url)) });
   await initSync({ module_or_path: await readFile(new URL('../../../crates/vault-sync/pkg/vault_sync_bg.wasm', import.meta.url)) });
@@ -124,6 +132,7 @@ beforeAll(async () => {
 beforeEach(() => {
   state.files = structuredClone(fixture); state.session = undefined; state.pause = undefined;
   state.pauseEnte = undefined;
+  state.pauseAudit = undefined;
   state.pauseSessionClear = undefined;
   state.idleState = 'active';
   state.failSave = false;
@@ -144,6 +153,36 @@ beforeEach(() => {
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
 describe('real WASM + background session integration', () => {
+  it('audits the authenticated snapshot without exposing secrets or keeping reports across lock', async () => {
+    const controller = await unlocked();
+    const item = record('Sensitive fixture', true);
+    item.data.password = 'password';
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    const id = (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
+    const before = structuredClone(state.files);
+    const report = await controller.handle({ type: 'audit' });
+    expect(report).toMatchObject({ missing2faItemIds: [id], weakItems: [{ itemId: id, title: item.title }] });
+    const finding = (report as { weakItems: Record<string, unknown>[] }).weakItems[0];
+    expect(finding).not.toHaveProperty('password');
+    expect(finding).not.toHaveProperty('username');
+    expect(state.files).toEqual(before);
+    const { key, wrap } = state.session!;
+    const damaged = state.files!.snap.slice();
+    damaged[damaged.length - 1] = damaged.at(-1)! ^ 1;
+    expect(() => wasm_audit_snapshot(key, wrap, state.files!.head, damaged)).toThrow();
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let auditSignal: AbortSignal | undefined;
+    state.pauseAudit = signal => { auditSignal = signal; started.resolve(); return finish.promise; };
+    const pending = controller.handle({ type: 'audit' });
+    const rejected = expect(pending).rejects.toThrow('密码库已锁定');
+    await started.promise;
+    try { await controller.lock(); } finally { finish.resolve(); }
+    expect(auditSignal?.aborted).toBe(true);
+    await rejected;
+    await expect(controller.handle({ type: 'audit' })).rejects.toThrow('解锁');
+  });
+
   it.each([401, 403, 429])('requires a corrected saved application password and a successful probe after HTTP %s', async status => {
     const input = { provider: 'koofr', base: '', folder: 'fixture', username: 'fixture-account', password: 'retired-app-password' } as const;
     const corrected = { ...input, password: 'replacement-app-password' };

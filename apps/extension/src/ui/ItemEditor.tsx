@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ArrowLeft, ChevronRight, Dices, Eye, EyeOff, Plus, Trash2 } from 'lucide-react';
 import { MAX_OTP_SETUP_LENGTH, request, type VaultItem } from '../vault-messages';
 import { AreaField, Ico, SecretField, SelectField, SwitchRow, TextField } from './components';
-import { developerFieldVisible, fieldSets, kinds, matchRules, subtypeNames, text } from './lib';
+import { developerFieldVisible, fieldSets, formatExpiryDate, kinds, matchRules, subtypeNames, text } from './lib';
 import { useOps } from './Main';
 
 export default function ItemEditor({ initial, save, close, onDirty }: {
@@ -61,9 +61,16 @@ export default function ItemEditor({ initial, save, close, onDirty }: {
         </div>
       </details>
     </>}
-    {item.data.kind === 'developer' && <TextField label="到期日期" type="date"
-      value={item.data.expiresAtMs ? new Date(Number(item.data.expiresAtMs)).toISOString().slice(0, 10) : ''}
-      onChange={value => update('expiresAtMs', value ? Date.parse(value) : null)} />}
+    {item.data.kind === 'developer' && <TextField label="到期日期" type="date" min="1970-01-01" max="9999-12-31"
+      value={formatExpiryDate(item.data.expiresAtMs)}
+      hint="按 UTC 日期记录。到期前 30 天开始提醒，清空日期可以停止提醒。"
+      onChange={value => {
+        if (!value) update('expiresAtMs', null);
+        else {
+          const time = Date.parse(value + 'T00:00:00Z');
+          if (formatExpiryDate(time) === value) update('expiresAtMs', time);
+        }
+      }} />}
     <AreaField label="备注" rows={3} value={item.note} onChange={note => setItem({ ...item, note })} />
     <TextField label="标签" hint="多个标签用逗号分隔。" value={item.tags.join(',')} onChange={value => setItem({ ...item, tags: value.split(/[,，]/) })} />
     <SwitchRow label="置顶" hint="在列表前面显示，方便下次取用。" checked={item.pinned} onChange={pinned => setItem({ ...item, pinned })} />

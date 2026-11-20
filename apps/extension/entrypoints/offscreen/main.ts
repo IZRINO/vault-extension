@@ -1,6 +1,9 @@
 import type { Reply } from '../../src/vault-messages';
 
 const preparedScanner = location.search === '?scan' ? new Worker(browser.runtime.getURL('/qr-worker.js')) : undefined;
+const auditLockError = '密码库已锁定，请重新解锁。';
+let abortAudit: (() => void) | undefined;
+let auditLocked = false;
 
 async function digest(text: string): Promise<string> {
   const bytes = new TextEncoder().encode(text);
@@ -31,8 +34,16 @@ function clipboardRead(): string {
   } finally { field.value = ''; field.remove(); }
 }
 browser.runtime.onMessage.addListener((message, sender, respond) => {
-  if (message?.target !== 'vault-offscreen') return;
+  const locked = message?.target === 'vault-event' && message.type === 'locked';
+  if (message?.target !== 'vault-offscreen' && !locked) return;
   if (sender.id !== browser.runtime.id || sender.tab || (sender.url && sender.url !== browser.runtime.getURL('/background.js'))) return;
+  if (locked) {
+    // This document is short-lived and jobs are serialized. Even an audit
+    // message delivered after the lock must not start until a new document.
+    auditLocked = true;
+    abortAudit?.();
+    return;
+  }
   const run = async (): Promise<unknown> => {
     if (message.operation === 'scan-otp' || message.operation === 'scan-migration-qr') {
       const migration = message.operation !== 'scan-otp';
@@ -49,28 +60,41 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       } finally { message.payload = ''; }
     }
     if (message.operation === 'derive') {
+      const { operation } = message.payload;
+      const audit = operation === 'audit-snapshot';
+      if (audit && auditLocked) {
+        for (const arg of message.payload.args) if (Array.isArray(arg?.bytes)) arg.bytes.fill(0);
+        throw new Error(auditLockError);
+      }
       return new Promise((resolve, reject) => {
         // Keep optional WASM out of the unlock path, including when WXT inlines worker assets.
-        const operation = message.payload.operation;
         const entry = operation === 'parse-browser-csv' ? '/csv-worker.js'
           : operation === 'parse-ente' || operation === 'export-ente' ? '/ente-worker.js'
+          : audit ? '/audit-worker.js'
           : ['csv-headers', 'parse-mapped-csv', 'export-login-csv', 'parse-authenticator-backup', 'portable-import', 'portable-export'].includes(operation) ? '/migration-worker.js'
           : ['seal-preferences', 'open-preferences', 'seal-webdav', 'open-webdav', 'sign-authorization', 'verify-authorization'].includes(operation) ? '/preferences-worker.js'
           : operation.startsWith('sync:') ? '/sync-worker.js'
           : operation.startsWith('passkey:') ? '/passkey-worker.js'
           : operation === 'validate-totp' || operation === 'generate-hotp' || operation === 'generate-otp' ? '/otp-worker.js' : '/kdf-worker.js';
         const worker = new Worker(browser.runtime.getURL(entry));
-        const timer = setTimeout(() => { worker.terminate(); reject(new Error('后台任务超时，请重试。')); }, 120000);
-        const finish = () => { clearTimeout(timer); worker.terminate(); };
+        const timer = setTimeout(() => { finish(); reject(new Error('后台任务超时，请重试。')); }, 120000);
+        const finish = () => { clearTimeout(timer); worker.terminate(); if (audit) abortAudit = undefined; };
+        if (audit) abortAudit = () => { finish(); reject(new Error(auditLockError)); };
         worker.onmessage = ({ data }: MessageEvent<Reply>) => {
           finish();
           if (data.ok) resolve(data.value); else reject(new Error(data.error));
         };
         worker.onerror = () => { finish(); reject(new Error('后台线程启动失败，请重试。')); };
-        const args = message.payload.args.map((v: unknown) =>
-          v && typeof v === 'object' && 'bytes' in v ? new Uint8Array((v as { bytes: number[] }).bytes) : v);
-        worker.postMessage({ operation, args });
-        for (const arg of args) if (arg instanceof Uint8Array) arg.fill(0);
+        const args = message.payload.args.map((v: unknown) => {
+          if (!v || typeof v !== 'object' || !('bytes' in v)) return v;
+          const bytes = (v as { bytes: number[] }).bytes;
+          const copy = new Uint8Array(bytes);
+          if (audit) bytes.fill(0);
+          return copy;
+        });
+        try { worker.postMessage({ operation, args }); }
+        catch (error) { finish(); reject(error); }
+        finally { for (const arg of args) if (arg instanceof Uint8Array) arg.fill(0); }
       });
     }
     if (message.operation === 'copy') {

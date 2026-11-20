@@ -114,6 +114,19 @@ export function formatDateTime(ms: number | undefined): string {
   return new Date(ms).toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+const EXPIRY_WARNING_MS = 30 * 24 * 60 * 60 * 1000;
+const validExpiry = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < Date.UTC(10000, 0, 1);
+
+export function formatExpiryDate(value: unknown): string {
+  return validExpiry(value) ? new Date(value).toISOString().slice(0, 10) : '';
+}
+
+export function expiryLabel(value: unknown, now: number): string {
+  if (!validExpiry(value) || value - now > EXPIRY_WARNING_MS) return '';
+  return value <= now ? '已到期' : '30 天内到期';
+}
+
 export const isPopup = () => document.body.classList.contains('popup');
 
 /** 列表筛选：回收站只看已移除的，其余只看未移除的；再按分类和搜索词过滤。 */

@@ -266,7 +266,7 @@ function Workspace({ status, refresh, initialItems, startBackupImport }: Workspa
             save={item => void save(item)} onDirty={value => { dirty.current = value; }}
             close={() => void leave().then(ok => { if (ok) setScreen(screen.back ? { name: 'detail', item: screen.back } : { name: 'list' }); })} />}
           {tab === 'generator' && <Generator />}
-          {tab === 'audit' && <Audit open={openById} />}
+          {tab === 'audit' && <Audit open={openById} items={items} />}
           {tab === 'settings' && <Settings status={status} page={settingsPage} setPage={setSettingsPage} refresh={reload} />}
           </Suspense>
         </main>

@@ -1855,6 +1855,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vault-audit"
+version = "0.1.0"
+dependencies = [
+ "vault-core",
+ "wasm-bindgen",
+ "zeroize",
+]
+
+[[package]]
 name = "vault-core"
 version = "0.1.0"
 dependencies = [
@@ -1905,6 +1914,7 @@ dependencies = [
  "p256",
  "pbkdf2",
  "prost",
+ "quick-xml",
  "rmp-serde",
  "scrypt",
  "serde",

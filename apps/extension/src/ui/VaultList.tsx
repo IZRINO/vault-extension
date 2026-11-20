@@ -2,7 +2,7 @@ import { ArchiveRestore, Copy, CreditCard, KeyRound, LockKeyhole, PackageOpen, P
 import { useMemo, useState } from 'react';
 import type { ItemSummary } from '../vault-messages';
 import { CopyButton, Ico } from './components';
-import { filterItems, plateText, rowSubtitle } from './lib';
+import { expiryLabel, filterItems, plateText, rowSubtitle } from './lib';
 import { useOps } from './Main';
 
 const filters: { id: string; label: string }[] = [
@@ -40,6 +40,7 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
   const searching = query.trim() !== '';
   const filterName = filters.find(entry => entry.id === filter)?.label;
   const trash = filter === 'trash' ? (items ?? []).filter(item => item.trashed) : [];
+  const now = Date.now();
   return <div className="view">
     <div className="toolbar">
       <div className="chips" role="group" aria-label="分类筛选">
@@ -66,7 +67,7 @@ export default function VaultList({ items, query, filter, changesSinceBackup, se
               {item.pinned && <><Ico of={Pin} /><span className="sr-only">已置顶</span></>}
               {item.requireReprompt && <><Ico of={LockKeyhole} /><span className="sr-only">打开前需要验证</span></>}
             </span>
-            <span className="row-sub">{rowSubtitle(item)}</span>
+            <span className="row-sub">{[!item.trashed && expiryLabel(item.expiresAtMs, now), rowSubtitle(item)].filter(Boolean).join(' · ')}</span>
           </span>
         </button>
         <div className="row-actions">

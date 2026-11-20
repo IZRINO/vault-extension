@@ -633,6 +633,10 @@ impl VaultItem {
             card_brand,
             card_last4,
             dev_subtype,
+            expires_at_ms: match &self.data {
+                CredentialData::Developer(dev) => dev.expires_at_ms,
+                _ => None,
+            },
             has_totp,
             tags: self.tags.clone(),
             pinned: self.pinned,
@@ -658,6 +662,7 @@ pub struct VaultItemSummary {
     pub card_brand: Option<CardBrand>,
     pub card_last4: Option<String>,
     pub dev_subtype: Option<DeveloperCredentialSubtype>,
+    pub expires_at_ms: Option<u64>,
     pub has_totp: bool,
     pub tags: Vec<String>,
     pub pinned: bool,
@@ -970,7 +975,7 @@ impl VaultItem {
 
 impl VaultItemSummary {
     pub fn to_json_value(&self) -> JVal {
-        JVal::Obj(vec![
+        let mut fields = vec![
             ("id", JVal::Str(self.id.clone())),
             ("title", JVal::Str(self.title.clone())),
             ("kind", JVal::Str(self.kind.clone())),
@@ -998,6 +1003,10 @@ impl VaultItemSummary {
             ("trashed", JVal::Bool(self.trashed)),
             ("trashedAtMs", JVal::opt_u64(self.trashed_at_ms)),
             ("updatedAtMs", JVal::Uint(self.updated_at_ms)),
-        ])
+        ];
+        if let Some(time) = self.expires_at_ms {
+            fields.push(("expiresAtMs", JVal::Uint(time)));
+        }
+        JVal::Obj(fields)
     }
 }

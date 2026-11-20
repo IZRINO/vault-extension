@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { ArrowLeft, ChevronRight, ExternalLink, Eye, EyeOff, MoreHorizontal, Pencil, ShieldCheck, Trash2 } from 'lucide-react';
+import { ArrowLeft, ChevronRight, ExternalLink, Eye, EyeOff, MoreHorizontal, Pencil, ShieldCheck, Trash2, TriangleAlert } from 'lucide-react';
 import { request, type ItemDetailData } from '../vault-messages';
 import { CopyButton, Ico, MenuButton } from './components';
 import { useDialogs } from './dialogs';
-import { developerFieldVisible, fieldSets, formatDateTime, kinds, openableUrl, plateText, subtypeNames, text } from './lib';
+import { developerFieldVisible, expiryLabel, fieldSets, formatDateTime, formatExpiryDate, kinds, openableUrl, plateText, subtypeNames, text } from './lib';
 import { useOps } from './Main';
 import TotpSection, { HotpSection } from './TotpSection';
 
@@ -31,6 +31,9 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove, otpUs
     .filter(field => !authenticatorOnly || field.key !== 'password');
   const uris = (item.data.uris ?? []) as { uri: string }[];
   const history = (item.data.passwordHistory ?? []) as { password: string; changedAtMs: number }[];
+  const expiry = item.data.kind === 'developer' ? item.data.expiresAtMs : undefined;
+  const expiryDate = formatExpiryDate(expiry);
+  const expiryNotice = item.trashed ? '' : expiryLabel(expiry, Date.now());
   function checkOnline() {
     // Request permission directly in this click's user activation.
     void browser.permissions.request({ origins: ['https://api.pwnedpasswords.com/*'] }).then(granted => {
@@ -54,7 +57,10 @@ export default function ItemDetail({ item, back, edit, setTrashed, remove, otpUs
     <div className="identity"><span className="plate plate-l" data-kind={item.data.kind} aria-hidden="true">{plateText(item.title)}</span>
       <div><h2>{item.title}</h2><p>{authenticatorOnly ? '两步验证码' : item.data.kind === 'developer' ? subtypeNames[text(item.data.subtype)] : kinds[item.data.kind]}{item.pinned && ' · 已置顶'}{item.requireReprompt && ' · 需要再次验证'}</p></div></div>
     {item.trashed && <div className="banner banner-warn">这条凭证在回收站里。恢复后可以继续使用。</div>}
+    {expiryNotice && <div className="banner banner-warn" role="status"><Ico of={TriangleAlert} />
+      <span>{expiryNotice}。请在来源服务更新凭证，再更新 Vault 中的记录。</span></div>}
     <div className="facts">{fields.map(field => <Fact key={field.key} label={field.label} value={text(item.data[field.key])} secret={field.secret} />)}</div>
+    {expiryDate && <p className="meta">到期日期：<time dateTime={expiryDate}>{expiryDate}</time>（UTC）</p>}
     {!item.trashed && (item.otp?.kind === 'hotp' ? <HotpSection id={item.id} requireReprompt={item.requireReprompt} used={otpUsed} /> :
       item.otp?.handle ? <TotpSection id={item.id} handle={item.otp.handle} /> : null)}
     {uris.length > 0 && <section className="section"><h2>网站</h2><div className="facts">{uris.map((uri, i) => {

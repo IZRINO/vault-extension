@@ -11,10 +11,7 @@ pub mod sync_codec;
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::audit::{
-    audit_vault_items, evaluate_password_strength, hibp_match_range_response,
-    hibp_sha1_prefix_and_suffix,
-};
+use crate::audit::{evaluate_password_strength, hibp_match_range_response, hibp_sha1_prefix_and_suffix};
 use crate::crypto::{
     calibrate_kdf_params, csprng_fill, derive_master_kek, KdfParams, RecoveryCode, SecretKey,
     VaultKeyHierarchy, MIN_M_COST_KIB,
@@ -604,11 +601,6 @@ impl WasmVaultEngine {
         })
     }
 
-    pub fn run_security_audit_json(&self) -> Result<String, JsValue> {
-        let snap = self.inner.snapshot_ref()?;
-        let report = audit_vault_items(&snap.items);
-        Ok(report.to_json_value().stringify())
-    }
 }
 
 
@@ -1196,6 +1188,21 @@ mod tests {
         assert_eq!(report.total_login_items, 2);
         assert_eq!(report.weak_items.len(), 2);
         assert!(report.weak_items.iter().all(|finding| finding.item_id != "otp"));
+    }
+
+    #[test]
+    fn audit_suggests_second_factors_only_for_sensitive_password_logins() {
+        let items: Vec<_> = [
+            r#"{"id":"provider","data":{"kind":"login","password":"fixture","uris":[{"uri":"https://work.example"},{"uri":"https://ACCOUNTS.Google.Com.:443/signin"}]}}"#,
+            r#"{"id":"protected","requireReprompt":true,"data":{"kind":"login","password":"fixture","uris":[{"uri":"https://bank.example"}]}}"#,
+            r#"{"id":"recorded","data":{"kind":"login","password":"fixture","uris":[{"uri":"https://github.com"}],"totpUri":"JBSWY3DPEHPK3PXP"}}"#,
+            r#"{"id":"passkey-only","data":{"kind":"login","uris":[{"uri":"https://github.com"}]}}"#,
+            r#"{"id":"unrelated","data":{"kind":"login","password":"fixture","uris":[{"uri":"https://example.test"}]}}"#,
+            r#"{"id":"spoofed","data":{"kind":"login","password":"fixture","uris":[{"uri":"https://fakegithub.com"},{"uri":"https://github.com.example.test"},{"uri":"https://github.com@example.test"},{"uri":"file://github.com"},{"uri":"https://github.com","matchRule":"regex"}]}}"#,
+            r#"{"id":"removed","trashed":true,"data":{"kind":"login","password":"fixture","uris":[{"uri":"https://github.com"}]}}"#,
+        ].into_iter().map(|item| VaultItem::from_json_str(item).unwrap()).collect();
+        let report = crate::audit::audit_vault_items(&items);
+        assert_eq!(report.missing_2fa_item_ids, ["provider", "protected"]);
     }
 
     #[test]

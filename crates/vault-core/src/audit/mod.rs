@@ -200,7 +200,6 @@ pub fn evaluate_password_strength(password: &str, user_hints: &[String]) -> Pass
 pub struct WeakItemFinding {
     pub item_id: String,
     pub title: String,
-    pub username: String,
     pub score: u8,
     pub entropy_tenths: u32,
     pub warnings: Vec<String>,
@@ -236,7 +235,6 @@ impl VaultSecurityAuditReport {
                             JVal::Obj(vec![
                                 ("itemId", JVal::Str(w.item_id.clone())),
                                 ("title", JVal::Str(w.title.clone())),
-                                ("username", JVal::Str(w.username.clone())),
                                 ("score", JVal::Uint(w.score as u64)),
                                 ("entropyBits", JVal::Tenths(w.entropy_tenths)),
                                 (
@@ -282,6 +280,37 @@ impl VaultSecurityAuditReport {
         ])
     }
 }
+/// A local advisory list, not a claim about the website's account settings.
+fn sensitive_site(uri: &crate::model::UriEntry) -> bool {
+    if uri.match_rule == crate::model::UriMatchRule::Regex {
+        return false;
+    }
+    let raw = uri.uri.trim_ascii();
+    let rest = match raw.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") => rest,
+        Some(_) => return false,
+        None => raw,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.split_once(':') {
+        Some((host, port)) if port.parse::<u16>().is_ok() => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host.len() > 253 || !host.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    }) {
+        return false;
+    }
+    [
+        "google.com", "github.com", "apple.com", "icloud.com", "microsoft.com",
+        "microsoftonline.com", "live.com", "amazon.com", "cloudflare.com", "paypal.com",
+        "alipay.com", "proton.me", "dropbox.com", "bitwarden.com", "1password.com",
+    ].iter().any(|root| host == *root || host.strip_suffix(root).is_some_and(|prefix| prefix.ends_with('.')))
+}
+
 /// Runs a zero-leakage offline security health check over in-memory decrypted vault items.
 pub fn audit_vault_items(items: &[VaultItem]) -> VaultSecurityAuditReport {
     let mut total_login_items = 0usize;
@@ -311,7 +340,6 @@ pub fn audit_vault_items(items: &[VaultItem]) -> VaultSecurityAuditReport {
                 weak_items.push(WeakItemFinding {
                     item_id: item.id.clone(),
                     title: item.title.clone(),
-                    username: login.username.clone(),
                     score: eval.score,
                     entropy_tenths: eval.entropy_tenths,
                     warnings: eval.warnings,
@@ -326,10 +354,9 @@ pub fn audit_vault_items(items: &[VaultItem]) -> VaultSecurityAuditReport {
                     by_pw_digest.push((digest, vec![(item.id.clone(), item.title.clone())]));
                 }
             }
-            if login
-                .totp_uri
-                .as_ref()
-                .is_none_or(|s| s.trim_ascii().is_empty())
+            if !login.password.is_empty()
+                && login.totp_uri.as_ref().is_none_or(|s| s.trim_ascii().is_empty())
+                && (item.require_reprompt || login.uris.iter().any(sensitive_site))
             {
                 missing_2fa_item_ids.push(item.id.clone());
             }
