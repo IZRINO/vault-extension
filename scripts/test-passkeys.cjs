@@ -440,6 +440,87 @@ async function verifyConflictReview(first, second) {
   const values = await Promise.all(copies.map(row => first.send({ type: 'get', id: row.id })));
   assert.deepEqual(values.map(item => item.data.password).sort(), ['fixture-A', 'fixture-B']);
   await review.close();
+
+  const editableTitle = 'Field resolution fixture';
+  await update(first, { id: '', title: editableTitle, data: { kind: 'login', username: 'fixture', password: 'field-base', uris: [] },
+    note: '', tags: [], customFields: [], pinned: false, requireReprompt: false, trashed: false });
+  await first.send({ type: 'webdav-sync' });
+  await second.send({ type: 'webdav-sync' });
+  const fieldId = (await second.send({ type: 'list' })).find(row => row.title === editableTitle).id;
+  const remote = await first.send({ type: 'get-edit', id: fieldId });
+  const local = await second.send({ type: 'get-edit', id: fieldId });
+  await update(first, { ...remote, tags: ['fixture-remote-tag'], data: { ...remote.data, password: 'field-remote' } });
+  await update(second, { ...local, note: 'fixture-local-note', data: { ...local.data, password: 'field-local' } });
+  await first.send({ type: 'webdav-sync' });
+  assert.equal((await second.send({ type: 'webdav-sync' })).count, 1);
+
+  const openReview = async () => {
+    await second.view.reload();
+    const opened = second.context.waitForEvent('page');
+    await second.view.getByRole('button', { name: '处理 1 项同步冲突' }).click();
+    const page = await opened;
+    const item = page.locator('details').filter({ has: page.getByText(editableTitle, { exact: true }) }).first();
+    await item.locator('summary').click();
+    await item.getByLabel('裁决', { exact: true }).selectOption('fields');
+    await item.getByLabel('密码', { exact: true }).selectOption('ours');
+    await page.getByRole('button', { name: '预览 1 项裁决' }).click();
+    const result = page.getByRole('region', { name: editableTitle });
+    await expect(result.getByText('fixture-local-note', { exact: true })).toBeVisible();
+    await expect(result.getByText('fixture-remote-tag', { exact: false })).toBeVisible();
+    assert.doesNotMatch(await result.innerText(), /field-local|field-remote|field-base/);
+    await result.getByText('微调合并结果', { exact: true }).click();
+    return { page, result };
+  };
+  const pending = await second.send({ type: 'webdav-conflicts' });
+  await assert.rejects(second.send({ type: 'webdav-resolve-preview', stamp: 'stale',
+    rules: [{ id: fieldId, mode: 'ours' }] }), /重新预览/);
+  const peers = [first, second];
+  const editState = () => Promise.all(peers.map(peer => peer.send({ type: 'get-edit', id: fieldId })));
+  const beforePreview = await editState();
+  const abandoned = await openReview();
+  const masterInput = abandoned.page.getByLabel('当前主密码', { exact: true });
+  const reveal = abandoned.page.getByRole('button', { name: '验证并显示结果' });
+  await masterInput.fill('fixture-wrong-master');
+  await reveal.click();
+  await expect(abandoned.page.getByRole('alert')).toContainText('主密码验证失败');
+  assert.doesNotMatch(await abandoned.result.innerText(), /field-local|field-remote|field-base/);
+  await masterInput.fill(master);
+  await reveal.click();
+  await expect(abandoned.result.getByText('field-local', { exact: true })).toBeVisible();
+  await abandoned.result.getByLabel('替换后的登录密码', { exact: true }).fill('discarded-fixture');
+  await expect(abandoned.result.getByText('field-local', { exact: true })).toHaveCount(0);
+  await abandoned.page.getByRole('button', { name: '返回', exact: true }).click();
+  await abandoned.page.close();
+  assert.equal((await second.send({ type: 'webdav-conflicts' })).stamp, pending.stamp);
+  assert.deepEqual(await editState(), beforePreview);
+
+  const resolved = await openReview();
+  await resolved.result.getByLabel('修改备注').check();
+  await resolved.result.getByLabel('新备注', { exact: true }).fill('fixture-merged-note');
+  await resolved.result.getByLabel('替换后的登录密码', { exact: true }).fill(' field-replacement ');
+  await expect(resolved.result.getByText('fixture-merged-note', { exact: true })).toBeVisible();
+  await resolved.page.getByLabel('当前主密码', { exact: true }).fill(master);
+  await resolved.page.getByRole('button', { name: '确认裁决' }).click();
+  await expect(resolved.page.getByRole('button', { name: '新建', exact: true })).toBeVisible();
+  await second.send({ type: 'webdav-sync' });
+  await first.send({ type: 'webdav-sync' });
+  const afterConfirm = await editState();
+  await assert.rejects(second.send({ type: 'webdav-resolve', stamp: pending.stamp, proof: { method: 'master', secret: master },
+    rules: [{ id: fieldId, mode: 'ours' }] }), /重新预览/);
+  assert.deepEqual(await editState(), afterConfirm);
+  for (const peer of peers) {
+    const actual = await peer.send({ type: 'get', id: fieldId });
+    assert.equal(actual.note, 'fixture-merged-note');
+    assert.deepEqual(actual.tags, ['fixture-remote-tag']);
+    assert.equal(actual.data.password, ' field-replacement ');
+    for (const previous of ['field-local', 'field-remote']) {
+      const history = actual.data.passwordHistory.filter(entry => entry.password === previous);
+      assert.equal(history.length, 1);
+      assert(history[0].sourceDevice && history[0].changedAtMs > 0);
+    }
+    assert.equal((await peer.send({ type: 'webdav-conflicts' })).rows.length, 0);
+  }
+  await resolved.page.close();
 }
 
 async function runHistoryRecovery() {
@@ -849,7 +930,8 @@ async function run() {
       helium: ['WebDAV sign-in using both original keys', 'authenticated .vaultpack restored both original keys'],
       failedUploadBS0: true, verifiedRecoveryBS1: true, defaultCountNoWrite: true, incrementalCountPersisted: true,
       independentMergeKeptSourceAndTargetIdentity: true, nativeFallbackOnceWithVirtualAuthenticator: true, wildcardNativeFallback: true,
-      abortAndNavigationCanceledOnBothBrowsers: true, promptTimeoutCanceledOnEdge: true, conflictReviewTabAndKeepBoth: true }));
+      abortAndNavigationCanceledOnBothBrowsers: true, promptTimeoutCanceledOnEdge: true, conflictReviewTabAndKeepBoth: true,
+      conflictFieldPreviewAndPasswordHistory: true }));
   } finally {
     await Promise.all(locals.reverse().map(local => local.close()));
     await site.done();

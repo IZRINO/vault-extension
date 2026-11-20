@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use vault_core::crypto::{FileRole, VaultKeyHierarchy};
 use vault_core::error::VaultError;
 use vault_core::json_lite::JVal;
-use vault_core::model::{VaultItem, generate_uuid_v4};
+use vault_core::model::{CredentialData, VaultItem, generate_uuid_v4};
 use vault_core::sync_codec::{MpReader, MsgPackWire, mp_write_array_len, mp_write_bin, mp_write_str, open_compact_object, seal_compact_object};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -162,30 +162,34 @@ impl Conflict {
     fn sensitive(&self) -> bool {
         self.base.iter().chain(&self.ours).chain(self.matches().map(|(item, _)| item)).any(|item| item.require_reprompt)
     }
+
+    fn version_json(item: &VaultItem, source: &str, fields: &[&str], permit: bool, revealed: bool) -> JVal {
+        let value = item.to_json_value();
+        let field = |name: &str| {
+            if !permit || matches!(name, "data.totpUri" | "data.passkeys" | "data.privateKey" | "data.passwordHistory") {
+                return JVal::Str("未显示".into());
+            }
+            if matches!(name, "$item" | "$duplicate" | "data") { return JVal::Str(item.title.clone()); }
+            if let Some(field) = name.strip_prefix("data.") {
+                if !revealed && matches!(field, "password" | "cvv" | "cardNumber" | "cardPin" | "tokenOrLicense" | "nationalIdOrPassport" | "taxId") {
+                    return JVal::Str("••••••••".into());
+                }
+                return value.get_field("data").and_then(|data| data.get_field(field)).cloned().unwrap_or(JVal::Null);
+            }
+            if name == "customFields" && !revealed { return JVal::Str("未显示".into()); }
+            value.get_field(name).cloned().unwrap_or(JVal::Null)
+        };
+        JVal::Obj(vec![("title", JVal::Str(item.title.clone())), ("time", JVal::Uint(item.updated_at_ms)), ("source", JVal::Str(source.into())),
+            ("trashed", JVal::Bool(item.trashed)), ("values", JVal::ParsedObj(fields.iter().map(|&name| (name.into(), field(name))).collect()))])
+    }
+
     fn json(&self, revealed: bool) -> JVal {
-        let permit = !self.sensitive() || revealed;
-        let group_fields = ["data.username", "data.uris", "data.password", "data.totpUri"];
-        let fields: Vec<&str> = if self.fields == ["$duplicate"] { group_fields.to_vec() }
-            else { self.fields.iter().map(String::as_str).collect() };
+        let permit = revealed || !self.sensitive();
+        let fields: Vec<&str> = if self.fields == ["$duplicate"] {
+            vec!["data.username", "data.uris", "data.password", "data.totpUri"]
+        } else { self.fields.iter().map(String::as_str).collect() };
         let render = |side: Option<&VaultItem>, source: &str| {
-            let Some(item) = side else { return JVal::Null; };
-            let value = item.to_json_value();
-            let field = |name: &str| {
-                if !permit || matches!(name, "data.totpUri" | "data.passkeys" | "data.privateKey") {
-                    return JVal::Str("未显示".into());
-                }
-                if matches!(name, "$item" | "$duplicate" | "data") { return JVal::Str(item.title.clone()); }
-                if let Some(field) = name.strip_prefix("data.") {
-                    if !revealed && matches!(field, "password" | "cvv" | "cardNumber" | "cardPin" | "tokenOrLicense" | "nationalIdOrPassport") {
-                        return JVal::Str("••••••••".into());
-                    }
-                    return value.get_field("data").and_then(|data| data.get_field(field)).cloned().unwrap_or(JVal::Null);
-                }
-                if name == "customFields" && !revealed { return JVal::Str("未显示".into()); }
-                value.get_field(name).cloned().unwrap_or(JVal::Null)
-            };
-            JVal::Obj(vec![("title", JVal::Str(item.title.clone())), ("time", JVal::Uint(item.updated_at_ms)), ("source", JVal::Str(source.into())),
-                ("trashed", JVal::Bool(item.trashed)), ("values", JVal::ParsedObj(fields.iter().map(|&name| (name.into(), field(name))).collect()))])
+            side.map_or(JVal::Null, |item| Self::version_json(item, source, &fields, permit, revealed))
         };
         JVal::Obj(vec![("id", JVal::Str(self.id.clone())), ("fields", JVal::Arr(self.fields.iter().cloned().map(JVal::Str).collect())),
             ("protected", JVal::Bool(self.sensitive())), ("base", render(self.base.as_ref(), "")), ("ours", render(self.ours.as_ref(), self.labels().0)),
@@ -284,17 +288,93 @@ fn resolve_one(conflict: &Conflict, rule: &JVal) -> Result<Vec<VaultItem>, Vault
         }
         merge::item(base, ours, theirs, &choices, sources)?.item.into_iter().collect()
     };
+    let adjustment = |name: &str, limit: usize| {
+        rule.get_field(name).map(|value| {
+            value.as_str().filter(|value| value.len() <= limit)
+                .ok_or_else(|| VaultError::InvalidInput("InvalidResolutionAdjustment".into()))
+        }).transpose()
+    };
+    let title = adjustment("title", 1024)?;
+    let note = adjustment("note", 65_536)?;
+    let password = adjustment("password", 16_384)?;
     if let [item] = result.as_mut_slice() {
-        if let Some(title) = rule.get_field("title").and_then(JVal::as_str) {
-            if title.trim().is_empty() || title.len() > 1024 { return Err(invalid()); }
+        if let Some(title) = title {
+            if title.trim().is_empty() { return Err(VaultError::InvalidInput("InvalidResolutionAdjustment".into())); }
             item.title = title.to_string();
         }
-        if let Some(note) = rule.get_field("note").and_then(JVal::as_str) {
-            if note.len() > 65_536 { return Err(invalid()); }
+        if let Some(note) = note {
             drop(Zeroizing::new(std::mem::replace(&mut item.note, note.to_string())));
         }
+        if let Some(password) = password {
+            let CredentialData::Login(login) = &mut item.data else { return Err(invalid()); };
+            if item.trashed || password.is_empty() { return Err(invalid()); }
+            if login.password != password {
+                drop(Zeroizing::new(std::mem::replace(&mut login.password, password.to_string())));
+                // Rebuild from the source histories against the final password.
+                // The first merge may have archived the value that now wins.
+                login.password_history.clear();
+                let displaced: Vec<_> = ours.into_iter().map(|item| (item, sources.0))
+                    .chain(conflict.matches()).collect();
+                merge::archive_resolution(item, &displaced);
+            }
+        }
+    } else if title.is_some() || note.is_some() || password.is_some() {
+        return Err(invalid());
     }
     Ok(result)
+}
+
+fn selected_rules(rules: &JVal, count: usize) -> Result<BTreeMap<String, &JVal>, VaultError> {
+    let rules = rules.as_array().filter(|rules| !rules.is_empty() && rules.len() <= count).ok_or_else(invalid)?;
+    let mut selected = BTreeMap::new();
+    for rule in rules {
+        if selected.insert(rule.get_str("id"), rule).is_some() { return Err(invalid()); }
+    }
+    Ok(selected)
+}
+
+fn preview_resolutions(rows: &[Conflict], rules: &str, revealed: bool) -> Result<JVal, VaultError> {
+    let rules = JVal::parse(rules)?;
+    let mut selected = selected_rules(&rules, rows.len())?;
+    let mut planned = Vec::new();
+    for row in rows {
+        let Some(rule) = selected.remove(&row.id) else { continue; };
+        let items = resolve_one(row, rule)?;
+        let can_replace_password = matches!(items.as_slice(), [item] if !item.trashed && matches!(item.data, CredentialData::Login(_)));
+        let permit = revealed || !row.sensitive();
+        let has_replacement = rule.get_field("password").is_some();
+        let collect_item = |item: &VaultItem| {
+            let mut fields = vec!["note", "tags"];
+            let summary: &[_] = match item.data {
+                CredentialData::Login(_) => &["data.username", "data.uris", "data.password"],
+                CredentialData::PaymentCard(_) => &["data.cardholderName", "data.cardNumber", "data.brand", "data.expMonth", "data.expYear"],
+                CredentialData::Identity(_) => &["data.fullName", "data.email"],
+                CredentialData::Developer(_) => &["data.serviceOrProduct"],
+            };
+            fields.extend(summary);
+            for field in &row.fields {
+                let field = field.as_str();
+                if !matches!(field, "$item" | "$duplicate" | "data" | "title" | "trashed") && !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
+            // The replacement already has a masked input in the review UI.
+            fields.retain(|field| *field != "customFields" && (!has_replacement || *field != "data.password"));
+            Conflict::version_json(item, "", &fields, permit, revealed)
+        };
+        planned.push(JVal::Obj(vec![("id", JVal::Str(row.id.clone())), ("canReplacePassword", JVal::Bool(can_replace_password)),
+            ("items", JVal::Arr(items.iter().map(collect_item).collect()))]));
+    }
+    if !selected.is_empty() { return Err(invalid()); }
+    Ok(JVal::Arr(planned))
+}
+
+#[wasm_bindgen]
+pub fn wasm_sync_preview_resolutions(key: Vec<u8>, wrap: Vec<u8>, staged: &[u8], rules: String, revealed: bool) -> Result<String, JsValue> {
+    let (key, wrap, rules) = (Zeroizing::new(key), Zeroizing::new(wrap), Zeroizing::new(rules));
+    let (vault, _, keys) = super::keys(&key, &wrap)?;
+    let staged = Staged::open(&keys, &vault, staged)?;
+    Ok(preview_resolutions(&staged.rows, &rules, revealed)?.stringify())
 }
 
 #[wasm_bindgen]
@@ -307,11 +387,7 @@ pub fn wasm_sync_resolve(
     let staged = Staged::open(&keys, &vault, staged)?;
     let mut items: BTreeMap<_, _> = snapshot.items.drain(..).map(|item| (item.id.clone(), item)).collect();
     let rules = JVal::parse(&rules)?;
-    let rules = rules.as_array().filter(|rules| !rules.is_empty() && rules.len() <= staged.rows.len()).ok_or_else(invalid)?;
-    let mut selections = BTreeMap::new();
-    for rule in rules {
-        if selections.insert(rule.get_str("id"), rule).is_some() { return Err(invalid().into()); }
-    }
+    let mut selections = selected_rules(&rules, staged.rows.len())?;
     let mut remaining = Vec::new();
     let mut receipts = Vec::new();
     for row in staged.rows {
@@ -343,8 +419,66 @@ pub fn wasm_sync_resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vault_core::model::CredentialData;
     use vault_passkeys::{Passkey, bundle};
+
+    #[test]
+    fn preview_shows_automatic_merges_and_redacts_secrets() {
+        let mut row = preview_fixture();
+        let rules = r#"[{"id":"same","mode":"fields","fields":{"data.password":"ours"}}]"#;
+        let preview = preview_resolutions(std::slice::from_ref(&row), rules, false).unwrap().stringify();
+        assert!(preview.contains("local-note") && preview.contains("remote-label"));
+        assert!(!preview.contains("fixture-password") && !preview.contains("otpauth"));
+        row.theirs.as_mut().unwrap().require_reprompt = true;
+        let masked = preview_resolutions(std::slice::from_ref(&row), rules, false).unwrap().stringify();
+        assert!(!masked.contains("local-note") && !masked.contains("remote-label"));
+        let revealed = preview_resolutions(std::slice::from_ref(&row), rules, true).unwrap().stringify();
+        assert!(revealed.contains("local-note") && revealed.contains("fixture-password-A"));
+        let replaced = preview_resolutions(&[row], r#"[{"id":"same","mode":"ours","password":"replacement-fixture"}]"#, true).unwrap().stringify();
+        assert!(!replaced.contains("replacement-fixture") && !replaced.contains("fixture-password"));
+    }
+
+    #[test]
+    fn manual_password_preserves_both_displaced_versions() {
+        let row = preview_fixture();
+        let rule = JVal::parse(r#"{"mode":"ours","title":"Edited","note":"","password":" typed verbatim "}"#).unwrap();
+        let items = resolve_one(&row, &rule).unwrap();
+        let item = &items[0];
+        assert_eq!(item.title, "Edited");
+        assert!(item.note.is_empty());
+        let CredentialData::Login(ref login) = item.data else { panic!() };
+        assert_eq!(login.password, " typed verbatim ");
+        assert_eq!(login.password_history.iter().map(|entry| {
+            (entry.password.as_str(), entry.changed_at_ms, entry.source_device.as_deref())
+        }).collect::<Vec<_>>(), vec![
+            ("fixture-password-B", 30, Some("Remote")),
+            ("fixture-password-A", 20, Some("Local")),
+        ]);
+    }
+
+    #[test]
+    fn manual_password_equal_to_one_side_archives_only_the_other() {
+        let row = preview_fixture();
+        let rule = JVal::parse(r#"{"mode":"ours","password":"fixture-password-B"}"#).unwrap();
+        let items = resolve_one(&row, &rule).unwrap();
+        let CredentialData::Login(ref login) = items[0].data else { panic!() };
+        assert_eq!(login.password, "fixture-password-B");
+        assert_eq!(login.password_history.len(), 1);
+        assert_eq!(login.password_history[0].password, "fixture-password-A");
+    }
+
+    fn preview_fixture() -> Conflict {
+        let version = |password: &str, note: &str, tags: &str, time| VaultItem::from_json_str(&format!(
+            r#"{{"id":"same","title":"Fixture","note":"{note}","tags":[{tags}],"updatedAtMs":{time},
+                "data":{{"kind":"login","password":"{password}","totpUri":"otpauth://totp/Fixture?secret=JBSWY3DPEHPK3PXP"}}}}"#
+        )).unwrap();
+        Conflict {
+            id: "same".into(), fields: vec!["data.password".into()], receipt: None, additional: Vec::new(),
+            base: Some(version("fixture-password-Base", "base-note", "", 10)),
+            ours: Some(version("fixture-password-A", "local-note", "", 20)),
+            theirs: Some(version("fixture-password-B", "base-note", r#""remote-label""#, 30)),
+            sources: Some(("Local".into(), "Remote".into())),
+        }
+    }
 
     #[test]
     fn split_keeps_latest_counter_on_original_and_suspends_the_duplicate() {

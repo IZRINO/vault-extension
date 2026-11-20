@@ -1,6 +1,7 @@
 import init, { wasm_make_local_wal, wasm_verify_local_wal, wasm_sync_authenticate_head, wasm_sync_create_genesis,
   wasm_sync_history_metadata, wasm_sync_unlock_head, wasm_sync_verify_recovery, wasm_sync_verify_snapshot, wasm_sync_replay, wasm_sync_make_batch,
-  wasm_sync_reconcile, wasm_sync_adopt, wasm_sync_write_guard, wasm_sync_conflicts, wasm_sync_conflict_stamp, wasm_sync_resolve, wasm_sync_guard_staged,
+  wasm_sync_reconcile, wasm_sync_adopt, wasm_sync_write_guard, wasm_sync_conflicts, wasm_sync_conflict_stamp, wasm_sync_preview_resolutions,
+  wasm_sync_resolve, wasm_sync_guard_staged,
   wasm_sync_compact, wasm_sync_publish_wrap, wasm_sync_rebase_wrap, wasm_sync_same_wrap, wasm_sync_restore_content, wasm_sync_devices, wasm_sync_device_change, wasm_sync_import_pack,
   type Genesis, type Replayed, type RemoteHead } from '../../../crates/vault-sync/pkg/vault_sync.js';
 
@@ -78,6 +79,8 @@ export default defineUnlistedScript(() => {
         value = wasm_sync_conflicts(...data.args as Parameters<typeof wasm_sync_conflicts>);
       } else if (data.operation === 'sync:conflict-stamp') {
         value = wasm_sync_conflict_stamp(...data.args as Parameters<typeof wasm_sync_conflict_stamp>);
+      } else if (data.operation === 'sync:resolve-preview') {
+        value = wasm_sync_preview_resolutions(...data.args as Parameters<typeof wasm_sync_preview_resolutions>);
       } else if (data.operation === 'sync:resolve') {
         value = replayOutput(wasm_sync_resolve(...data.args as Parameters<typeof wasm_sync_resolve>));
       } else if (data.operation === 'sync:guard-staged') {
@@ -97,6 +100,7 @@ export default defineUnlistedScript(() => {
       const message = data.operation === 'sync:unlock-head' ? '无法验证网盘密码库，请核对该库自己的主密码或恢复码。' :
         data.operation === 'sync:import-pack' ? '无法读取此备份，请核对文件密码和 .vaultpack 文件是否完整。' :
         data.operation === 'sync:local-wal' ? '同步日志无法保存，本次操作未完成。' :
+        typeof error === 'string' && error.includes('InvalidResolutionAdjustment') ? '请填写有效的名称，并缩短超出长度限制的字段。' :
         typeof error === 'string' && error.includes('SyncAncestorRequired') ? '缺少可验证的共同快照（SyncAncestorRequired）。本机编辑仍在。' :
         conflict ? '此条目正在等待同步裁决，未保存此次修改。请先到网盘设置处理冲突。' : '网盘对象无法验证或版本不受支持。';
       self.postMessage({ ok: false, error: typeof error === 'string' && error.startsWith('COMPACT_OBJECT_TOO_LARGE: ') ? error : message });

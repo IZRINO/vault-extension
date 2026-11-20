@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Eye, GitCompareArrows } from 'lucide-react';
-import { request, type ConflictReview, type ConflictRule, type ConflictVersion, type VaultConflict } from '../vault-messages';
+import { request, type ConflictReview, type ConflictRule, type ConflictVersion, type ResolutionPreview, type VaultConflict } from '../vault-messages';
 import { AreaField, ErrorBanner, Ico, SecretField, SelectField, TextField } from './components';
 import { errorText } from './lib';
 
@@ -8,7 +8,9 @@ const label: Record<string, string> = {
   '$item': '整条凭证', '$duplicate': '同站点账号', title: '名称', note: '备注', tags: '标签', customFields: '自定义字段',
   pinned: '置顶', trashed: '回收站状态', data: '凭证类型', 'data.username': '用户名', 'data.password': '密码',
   'data.uris': '网站', 'data.totpUri': '二次验证码', 'data.cardNumber': '卡号', 'data.cvv': '安全码',
-  'data.cardholderName': '持卡人', 'data.passkeys': '通行密钥', 'data.privateKey': '私钥',
+  'data.cardholderName': '持卡人', 'data.expMonth': '到期月份', 'data.expYear': '到期年份', 'data.brand': '卡品牌',
+  'data.passkeys': '通行密钥', 'data.privateKey': '私钥', 'data.fullName': '姓名',
+  'data.email': '邮箱', 'data.serviceOrProduct': '服务或产品',
 };
 const modeText: Record<ConflictRule['mode'], string> = {
   ours: '选版本 A', theirs: '选版本 B', both: '保留双份', fields: '逐字段选择',
@@ -72,6 +74,7 @@ function VersionDiff({ row, compared, heading }: { row: VaultConflict; compared:
 export function SyncConflicts({ close, changed }: { close(): void; changed(): Promise<void> }) {
   const [review, setReview] = useState<ConflictReview>();
   const [rules, setRules] = useState<Record<string, ConflictRule>>({});
+  const [preview, setPreview] = useState<{ selection: ConflictRule[]; rows: ResolutionPreview[]; revealed?: boolean }>();
   const [stage, setStage] = useState<'select' | 'preview' | 'reveal'>('select');
   const [secret, setSecret] = useState('');
   const [busy, setBusy] = useState(false);
@@ -82,12 +85,38 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
       error => { if (active) setError(errorText(error)); });
     return () => { active = false; };
   }, []);
-  const rows = review?.rows ?? [];
+  const rows = useMemo(() => review?.rows ?? [], [review]);
   const splittable = rows.filter(row => row.ours && row.theirs);
   const grouped = rows.some(row => row.otherMatches?.length);
-  const selected = rows.map(row => rules[row.id]).filter((rule): rule is ConflictRule => !!rule);
+  const selected = useMemo(() => rows.map(row => rules[row.id]).filter((rule): rule is ConflictRule => !!rule), [rows, rules]);
   const ready = selected.length > 0 && selected.every(rule => rule.mode !== 'fields' ||
     rows.find(row => row.id === rule.id)?.fields.every(field => !!rule.fields?.[field]));
+  const currentPreview = preview?.selection === selected;
+  const stamp = review?.stamp;
+  useEffect(() => {
+    if (stage !== 'preview' || !stamp || !ready) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      setError('');
+      void (async () => {
+        try {
+          const planned = await request<ResolutionPreview[]>({ type: 'webdav-resolve-preview', stamp, rules: selected });
+          if (active) setPreview({ selection: selected, rows: planned });
+        } catch (e) {
+          if (!active) return;
+          const message = errorText(e);
+          if (message.includes('重新预览')) {
+            const next = await request<ConflictReview>({ type: 'webdav-conflicts' }).catch(() => undefined);
+            if (!active) return;
+            if (next) { setReview(next); setRules({}); setPreview(undefined); setSecret(''); setStage('select'); }
+          }
+          setError(message);
+        }
+      })();
+    }, 200);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [stage, stamp, ready, selected]);
+
   function choose(id: string, mode: ConflictRule['mode'] | '') {
     setRules(old => {
       const next = { ...old };
@@ -98,8 +127,8 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
   function update(id: string, change: Partial<ConflictRule>) {
     setRules(old => old[id] ? { ...old, [id]: { ...old[id], ...change } } : old);
   }
-  async function submit() {
-    if (!review || busy) return;
+  async function submit(revealResult = false) {
+    if (!review || busy || (stage === 'preview' && !currentPreview)) return;
     setBusy(true); setError('');
     const proof = { method: 'master' as const, secret };
     try {
@@ -107,20 +136,23 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
         const next = await request<ConflictReview>({ type: 'webdav-conflicts', reveal: proof });
         if (next.stamp !== review.stamp) setRules({});
         setReview(next); setStage('select');
+      } else if (revealResult) {
+        const planned = await request<ResolutionPreview[]>({ type: 'webdav-resolve-preview', stamp: review.stamp, rules: selected, reveal: proof });
+        setPreview({ selection: selected, rows: planned, revealed: true });
       } else if (stage === 'preview' && ready) {
         const remaining = await request<number>({ type: 'webdav-resolve', stamp: review.stamp, rules: selected, proof });
         await changed();
         if (!remaining) close();
         else {
           setReview(await request<ConflictReview>({ type: 'webdav-conflicts' }));
-          setRules({}); setStage('select');
+          setRules({}); setPreview(undefined); setStage('select');
         }
       }
     } catch (e) {
       const message = errorText(e);
       if (message.includes('重新预览')) {
         const next = await request<ConflictReview>({ type: 'webdav-conflicts' }).catch(() => undefined);
-        if (next) { setReview(next); setRules({}); setStage('select'); }
+        if (next) { setReview(next); setRules({}); setPreview(undefined); setStage('select'); }
       }
       setError(message);
     }
@@ -128,7 +160,12 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
   }
   return <div className="form sync-conflicts">
     <div className="actions">
-      <button className="btn" type="button" disabled={busy} onClick={() => stage === 'select' ? close() : (setSecret(''), setStage('select'))}>
+      <button className="btn" type="button" disabled={busy} onClick={() => {
+        if (stage === 'select') { close(); return; }
+        setSecret(''); setPreview(undefined); setError('');
+        if (stage === 'preview') setRules(old => Object.fromEntries(Object.entries(old).map(([id, rule]) => [id, { ...rule, password: undefined }])));
+        setStage('select');
+      }}>
         <Ico of={ArrowLeft} />返回
       </button>
       <h3><Ico of={GitCompareArrows} />同步冲突{rows.length > 0 ? ` · ${rows.length}` : ''}</h3>
@@ -162,28 +199,63 @@ export function SyncConflicts({ close, changed }: { close(): void; changed(): Pr
               onChange={value => update(row.id, { fields: { ...rule.fields, [field]: value as 'ours' | 'theirs' } })}>
               <option value="">请选择</option><option value="ours">版本 A</option><option value="theirs">版本 B</option>
             </SelectField>)}
-            {rule && rule.mode !== 'both' && !(rule.mode === 'theirs' && extra.length) && <details className="fold fold-plain">
-              <summary>调整名称或备注</summary><div className="fold-body form">
-                <TextField label="新名称（可选）" value={rule.title ?? ''} maxLength={1024} onChange={title => update(row.id, { title: title || undefined })} />
-                <AreaField label="新备注（可选）" value={rule.note ?? ''} maxLength={16384} onChange={note => update(row.id, { note: note || undefined })} />
-              </div>
-            </details>}
           </div>
         </details>;
       })}
       <button className="btn btn-primary" type="button" disabled={!ready} onClick={() => setStage('preview')}>预览 {selected.length} 项裁决</button>
     </>}
     {stage !== 'select' && <form className="form" onSubmit={e => { e.preventDefault(); void submit(); }}>
-      {stage === 'preview' && <ul className="sync-preview">{selected.map(rule => {
-        const row = rows.find(item => item.id === rule.id);
-        const keptRemote = [row?.theirs, ...(row?.otherMatches ?? [])].flatMap(version => version ? [versionTitle(version)] : []);
-        return <li key={rule.id}><b>{rule.title ?? row?.ours?.title ?? row?.theirs?.title ?? '凭证'}</b> · {row ? modesFor(row, rule.mode) : modeText[rule.mode]}
-          {keptRemote.length > 1 && rule.mode !== 'ours' && <span>保留：{[...(rule.mode === 'both' ? [versionTitle(row?.ours ?? null)] : []), ...keptRemote].join('、')}</span>}
-          {rule.mode === 'fields' && <span>{Object.entries(rule.fields ?? {}).map(([field, side]) => `${label[field] ?? field}：${side === 'ours' ? '版本 A' : '版本 B'}`).join('、')}</span>}
-        </li>;
-      })}</ul>}
+      {stage === 'preview' && <>
+        <h4>合并结果</h4>
+        {!currentPreview && !error && <p className="hint" role="status">正在更新预览…</p>}
+        {preview?.rows.map(({ id, items, canReplacePassword }) => {
+          const rule = rules[id];
+          const row = rows.find(item => item.id === id);
+          if (!rule || !row) return null;
+          const [item] = items;
+          return <section className="sync-result form" key={id} aria-label={row.ours?.title ?? row.theirs?.title ?? row.base?.title}>
+            <b>{modesFor(row, rule.mode)}</b>
+            {rule.mode === 'fields' && <p className="hint">{Object.entries(rule.fields ?? {}).map(([field, side]) =>
+              `${label[field] ?? field} · ${side === 'ours' ? '版本 A' : '版本 B'}`).join('、')}</p>}
+            {items.length === 0 && <p>此凭证将永久删除。</p>}
+            {items.map((result, index) => <div className="sync-result-item" key={index}>
+              <b>{versionTitle(result)}</b>
+              {(currentPreview || !preview.revealed) && <dl>{Object.entries(result.values).map(([field, value]) => <div key={field}>
+                <dt>{label[field] ?? field.replace(/^data\./, '')}</dt>
+                <dd>{show(value) || '—'}</dd>
+              </div>)}</dl>}
+            </div>)}
+            {items.length === 1 && item && <details className="fold">
+              <summary>微调合并结果</summary>
+              <div className="fold-body form">
+                <TextField label="新名称" value={rule.title ?? ''} placeholder={item.title} maxLength={1024} disabled={busy}
+                  onChange={title => update(id, { title: title || undefined })} />
+                {row.protected ? <>
+                  <AreaField label="新备注" value={rule.note ?? ''} maxLength={16384} disabled={busy || rule.note === ''}
+                    hint="留空保留已选的备注。" onChange={note => update(id, { note: note || undefined })} />
+                  <label className="check"><input type="checkbox" checked={rule.note === ''} disabled={busy}
+                    onChange={event => update(id, { note: event.target.checked ? '' : undefined })} />清空备注</label>
+                </> : <>
+                  <label className="check"><input type="checkbox" checked={rule.note !== undefined} disabled={busy}
+                    onChange={event => update(id, { note: event.target.checked ? String(item.values.note ?? '') : undefined })} />
+                    修改备注</label>
+                  {rule.note !== undefined && <AreaField label="新备注" value={rule.note} maxLength={16384} disabled={busy}
+                    onChange={note => update(id, { note })} />}
+                </>}
+                {canReplacePassword && <SecretField label="替换后的登录密码" value={rule.password ?? ''} maxLength={4096} disabled={busy}
+                  autoComplete="off" spellCheck={false} onChange={password => update(id, { password: password || undefined })}
+                  hint="留空保留选定的密码。填写新密码后，两端被替换的密码会进入历史记录。" />}
+              </div>
+            </details>}
+          </section>;
+        })}
+      </>}
       <SecretField label="当前主密码" value={secret} onChange={setSecret} required maxLength={1024} disabled={busy} autoComplete="current-password" />
-      <button className="btn btn-primary" disabled={busy}>{stage === 'reveal' ? '验证并显示差异' : '确认裁决'}</button>
+      <div className="actions">
+        {stage === 'preview' && !preview?.revealed && <button className="btn" type="button" disabled={busy || !currentPreview || !secret}
+          onClick={() => void submit(true)}><Ico of={Eye} />验证并显示结果</button>}
+        <button className="btn btn-primary" disabled={busy || (stage === 'preview' && !currentPreview)}>{stage === 'reveal' ? '验证并显示差异' : '确认裁决'}</button>
+      </div>
     </form>}
   </div>;
 }

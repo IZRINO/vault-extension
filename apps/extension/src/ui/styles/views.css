@@ -470,10 +470,36 @@ details.fold[open] > summary > .icon {
 }
 
 .sync-diff-row time,
-.sync-diff-field,
-.sync-preview li > span {
+.sync-diff-field {
   display: block;
   font-size: 0.8rem;
+}
+
+.sync-result {
+  padding-block-end: 12px;
+  border-block-end: 1px solid var(--line);
+}
+
+.sync-result-item {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sync-result-item dl {
+  display: grid;
+  gap: 4px;
+  margin: 6px 0;
+}
+
+.sync-result-item dl > div {
+  display: grid;
+  grid-template-columns: minmax(5rem, 20%) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.sync-result-item dd {
+  margin: 0;
+  white-space: pre-wrap;
 }
 
 .sync-diff-row mark {

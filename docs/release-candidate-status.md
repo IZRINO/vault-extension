@@ -6,6 +6,13 @@
 
 ## 当前候选包 0.1.0
 
+- ZIP `test-results/Vault-2026-11-20-59c653f043bd-chrome.zip`，6,196,928 B，SHA-256 `59c653f043bd258bfa835c2823a463c6619c674f7bf6e5fc67c5fdd1d7529a04`。解压 `test-results/release-unpacked-59c653f043bd`，54 个文件与生产构建逐字节一致，树摘要 `35f71784797f9637b2c52c2e54c3be6d0a687487c19502461b98816cb983d79d`。
+- T14 在逐字段裁决后显示实际合并结果，可改名称、备注和单条登录密码。受保护的字段验证后显示。手动换密码按最终选择归档两端落选值及来源、修改时间，保留最近 20 条。预览、取消和旧裁决重复提交的双端数据一致性均通过。
+- Rust **80** 项（其中 vendored 3 项）、Vitest **139** 项、TypeScript、九个 WASM 和生产 ZIP 通过。主核 **250,848 B**，同步 Worker 的 WASM **1,720,639 B**，清单、权限与 CSP 同 `7e9e617da993`。同包 Edge 与 Helium 通过 Passkey、回环 WebDAV 冲突裁决和历史恢复，日志位于 `test-results/release-checks-59c653f043bd/`。可见布局夹具控制台及失败请求为空。桌面焦点限制使快照和截图未完成。
+- 同包全量功能矩阵及亮暗码测量属于下节 `7e9e617da993`。千条库冷开仍以 `5a759f049e22` 的未达标记录为准。真实设备、第三方服务及原厂应用待日常试用。
+
+## 厂商迁移与子域排除候选包 0.1.0
+
 - ZIP `test-results/Vault-2026-11-20-7e9e617da993-chrome.zip`，6,193,492 B。SHA-256 `7e9e617da993f93d8d99de9b4f0688325e882e252e5c070d0edd978cd1e3b888`。解压 `test-results/release-unpacked-7e9e617da993`，54 个文件与构建逐字节一致，树摘要 `cc783003c03bb39fa6ff08b771aa82b99ec6f1dd59ac0d7ac3372fdf271efa7f`。
 - 网站排除规则支持当前来源或其 DNS 子域范围，按协议和端口匹配。关闭内联图标后仍可主动用快捷键或右键填充。停止保存或 Passkey 接管即时作用于匹配站点，未提交的 Passkey 请求可回退原生认证器。精确规则继续生效，偏好密封在本机。清单、权限与 CSP 同上一包 `776beb2b25c0`。
 - 新增 Enpass 桌面 JSON、Dashlane CLI 密码和安全备注 JSON、LastPass CLI `show --json`。独立样本及[来源限制](agents/vendor-json-sources.md)已核对。Bitwarden type 5 SSH 保留原始密钥、指纹、备注及二次验证标记，导出使用原生 `sshKey` 对象。已经绑定旧密钥的来源指纹不会在换钥后沿用。预览不返回密钥，导入取消不写入。

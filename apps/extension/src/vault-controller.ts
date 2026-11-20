@@ -673,7 +673,7 @@ export class VaultController {
     } finally { config.password = ''; config.username = ''; }
   }
 
-  private async reviewConflicts(message: Extract<VaultMessage, { type: 'webdav-conflicts' | 'webdav-resolve' }>, check: () => void) {
+  private async reviewConflicts(message: Extract<VaultMessage, { type: 'webdav-conflicts' | 'webdav-resolve-preview' | 'webdav-resolve' }>, check: () => void) {
     const files = this.files!, session = this.session!;
     const anchor = await store.loadRemoteAnchor(files.vaultId);
     check();
@@ -691,6 +691,12 @@ export class VaultController {
       throw new Error('请选择要处理的冲突。');
     const rules = JSON.stringify(message.rules);
     if (rules.length > 1024 * 1024) throw new Error('裁决内容过长。');
+    if (message.type === 'webdav-resolve-preview') {
+      if (message.reveal) await this.verifyMaster(message.reveal, check);
+      const preview = await derive<string>('sync:resolve-preview', [session.key, session.wrap, staged, rules, !!message.reveal]);
+      check();
+      return JSON.parse(preview);
+    }
     await this.verifyMaster(message.proof, check);
     const output = await derive<ReplayOutput>('sync:resolve', [session.key, session.wrap, files.head, files.snap, staged, rules, Date.now()]);
     check();
@@ -930,6 +936,7 @@ export class VaultController {
     const session = this.session;
     switch (message.type) {
       case 'webdav-conflicts':
+      case 'webdav-resolve-preview':
       case 'webdav-resolve':
         return this.reviewConflicts(message, check);
       case 'webdav-history':

@@ -53,10 +53,11 @@ export interface VaultConflict {
   otherMatches: ConflictVersion[];
 }
 export interface ConflictReview { stamp: string; rows: VaultConflict[] }
+export interface ResolutionPreview { id: string; items: ConflictVersion[]; canReplacePassword: boolean }
 export interface DavJoinPreview { stamp: string; sourceCount: number; targetCount: number; mergedCount: number; conflicts: number }
 export interface ConflictRule {
   id: string; mode: 'ours' | 'theirs' | 'both' | 'fields'; fields?: Record<string, 'ours' | 'theirs'>;
-  title?: string; note?: string;
+  title?: string; note?: string; password?: string;
 }
 export interface SyncHistoryEntry { id: string; time: number; epoch: number; count: number; current: boolean }
 export interface SyncRestorePreview { id: string; before: number; after: number; removed: number; blocked: boolean; bulk: boolean; stamp: string; readOnly?: boolean }
@@ -79,6 +80,7 @@ export type VaultMessage =
   | { type: 'webdav-update-key'; password: string }
   | { type: 'webdav-sync'; confirmation?: { stamp: string; proof: Proof } }
   | { type: 'webdav-conflicts'; reveal?: Proof }
+  | { type: 'webdav-resolve-preview'; stamp: string; rules: ConflictRule[]; reveal?: Proof }
   | { type: 'webdav-resolve'; stamp: string; rules: ConflictRule[]; proof: Proof }
   | { type: 'webdav-history' }
   | { type: 'webdav-history-preview'; id: string }
