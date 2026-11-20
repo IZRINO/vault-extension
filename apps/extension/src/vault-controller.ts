@@ -4,7 +4,7 @@ import { copyWithExpiry } from './clipboard';
 import * as store from './vault-storage';
 import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BackupReceipt, type BrowserCsvPreview, type EntePreview, type HotpCode, type ItemDetailData, type ItemSummary, type OtpWorkerCode, type Proof, type TimedOtpCode, type VaultItem, type VaultMessage, type VaultOpening, type VaultPackPreview, type VaultStatus } from './vault-messages';
 import { planEnteImport, type EnteBatch } from './ente-auth';
-import { uriMatches, validateGroups, webUrl, type AutofillSettings } from './autofill-policy';
+import { loginUrisMatch, validateGroups, webUrl, type AutofillSettings } from './autofill-policy';
 import type { FillCandidate, FillKind, FillPayload } from './autofill-messages';
 import { planMigration, type MigrationBatch } from './migration';
 import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTABLE_FORMATS, type AuthBackupPreview, type MigrationExport, type MigrationPreview } from './vault-messages';
@@ -33,7 +33,7 @@ async function digestHex(bytes: Uint8Array<ArrayBuffer>) {
   return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-const internalFields = new Set(['Bitwarden 保留字段', 'Bitwarden 未识别的验证码设置', 'CSV 未识别的验证码设置', 'Vault 迁移来源']);
+const internalFields = new Set(['Bitwarden 保留字段', 'Bitwarden 未识别的验证码设置', 'CSV 未识别的验证码设置', 'CSV 源自定义字段', 'CSV 源归档状态', 'Vault 迁移来源']);
 type AuthorizationScope = 'vaultpack:receipt:v1' | 'otp:read:v1';
 async function authorize(key: Uint8Array, scope: AuthorizationScope, payload: Uint8Array) {
   try {
@@ -1020,6 +1020,7 @@ export class VaultController {
           const batch = JSON.parse(await derive<string>('parse-mapped-csv', [bytes, mapping])) as MigrationBatch;
           check();
           batch.rows = batch.rows.filter(item => {
+            if (item.data.kind !== 'login') return true;
             try {
               if (!Array.isArray(item.data.uris)) throw new Error();
               for (const { uri } of item.data.uris) webUrl(uri);
@@ -1421,7 +1422,7 @@ export class VaultController {
     if (item.trashed || !this.autofillKind(item.data.kind, fill)) return false;
     if (fill === 'card' || fill === 'identity') return true;
     const uris = item.data.uris as { uri: string; matchRule?: string }[] | undefined;
-    return !!uris?.some(uri => uriMatches(uri, url, groups)) && (fill !== 'otp' || !!item.data.totpUri);
+    return !!uris && loginUrisMatch(uris, url, groups) && (fill !== 'otp' || !!item.data.totpUri);
   }
   private validatePassword(password: string) {
     if (typeof password !== 'string' || password.length < 12 || password.length > 1024) throw new Error('密码需要 12–1024 个字符。');

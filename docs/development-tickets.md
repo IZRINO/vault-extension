@@ -309,10 +309,12 @@
 
 ## 架构与工单范围的差异
 
-Ente Auth 加密 JSON v1 已按架构实现本机导入。离线体检已提示「高敏登录项未关联验证器」，开发者凭证列表与详情已提醒 30 天内到期及已到期。相关合成样本证据见[候选记录](release-candidate-status.md#当前候选包-010)。T06 的 Ente Auth、Bitwarden 原生应用往返仍待验收，不以合成样本代签。下表是其余差异，不擅自升级成 T36 的发布门槛。
+Ente Auth 加密 JSON v1 已实现本机导入；离线体检已提示「高敏登录项未关联验证器」，开发者凭证列表与详情已提醒 30 天内到期及已到期。迁移新增 KeePass XML/CSV、FreeOTP+、WinAuth、Bitwarden CSV、Proton Pass CSV 与指定 PGP ZIP、RoboForm CSV、英文 Kaspersky 打印 TXT，以及限定表头的 1Password CSV；浏览器 CSV 可归一 `origin` 或 `url`。见[候选记录](release-candidate-status.md#当前候选包-010)和[格式边界与夹具](agents/remaining-password-formats.md)。T06 的 Ente Auth、Bitwarden 原生应用往返仍待验收，不以合成样本代签。
 
-| 候选项 | 建议从哪里接 | 可独立签收的结果 |
+下表为尚未确认的兼容边界，不擅自升级成 T36 的发布门槛。
+
+| 格式或算法 | 相关工单 | 当前证据边界 |
 | --- | --- | --- |
-| KeePass XML/CSV、1Password CSV、Proton 其他导出/PGP 外层 | 对应的 T28、T29 或 T30 之后 | 每种来源/格式单独用真实工具的合成样本确认方向和载荷，不以 ZIP/JSON 已跑通推断加密包也可用。 |
-| FreeOTP+ / WinAuth，RoboForm / Kaspersky，其他供应商 JSON 等 | 分别沿用 T34 / T35 的验收方式 | 每个来源列版本、已映射字段、不能承载的内容和回归样本；Opera 等浏览器方言先复测已有通用 CSV，再决定是否需开发。 |
+| 1Password CSV、其他原厂方言、Opera 实际导出 | T29、T35 | 合成回归不能证明当前各平台、语言和所有导出选项兼容；1Password CSV 目前只覆盖已列出的表头。 |
+| 其他供应商 JSON、Kaspersky 非英文打印稿或受保护备份 | T35 | 未接入无已验证格式规范或夹具的输入；原厂的 Kaspersky CSV 模板属于导入方向，不是密码库原生导出。 |
 | 可选 RS256 | 有实际只支持该算法的 RP 需求时，接 T22 | 独立服务端注册及验签通过；不阻塞计划指定的 ES256、EdDSA。 |

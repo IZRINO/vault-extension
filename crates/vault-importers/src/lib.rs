@@ -11,6 +11,9 @@ mod keepass_text;
 mod portable;
 mod protected_jwe;
 mod proton_passkey;
+mod proton_pgp;
+mod typed_csv;
+mod kaspersky;
 mod vendor_archives;
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -111,7 +114,7 @@ fn parse(data: &[u8]) -> Result<String, &'static str> {
         if matching.next().is_some() { return Err("CSV 包含重复的字段列，请保留一列后重试。"); }
         Ok(index)
     };
-    let url = column(&["url", "website", "网站", "网址"])?.ok_or("缺少网站列，请使用浏览器导出的登录密码 CSV。")?;
+    let url = column(&["url", "origin", "website", "网站", "网址"])?.ok_or("缺少网站列，请使用浏览器导出的登录密码 CSV。")?;
     let password = column(&["password", "密码"])?.ok_or("缺少密码列，请使用浏览器导出的登录密码 CSV。")?;
     let title = column(&["name", "title", "名称", "标题"])?;
     let username = column(&["username", "user", "用户名", "账号"])?;
@@ -161,6 +164,14 @@ mod tests {
         assert_eq!(safari["rows"][0]["title"], "邮件");
         assert_eq!(safari["invalid"], 1);
         assert_eq!(safari["ignoredOtp"], 1);
+    }
+
+    #[test]
+    fn accepts_origin_as_a_browser_url_column_without_allowing_ambiguity() {
+        let output = decode("Origin,Username,Password,Note\nhttps://example.test,fixture,secret,synthetic note");
+        assert_eq!(output["rows"][0]["url"], "https://example.test");
+        assert_eq!(output["rows"][0]["note"], "synthetic note");
+        assert!(parse(b"url,origin,password\nhttps://example.test,https://other.test,secret").is_err());
     }
 
     #[test]

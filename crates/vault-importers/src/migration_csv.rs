@@ -48,6 +48,9 @@ fn enpass(rows: &[Vec<String>]) -> bool {
 fn headers(bytes: &[u8]) -> Result<String, &'static str> {
     let rows = records(bytes)?;
     let head = rows.first().ok_or("CSV 没有表头。")?;
+    if let Some(vendor) = crate::typed_csv::detect(head) {
+        return Ok(json!({ "vendor":vendor.label(), "headers":[], "count":rows.len() - 1, "mapping":{} }).to_string());
+    }
     if enpass(&rows) {
         return Ok(json!({ "vendor": "Enpass", "headers": [], "count": rows.len(), "mapping": {} }).to_string());
     }
@@ -118,7 +121,7 @@ fn import_enpass(rows: &[Vec<String>]) -> String {
     json!({ "rows": output.0, "invalid": invalid, "unsupported": skipped, "ignoredOtp": ignored_otp }).to_string()
 }
 
-fn valid_additional_url(raw: &str) -> bool {
+pub(crate) fn valid_additional_url(raw: &str) -> bool {
     let Some((scheme, _)) = raw.split_once("://") else { return false; };
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") { return false; }
     if raw.len() > 8192 || raw.bytes().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control()) { return false; }
@@ -141,6 +144,10 @@ fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
     let (head, rows) = records.split_first().ok_or("CSV 没有表头。")?;
     let mapping: Value = serde_json::from_str(mapping).map_err(|_| "字段映射无效。")?;
     if !mapping.is_object() { return Err("字段映射无效。"); }
+    if let Some(vendor) = crate::typed_csv::detect(head) {
+        if mapping.as_object().is_some_and(|fields| !fields.is_empty()) { return Err("此导出格式不接受手工字段映射。"); }
+        return Ok(crate::typed_csv::import(vendor, head, rows));
+    }
     if enpass(&records) {
         if mapping.as_object().is_some_and(|fields| !fields.is_empty()) { return Err("Enpass 导出使用记录内的字段名，不接受表头映射。"); }
         return Ok(import_enpass(&records));

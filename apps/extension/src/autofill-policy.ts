@@ -5,6 +5,7 @@ export { defaultFlags, type AutofillSettings, type SiteFlags } from './autofill-
 const builtInGroups = [
   ['microsoft.com', 'live.com', 'office.com', 'microsoftonline.com'],
   ['google.com', 'youtube.com'], ['taobao.com', 'tmall.com', 'alipay.com'],
+  ['jd.com', '3.cn'], ['apple.com', 'icloud.com'],
 ];
 
 export function webUrl(raw: unknown): URL {
@@ -45,6 +46,17 @@ export function uriMatches(saved: { uri: string; matchRule?: string }, target: U
       default: return local ? url.origin === target.origin : sameSite(url, target, custom);
     }
   } catch { return false; }
+}
+export function loginUrisMatch(uris: readonly { uri: string; matchRule?: string }[], target: URL, custom: string[][]): boolean {
+  // A page-level exclusion takes precedence over another URI's domain rule.
+  if (uris.some(entry => {
+    if (entry.matchRule !== 'never') return false;
+    try {
+      const blocked = webUrl(entry.uri);
+      return blocked.origin === target.origin && blocked.pathname === target.pathname;
+    } catch { return false; }
+  })) return false;
+  return uris.some(uri => uriMatches(uri, target, custom));
 }
 export function validateGroups(groups: unknown): string[][] {
   if (!Array.isArray(groups) || groups.length > 32) throw new Error('最多设置 32 组关联域名。');

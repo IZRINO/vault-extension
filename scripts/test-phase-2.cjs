@@ -1,6 +1,7 @@
 const { chromium, expect } = require('@playwright/test');
 const assert = require('node:assert/strict');
 const { createHmac } = require('node:crypto');
+const { crc32 } = require('node:zlib');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -100,7 +101,7 @@ async function verify(name) {
     assert.equal(await otpLoaded(), false);
     await page.getByLabel('浏览器密码文件').setInputFiles({
       name: 'browser-export.csv', mimeType: 'text/csv', buffer: Buffer.from([
-        'Title,URL,Username,Password,Notes,OTPAuth',
+        'Title,Origin,Username,Password,Notes,OTPAuth',
         `Mail import,https://new.example,guest,${csvPassword},"Work, account",`,
         'Duplicate,https://new.example/page,guest,Second-Test-Secret,,',
         'Existing,https://EXISTING.example:443,old,Do-Not-Replace,,',
@@ -152,13 +153,14 @@ async function verify(name) {
     await verifyEnte(page, send, name, () => setClock(fixtureTime + 30000), fixtureTime + 30000);
     await verifyEncryptedEnte(page, send, name);
     await verifyAuditReminders(page, send, name);
+    await verifyPasswordFormats(page, send, name);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
       totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true,
-      offlineAuditAndDeveloperExpiry: true, errors }));
+      offlineAuditAndDeveloperExpiry: true, protonPgpAndBitwardenCsv: true, errors }));
   } finally {
     try { await context?.close(); }
     finally {
@@ -167,6 +169,80 @@ async function verify(name) {
       await fs.rm(resolved, { recursive: true, maxRetries: 3, retryDelay: 200 });
     }
   }
+}
+
+function singleEntryZip(file, bytes) {
+  const name = Buffer.from(file);
+  const local = Buffer.alloc(30), central = Buffer.alloc(46), end = Buffer.alloc(22);
+  const crc = crc32(bytes);
+  local.writeUInt32LE(0x04034b50); local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(crc, 14); local.writeUInt32LE(bytes.length, 18);
+  local.writeUInt32LE(bytes.length, 22); local.writeUInt16LE(name.length, 26);
+  central.writeUInt32LE(0x02014b50); central.writeUInt16LE(20, 4); central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(crc, 16); central.writeUInt32LE(bytes.length, 20);
+  central.writeUInt32LE(bytes.length, 24); central.writeUInt16LE(name.length, 28);
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(central.length + name.length, 12);
+  end.writeUInt32LE(local.length + name.length + bytes.length, 16);
+  return Buffer.concat([local, name, bytes, central, name, end]);
+}
+
+async function verifyPasswordFormats(page, send, browser) {
+  const list = () => send({ type: 'list' });
+  const before = (await list()).length;
+  const settings = async (name) => {
+    await page.getByRole('button', { name: '设置', exact: true }).click();
+    await page.getByRole('button', { name }).click();
+  };
+  await settings(/^其他密码库与 CXF/);
+  await page.getByLabel('来源格式').selectOption('proton');
+  const armor = await fs.readFile(path.join(root, 'crates/vault-importers/tests/fixtures/proton-password.pgp'));
+  await page.getByLabel('迁移文件').setInputFiles({
+    name: 'synthetic-proton.zip', mimeType: 'application/zip', buffer: singleEntryZip('Proton Pass/data.pgp', armor),
+  });
+  const filePassword = page.getByLabel('Proton Pass 文件密码（明文留空）', { exact: true });
+  const preview = page.getByRole('button', { name: '预览迁移内容' });
+  await filePassword.fill('Wrong synthetic file password');
+  await preview.click();
+  await expect(page.getByRole('alert')).toContainText('PGP 文件密码错误');
+  assert.equal((await list()).length, before);
+  await filePassword.fill('Fixture-File-Password#3');
+  await preview.click();
+  await expect(page.getByRole('heading', { name: '可导入 1 条凭证' })).toBeVisible();
+  assert.equal((await list()).length, before);
+  assert(!(await page.locator('body').innerText()).includes('synthetic-password'));
+  await screenshot(page, browser, 'proton-pgp-preview');
+  const confirm = page.getByRole('button', { name: '确认导入', exact: true });
+  await confirm.click();
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  assert.equal((await list()).length, before);
+  await confirm.click();
+  await page.getByRole('dialog').getByLabel('验证方式').selectOption('master');
+  await enterProof(page);
+  await expect(page.getByText('已导入 1 条凭证。')).toBeVisible();
+  assert((await list()).some(item => item.title === 'Proton encrypted fixture' && item.hasTotp));
+
+  await settings(/^CSV 字段映射与导出/);
+  await page.getByLabel('CSV 文件', { exact: true }).setInputFiles({
+    name: 'synthetic-bitwarden.csv', mimeType: 'text/csv', buffer: Buffer.from([
+      'folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp',
+      'Work,1,login,Protected CSV login,Synthetic note,,1,https://example.test,fixture-user,CSV-synthetic-password,',
+      'Work,0,note,CSV secure note,Synthetic secure note,,1,,,,',
+    ].join('\r\n')),
+  });
+  await page.getByRole('button', { name: '读取列名' }).click();
+  await expect(page.getByText('识别到 Bitwarden 导出。')).toBeVisible();
+  await expect(page.getByRole('group', { name: '对应源列' })).toHaveCount(0);
+  await preview.click();
+  await expect(page.getByRole('heading', { name: '可导入 2 条凭证' })).toBeVisible();
+  assert.equal((await list()).length, before + 1);
+  await page.getByRole('button', { name: '确认导入 2 条' }).click();
+  await page.getByRole('dialog').getByLabel('验证方式').selectOption('master');
+  await enterProof(page);
+  await expect(page.getByText('已导入 2 条凭证。')).toBeVisible();
+  const saved = await list();
+  assert(saved.some(item => item.title === 'Protected CSV login' && item.requireReprompt && item.pinned));
+  assert(saved.some(item => item.title === 'CSV secure note' && item.requireReprompt && item.devSubtype === 'secure_note'));
 }
 
 async function verifyEnte(page, send, name, setSteamTime, steamTime) {

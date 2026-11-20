@@ -11,6 +11,7 @@ export const subtypeNames: Record<string, string> = {
   api_token: 'API 令牌',
   license_key: '软件许可证',
   ssh_key: 'SSH 密钥',
+  secure_note: '安全备注',
 };
 
 export const matchRules: [value: string, label: string][] = [
@@ -70,6 +71,7 @@ export const fieldSets: Record<string, FieldSpec[]> = {
 
 /** 开发者凭证按子类型显示的字段；已经填了内容的字段总是显示。 */
 export function developerFieldVisible(key: string, subtype: string, value: unknown): boolean {
+  if (subtype === 'secure_note') return !!value;
   if (key === 'serviceOrProduct' || value) return true;
   if (key === 'tokenOrLicense') return subtype !== 'ssh_key';
   return subtype === 'ssh_key';
@@ -138,7 +140,7 @@ export function filterItems(items: ItemSummary[], filter: string, query: string)
 }
 
 /** 后端在没有填写服务名时给出的英文占位副标题，界面上改用中文类型名。 */
-const developerFallbacks = ['API Token', 'Software License', 'SSH Keypair'];
+const developerFallbacks = ['API Token', 'Software License', 'SSH Keypair', 'Secure Note'];
 
 export function rowSubtitle(item: ItemSummary): string {
   if (item.kind === 'login') {

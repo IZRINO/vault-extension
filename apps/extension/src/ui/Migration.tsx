@@ -57,7 +57,8 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
   const assigned = Object.values(mapping);
   const duplicate = new Set(assigned).size !== assigned.length;
   const missing = columns.some(column => column.required && mapping[column.key] == null);
-  const canPreview = !headers || vendor === 'Enpass' || (!duplicate && !missing);
+  const autoMapped = !!vendor && headers?.length === 0;
+  const canPreview = !headers || autoMapped || (!duplicate && !missing);
 
   return <>
     <div className="chips" role="group" aria-label="密码迁移操作">
@@ -98,7 +99,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
         <p className="hint">每次最多 {limit / 1024 / 1024} MiB、5,000 条。原文件保持不变。</p>
         {!csv && <SecretField label="文件密码（加密 JSON 才需填写）" autoComplete="off" value={filePassword} maxLength={4096} onChange={value => { setFilePassword(value); setPreview(undefined); }} />}
         {vendor && <p className="hint" role="status">识别到 {vendor} 导出。</p>}
-        {csv && headers && vendor !== 'Enpass' && <fieldset className="form">
+        {csv && headers && !autoMapped && <fieldset className="form">
           <legend>对应源列</legend>
           <ul className="csv-source" aria-label="文件源列">
             {headers.map((header, index) => <li className="csv-column" key={index} draggable={!busy}

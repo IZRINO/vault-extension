@@ -8,7 +8,7 @@ export const MAX_AUTH_BACKUP_BYTES = 4 * 1024 * 1024;
 export const AUTH_BACKUP_FORMATS = ['google', '2fas', 'aegis', 'raivo', 'andotp', 'stratum', 'freeotp-plus', 'winauth'] as const;
 export type AuthBackupFormat = typeof AUTH_BACKUP_FORMATS[number];
 export type AuthBackupInput = { format: AuthBackupFormat; bytes?: number[]; images?: string[]; password?: string };
-export const PORTABLE_FORMATS = ['bitwarden', 'bitwarden-retained', 'cxf', 'keepass', 'onepassword', 'proton'] as const;
+export const PORTABLE_FORMATS = ['bitwarden', 'bitwarden-retained', 'cxf', 'keepass', 'onepassword', 'proton', 'kaspersky'] as const;
 export type MigrationFormat = typeof PORTABLE_FORMATS[number] | 'csv';
 export type CsvMapping = Partial<Record<'title' | 'url' | 'username' | 'password' | 'note' | 'totp' | 'tags' | 'trashed', number>>;
 export interface MigrationPreview {

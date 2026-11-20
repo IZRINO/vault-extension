@@ -59,7 +59,7 @@ pub(crate) fn read(bytes: &[u8], password: &str) -> Result<Batch, MappingError> 
             let login_meaningful = !text(&login.0, "username").is_empty() || !text(&login.0, "password").is_empty() ||
                 login.0["totpUri"].is_string() || !keys.is_empty();
             if !login_meaningful && notes.is_empty() { batch.invalid += 1; continue; }
-            if !login_meaningful { login.0 = json!({ "kind": "developer", "subtype": "api_token" }); }
+            if !login_meaningful { login.0 = json!({ "kind": "developer", "subtype": "secure_note" }); }
             let data = SecretJson(json!({ "title": text(item, "title"), "note": notes.join("\n\n"), "data": login.0,
                 "pinned": item["favorite"] == true, "tags": item["tags"], "createdAtMs": as_millis(&item["creationAt"]),
                 "updatedAtMs": as_millis(&item["modifiedAt"]) }));
@@ -84,7 +84,7 @@ fn field(name: &str, value: &str) -> Value { json!({ "fieldType": name, "value":
 
 fn has_standalone_note(item: &vault_core::model::VaultItem) -> bool {
     let CredentialData::Developer(data) = &item.data else { return false; };
-    data.subtype == DeveloperCredentialSubtype::ApiToken
+    matches!(data.subtype, DeveloperCredentialSubtype::ApiToken | DeveloperCredentialSubtype::SecureNote)
         && matches!(data.service_or_product.as_str(), "" | "安全备注")
         && data.token_or_license.is_empty()
         && data.private_key.is_empty()

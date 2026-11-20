@@ -1,9 +1,12 @@
 import init, { wasm_csv_headers, wasm_export_login_csv, wasm_parse_mapped_csv, wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import type { Reply } from '../src/vault-messages';
 
 export default defineUnlistedScript(() => {
   self.onmessage = async ({ data }: MessageEvent<{ operation: string; args: unknown[] }>) => {
+    let memory: WebAssembly.Memory | undefined;
+    let reply: Reply;
     try {
-      await init();
+      memory = (await init()).memory;
       const [first, second, third] = data.args;
       let value: unknown;
       switch (data.operation) {
@@ -22,12 +25,19 @@ export default defineUnlistedScript(() => {
         case 'export-login-csv': value = wasm_export_login_csv(first as string); break;
         default: throw new Error('不支持的迁移格式。');
       }
-      self.postMessage({ ok: true, value });
+      reply = { ok: true, value };
     } catch (error) {
-      self.postMessage({ ok: false, error: typeof error === 'string' ? error : '无法读取迁移文件，请检查文件格式和密码。' });
+      reply = { ok: false, error: typeof error === 'string' ? error : '无法读取迁移文件，请检查文件格式和密码。' };
     } finally {
+      // The OpenPGP library also holds authenticated plaintext in internal scratch buffers.
+      // This worker is single-use; clear even freed linear-memory pages before closing it.
+      if (memory && data.operation === 'portable-import' && data.args[0] === 'proton') {
+        new Uint8Array(memory.buffer).fill(0);
+      }
       for (const arg of data.args) if (arg instanceof Uint8Array) arg.fill(0);
-      data.args = []; self.close();
+      data.args = [];
     }
+    self.postMessage(reply);
+    self.close();
   };
 });

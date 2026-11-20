@@ -63,10 +63,10 @@ function googleUri(index: number, kind: 1 | 2, batchId = 24) {
     field(1, otp), Buffer.from([0x10, 1, 0x18, 2, 0x20, index, 0x28, batchId]),
   ])));
 }
-function zip(files: Record<string, Buffer>) {
+function zip(files: Record<string, Buffer> | [string, Buffer][]) {
   const local: Buffer[] = [], directory: Buffer[] = [];
   let offset = 0;
-  for (const [file, body] of Object.entries(files)) {
+  for (const [file, body] of Array.isArray(files) ? files : Object.entries(files)) {
     const name = Buffer.from(file);
     const entry = Buffer.alloc(30), header = Buffer.alloc(46), crc = crc32(body);
     entry.writeUInt32LE(0x04034b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt32LE(crc, 14);
@@ -84,6 +84,104 @@ function zip(files: Record<string, Buffer>) {
 }
 const parseAuth = (format: string, bytes: Uint8Array, password = '') => JSON.parse(wasm_parse_authenticator_backup(format, bytes, password));
 const codeAt = (row: { data: { totpUri: string } }) => JSON.parse(wasm_otp_at(row.data.totpUri, now, 0)).value;
+
+function vendorCsv(header: string, rows: string[][]) {
+  return Buffer.from('\uFEFF' + header + '\r\n' + rows.map(row => row.map(value => `"${value.replaceAll('"', '""')}"`).join(',')).join('\r\n'));
+}
+
+it('recognizes Bitwarden personal and organization CSV without weakening reprompt', () => {
+  for (const prefix of ['folder,favorite', 'collections']) {
+    const start = prefix.includes(',') ? ['Work', '1'] : ['Work,Team accounts'];
+    const source = vendorCsv(prefix + ',type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp', [
+      [...start, 'login', 'Imported bank', 'Fixture\r\nnote', 'PIN: keep private', '1',
+        '"https://bank.example/a,b",https://login.example', 'fixture-account', ' fixture-password ', base32],
+      [...start, 'note', 'Offline note', 'Fixture note only', '', '1', '', '', '', ''],
+      [...start, 'login', 'Unrecognized reprompt', '', '', '2', 'https://example.net', 'fixture-account', 'fixture-password', ''],
+    ]);
+    const info = JSON.parse(wasm_csv_headers(source));
+    expect(info).toMatchObject({ vendor: 'Bitwarden', headers: [], count: 3, mapping: {} });
+    const batch = JSON.parse(wasm_parse_mapped_csv(source, '{}'));
+    expect(batch).toMatchObject({ invalid: 1, unsupported: 0, rows: [
+      { title: 'Imported bank', requireReprompt: true, pinned: prefix.includes(','), tags: prefix.includes(',') ? ['Work'] : ['Work', 'Team accounts'], note: 'Fixture\r\nnote',
+        customFields: [{ hidden: true, value: 'PIN: keep private' }],
+        data: { kind: 'login', password: ' fixture-password ', uris: [{ uri: 'https://bank.example/a,b' }, { uri: 'https://login.example' }] } },
+      { title: 'Offline note', requireReprompt: true, data: { kind: 'developer', subtype: 'secure_note' } },
+    ] });
+    expect(codeAt(batch.rows[0])).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+  }
+});
+
+it('preserves Proton CSV URL restrictions and ignores a malformed structured column', () => {
+  const structured = str([
+    { url: 'https://example.com', mode: 0 },
+    { url: 'https://exact.example.net/session?q=x,y', mode: 1 },
+    { url: 'https://never.example.org', mode: 2 },
+    { url: 'https://prefix.example.net/login/', mode: 3 },
+    { url: 'https://unsupported.example.net', mode: 6 },
+  ]);
+  const source = vendorCsv('type,name,url,autofillUrls,email,username,password,note,totp,createTime,modifyTime,vault', [
+    ['login', 'Proton login', 'https://example.com', structured, 'mail@example.test', 'fixture-account', ' fixture-password ', 'fixture note', base32, '', '', 'Work'],
+    ['login', 'Malformed', 'https://fallback.example.com', '{bad', '', 'second-user', 'p', '', '', '', '', 'Work'],
+    ['login', 'Empty modes', 'https://fallback.example.com', '', '', 'third-user', 'p', '', '', '', '', 'Work'],
+    ['login', 'Unreadable exclusion', '', str([{ url: 'https://example.com', mode: 0 }, { url: '', mode: 2 }]),
+      '', 'fourth-user', 'p', '', '', '', '', 'Work'],
+    ['login', 'Overlong rules', '', str([...Array.from({ length: 64 }, () => ({ url: 'https://example.com', mode: 0 })),
+      { url: 'https://example.com/not-here', mode: 2 }]), '', 'fifth-user', 'p', '', '', '', '', 'Work'],
+    ['note', 'Proton note', '', '', '', '', '', 'plain note', '', '', '', ''],
+    ['creditCard', 'Proton card', '', '', '', '', '', str({ cardholderName: 'Fixture', number: '4111111111111111', note: 'card note' }), '', '', '', ''],
+    ['alias', 'Unavailable alias', '', '', 'alias@example.test', '', '', '', '', '', '', ''],
+  ]);
+  expect(JSON.parse(wasm_csv_headers(source)).vendor).toBe('Proton Pass');
+  const batch = JSON.parse(wasm_parse_mapped_csv(source, '{}'));
+  expect(batch).toMatchObject({ invalid: 0, unsupported: 6, rows: [
+    { title: 'Proton login', tags: ['Work'], customFields: [{ name: 'Proton Pass 邮箱', value: 'mail@example.test', hidden: true }],
+      data: { username: 'fixture-account', password: ' fixture-password ', uris: [
+        { uri: 'https://example.com' }, { uri: 'https://exact.example.net/session?q=x,y', matchRule: 'host' },
+        { uri: 'https://never.example.org', matchRule: 'never' }, { uri: 'https://prefix.example.net/login/', matchRule: 'starts_with' },
+        { uri: 'https://unsupported.example.net', matchRule: 'never' },
+      ] } },
+    { title: 'Malformed', data: { uris: [] } },
+    { title: 'Empty modes', data: { uris: [] } },
+    { title: 'Unreadable exclusion', data: { uris: [] } },
+    { title: 'Overlong rules', data: { uris: [] } },
+    { title: 'Proton note', data: { kind: 'developer', subtype: 'secure_note' } },
+    { title: 'Proton card', note: 'card note', data: { kind: 'payment_card', cardNumber: '4111111111111111' } },
+  ] });
+  expect(codeAt(batch.rows[0])).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+});
+
+it('parses variable-width RoboForm CSV without interpreting script or navigation fields as fill targets', () => {
+  const source = vendorCsv('Name,Url,MatchUrl,Login,Pwd,Note,Folder,RfFieldsV2', [
+    ['Robo Login', 'https://redirect.example.net', 'https://login.example.com/account', "'@user", "''fixture ",
+      'Fixture\r\nnote', 'Parent/Child', `TOTP KEY$fixture,${base32}`, 'Unknown Script$fixture'],
+    ['Safe Note', '', '', '', '', 'Local fixture note', 'Parent'],
+  ]);
+  expect(JSON.parse(wasm_csv_headers(source)).vendor).toBe('RoboForm');
+  const batch = JSON.parse(wasm_parse_mapped_csv(source, '{}'));
+  expect(batch).toMatchObject({ invalid: 0, unsupported: 1, rows: [
+    { title: 'Robo Login', note: 'Fixture\r\nnote', tags: ['Parent/Child'], customFields: [], data: {
+      username: '@user', password: "'fixture ", uris: [{ uri: 'https://login.example.com/account', matchRule: 'exact' },
+        { uri: 'https://redirect.example.net', matchRule: 'never' }],
+    } },
+    { title: 'Safe Note', data: { kind: 'developer', subtype: 'secure_note' } },
+  ] });
+  expect(codeAt(batch.rows[0])).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+});
+
+it('retains 1Password CSV password-only and archived records without moving them to trash', () => {
+  const source = vendorCsv('Title,Url,Username,Password,OTPAuth,Favorite,Archived,Tags,Notes', [
+    ['Offline password', '', '', ' fixture-password ', '', 'true', '', 'Work,Personal', 'fixture note'],
+    ['Archived login', 'https://example.test', 'fixture-account', 'p', base32, 'false', 'true', 'Old', 'fixture archived'],
+    ['Unknown archive flag', 'https://example.test', '', 'p', '', '', 'unknown', '', ''],
+  ]);
+  expect(JSON.parse(wasm_csv_headers(source)).vendor).toBe('1Password');
+  const batch = JSON.parse(wasm_parse_mapped_csv(source, '{}'));
+  expect(batch).toMatchObject({ invalid: 1, rows: [
+    { title: 'Offline password', pinned: true, tags: ['Work', 'Personal'], data: { uris: [], password: ' fixture-password ' } },
+    { title: 'Archived login', pinned: false, trashed: false, data: { uris: [{ uri: 'https://example.test', matchRule: 'never' }] } },
+  ] });
+  expect(codeAt(batch.rows[1])).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+});
 
 it('preserves NordPass additional URLs encoded as a JSON array inside a CSV cell', () => {
   const header = 'name,url,additional_urls,username,password,note,folder,cardholdername,cardnumber,type';
@@ -490,6 +588,63 @@ describe('portable import writes sealed credentials that can sign', () => {
     }
     expect(() => imported(vault, 'proton', zip({ 'Proton Pass/data.pgp': Buffer.from('Synthetic unsupported wrapper') }))).toThrow(/PGP/);
     expect(() => imported(vault, 'proton', bin({ ...current, version: 'unknown' }))).toThrow(/版本/);
+  });
+
+  it('opens password-encrypted Proton ZIPs locally without committing during preview', async () => {
+    const armor = await readFile(new URL('../../../crates/vault-importers/tests/fixtures/proton-password.pgp', import.meta.url));
+    const name = 'Proton Pass/data.pgp';
+    const bytes = zip({ [name]: armor, 'Proton Pass/files/ignored.txt': Buffer.from('synthetic attachment') });
+    const vault = fresh();
+    expect(() => imported(vault, 'proton', bytes)).toThrow(/文件密码/);
+    expect(() => imported(vault, 'proton', bytes, 'wrong fixture password')).toThrow(/PGP.*密码错误或.*损坏/);
+    const invalid = Buffer.from(armor);
+    const data = invalid.indexOf('\n\n') + 2;
+    const position = data + 125;
+    invalid[position] = invalid[position] === 65 ? 66 : 65;
+    expect(() => imported(vault, 'proton', zip({ [name]: invalid }), filePassword)).toThrow(/PGP.*损坏/);
+    expect(() => imported(vault, 'proton', zip([[name, armor], [name, armor]]), filePassword)).toThrow(/一份/);
+    expect(() => imported(vault, 'proton', zip({ [name]: armor, 'data.pgp': armor }), filePassword)).toThrow(/一份/);
+    expect(() => imported(vault, 'proton', zip({ [name]: armor, 'Proton Pass/data.json': bin({}) }), filePassword)).toThrow(/一份/);
+
+    const preview = imported(vault, 'proton', bytes, filePassword, false);
+    expect(preview.snap).toHaveLength(0);
+    expect(preview.head).toHaveLength(0);
+    expect(preview.report).toMatchObject({ ready: 1, unsupported: 1, invalid: 0, passkeys: 0 });
+    expect(str(preview.report)).not.toMatch(/synthetic-password|GEZDGNBV/);
+    const saved = imported(vault, 'proton', bytes, filePassword);
+    expect(saved.count).toBe(1);
+    const restored = { ...vault, ...saved };
+    const row = restoredItem(restored);
+    expect(row).toMatchObject({ title: 'Proton encrypted fixture', note: 'Fixture note', tags: ['Fixture Vault'],
+      data: { username: 'fixture-account', password: 'synthetic-password', uris: [{ uri: 'https://example.test' }] } });
+    expect(codeAt(row)).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+    expect(imported(restored, 'proton', bytes, filePassword)).toMatchObject({ count: 0, snap: new Uint8Array(0) });
+  });
+
+  it('imports Kaspersky printed websites, app logins and multiline notes without treating note text as a password field', () => {
+    const source = Buffer.from('\uFEFF' + [
+      'Websites', '', 'Website name: Fixture', 'Website URL: example.test', 'Login name: Fixture web',
+      'Login: fixture-user', 'Password:  fixture-password ', 'Comment: first line', 'second line', '---', '',
+      'Applications', '', 'Application: Editor', 'Login name: Fixture app', 'Login: offline-user', 'Password: app password',
+      'Comment:', '---', '', 'Notes', '', 'Name: Secure note', 'Text: plain text', 'Password: literal text', '---',
+      'Name: a literal example', 'still the same note', '---', '',
+    ].join('\r\n'));
+    const vault = fresh();
+    expect(() => imported(vault, 'kaspersky', Buffer.from('Name,Url,Login,Pwd'))).toThrow(/英文 UTF-8/);
+    const preview = imported(vault, 'kaspersky', source, '', false);
+    expect(preview.snap).toHaveLength(0);
+    expect(preview.report).toMatchObject({ ready: 3, invalid: 0, unsupported: 0 });
+    expect(str(preview.report)).not.toMatch(/fixture-password|app password|literal text/);
+    const restored = { ...vault, ...imported(vault, 'kaspersky', source) };
+    expect(restoredItems(restored)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: 'Fixture web', note: 'first line\nsecond line',
+        data: expect.objectContaining({ username: 'fixture-user', password: ' fixture-password ',
+          uris: [{ uri: 'https://example.test', matchRule: 'host' }] }) }),
+      expect.objectContaining({ title: 'Editor / Fixture app', data: expect.objectContaining({ uris: [] }) }),
+      expect.objectContaining({ title: 'Secure note', note: 'plain text\nPassword: literal text\n---\nName: a literal example\nstill the same note',
+        data: expect.objectContaining({ kind: 'developer', subtype: 'secure_note' }) }),
+    ]));
+    expect(imported(restored, 'kaspersky', source)).toMatchObject({ count: 0, snap: new Uint8Array(0) });
   });
 
   it('rejects unknown Proton item content versions and malformed items without committing a partial import', () => {

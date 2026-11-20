@@ -340,6 +340,7 @@ pub enum DeveloperCredentialSubtype {
     ApiToken,
     LicenseKey,
     SshKey,
+    SecureNote,
 }
 
 impl DeveloperCredentialSubtype {
@@ -348,6 +349,7 @@ impl DeveloperCredentialSubtype {
             Self::ApiToken => "api_token",
             Self::LicenseKey => "license_key",
             Self::SshKey => "ssh_key",
+            Self::SecureNote => "secure_note",
         }
     }
 
@@ -355,6 +357,7 @@ impl DeveloperCredentialSubtype {
         match s {
             "license_key" => Self::LicenseKey,
             "ssh_key" => Self::SshKey,
+            "secure_note" => Self::SecureNote,
             _ => Self::ApiToken,
         }
     }
@@ -364,6 +367,7 @@ impl DeveloperCredentialSubtype {
             Self::ApiToken => 0,
             Self::LicenseKey => 1,
             Self::SshKey => 2,
+            Self::SecureNote => 3,
         }
     }
 
@@ -371,6 +375,7 @@ impl DeveloperCredentialSubtype {
         match v {
             1 => Self::LicenseKey,
             2 => Self::SshKey,
+            3 => Self::SecureNote,
             _ => Self::ApiToken,
         }
     }
@@ -618,6 +623,7 @@ impl VaultItem {
                         DeveloperCredentialSubtype::ApiToken => "API Token".into(),
                         DeveloperCredentialSubtype::LicenseKey => "Software License".into(),
                         DeveloperCredentialSubtype::SshKey => "SSH Keypair".into(),
+                        DeveloperCredentialSubtype::SecureNote => "Secure Note".into(),
                     }
                 };
                 (sub, None, None, None, Some(dev.subtype), false)

@@ -1,7 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { sameSite, uriMatches, validateGroups, webUrl } from './autofill-policy';
+import { loginUrisMatch, sameSite, uriMatches, validateGroups, webUrl } from './autofill-policy';
 
 describe('autofill site boundaries', () => {
+  it('honors a page exclusion before other URIs on the same account', () => {
+    const uris = [{ uri: 'https://accounts.example.com' },
+      { uri: 'https://settings.example.com/no-fill', matchRule: 'never' }];
+    expect(loginUrisMatch(uris, webUrl('https://settings.example.com/no-fill?step=2#next'), [])).toBe(false);
+    expect(loginUrisMatch(uris, webUrl('https://settings.example.com/profile'), [])).toBe(true);
+  });
+  it('supports the configured Apple and JD domain groups only on the same scheme and port', () => {
+    expect(sameSite(webUrl('https://apple.com'), webUrl('https://www.icloud.com'))).toBe(true);
+    expect(sameSite(webUrl('https://www.jd.com'), webUrl('https://3.cn'))).toBe(true);
+    expect(sameSite(webUrl('https://www.jd.com'), webUrl('https://3.cn:8443'))).toBe(false);
+  });
   it('uses private public suffixes and never matches deceptive lookalikes or HTTP downgrades', () => {
     const saved = { uri: 'https://github.com/login' };
     expect(uriMatches(saved, webUrl('https://github.com/settings'))).toBe(true);

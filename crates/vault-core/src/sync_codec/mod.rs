@@ -661,7 +661,7 @@ impl MsgPackWire for VaultItem {
             }
             4 => {
                 rd.require_array_len(6);
-                let subtype = DeveloperCredentialSubtype::from_u8(rd.read_tag(2));
+                let subtype = DeveloperCredentialSubtype::from_u8(rd.read_tag(3));
                 let service_or_product = rd.read_string();
                 let token_or_license = rd.read_string();
                 let public_key = rd.read_string();

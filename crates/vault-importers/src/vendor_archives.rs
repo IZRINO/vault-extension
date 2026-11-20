@@ -148,7 +148,7 @@ pub(crate) fn onepassword(bytes: &[u8]) -> Result<Batch> {
                             "company":get(&["company"]),"addressLine":text(address,"street"),"city":text(address,"city"),
                             "province":text(address,"state"),"country":text(address,"country"),"postalCode":text(address,"zip")})
                     }
-                    "003" => json!({"kind":"developer","subtype":"api_token"}),
+                    "003" => json!({"kind":"developer","subtype":"secure_note"}),
                     "100" | "102" | "110" | "112" | "114" => {
                         let ssh = fields.iter().find(|field| field["value"]["sshKey"].is_object()).map(|field| &field["value"]["sshKey"]).unwrap_or(&Value::Null);
                         let subtype = match category { "100" => "license_key", "114" => "ssh_key", _ => "api_token" };
@@ -172,25 +172,62 @@ pub(crate) fn onepassword(bytes: &[u8]) -> Result<Batch> {
     Ok(batch)
 }
 
-pub(crate) fn proton(bytes: &[u8]) -> Result<Batch> {
-    const ENCRYPTED: MappingError = "不支持 Proton Pass 的 PGP 加密外层。请从原应用导出未加密的迁移文件。";
+fn proton_archive(bytes: &[u8], password: &str) -> Result<(Zeroizing<Vec<u8>>, usize)> {
+    const SOURCE: MappingError = "Proton Pass ZIP 必须只包含一份凭证数据（JSON 或 PGP）。";
+    let mut zip = archive(bytes)?;
+    // ZipArchive indexes entries by name; count the physical central-directory records
+    // as well, so a duplicate name cannot silently choose one of two payloads.
+    let start = usize::try_from(zip.central_directory_start()).map_err(|_| INVALID)?;
+    let mut directory = bytes.get(start..).ok_or(INVALID)?;
+    for _ in 0..zip.len() {
+        if !directory.starts_with(b"PK\x01\x02") { return Err(SOURCE); }
+        let header = directory.get(..46).ok_or(INVALID)?;
+        let size = 46 + [28, 30, 32].into_iter().map(|i|
+            u16::from_le_bytes([header[i], header[i + 1]]) as usize).sum::<usize>();
+        directory = directory.get(size..).ok_or(INVALID)?;
+    }
+    if directory.starts_with(b"PK\x01\x02") { return Err(SOURCE); }
+    let files = zip.file_names().filter(|name| !name.ends_with('/')).collect::<Vec<_>>();
+    let possible = files.iter().copied().filter(|name| !name.starts_with("Proton Pass/files/")).collect::<Vec<_>>();
+    let encrypted = possible.iter().copied().filter(|name| matches!(*name, "data.pgp" | "Proton Pass/data.pgp")).collect::<Vec<_>>();
+    let json = possible.iter().copied().filter(|name| name.ends_with(".json")).collect::<Vec<_>>();
+    let known = json.iter().copied().filter(|name| name.rsplit('/').next().is_some_and(|name|
+        name == "data.json" || name.starts_with("proton-pass"))).collect::<Vec<_>>();
+    let (name, pgp) = match encrypted.as_slice() {
+        [name] if json.is_empty() => (*name, true),
+        [] => match if known.is_empty() { json.as_slice() } else { known.as_slice() } {
+            [name] => (*name, false),
+            _ => return Err(SOURCE),
+        },
+        _ => return Err(SOURCE),
+    };
+    let count = files.len() - 1;
+    let name = name.to_owned();
+    let data = entry(&mut zip, &name, LIMIT)?;
+    Ok((if pgp { crate::proton_pgp::decrypt(&data, password)? } else { data }, count))
+}
+
+pub(crate) fn proton_card(content: &Value) -> Value {
+    let (month, year) = expiry(&content["expirationDate"]);
+    json!({"kind":"payment_card","cardholderName":text(content,"cardholderName"),"cardNumber":text(content,"number"),
+        "expMonth":month,"expYear":year,"cvv":text(content,"verificationNumber"),"cardPin":text(content,"pin")})
+}
+
+pub(crate) fn proton_identity(content: &Value) -> Value {
+    json!({"kind":"identity","fullName":text(content,"fullName"),"email":text(content,"email"),"phone":text(content,"phoneNumber"),
+        "addressLine":text(content,"streetAddress"),"city":text(content,"city"),"province":text(content,"stateOrProvince"),
+        "postalCode":text(content,"zipOrPostalCode"),"company":text(content,"organization"),"country":text(content,"countryOrRegion"),
+        "nationalIdOrPassport":text(content,"passportNumber")})
+}
+
+pub(crate) fn proton(bytes: &[u8], password: &str) -> Result<Batch> {
     let unpacked;
     let (json, attachments) = if bytes.starts_with(b"PK\x03\x04") {
-        let mut zip = archive(bytes)?;
-        let files = zip.file_names().filter(|name| !name.ends_with('/')).collect::<Vec<_>>();
-        if files.iter().any(|name| matches!(*name, "data.pgp" | "Proton Pass/data.pgp")) { return Err(ENCRYPTED); }
-        let known = files.iter().filter(|name| name.rsplit('/').next() == Some("data.json") ||
-            name.rsplit('/').next().is_some_and(|name| name.starts_with("proton-pass") && name.ends_with(".json"))).copied().collect::<Vec<_>>();
-        let options = files.iter().filter(|name| name.ends_with(".json")).copied().collect::<Vec<_>>();
-        let candidates = if known.is_empty() { &options } else { &known };
-        if candidates.len() != 1 { return Err("Proton Pass ZIP 必须包含一份未加密的导出 JSON。"); }
-        let count = files.len() - 1;
-        let name = candidates[0].to_string();
-        unpacked = entry(&mut zip, &name, LIMIT)?;
-        (&unpacked[..], count)
+        unpacked = proton_archive(bytes, password)?;
+        (&unpacked.0[..], unpacked.1)
     } else { (bytes, 0) };
-    let root = json_from_bytes(json).map_err(|_| "请选择 Proton Pass 的未加密 JSON 或包含该 JSON 的 ZIP。")?;
-    if root.0["encrypted"] == true { return Err(ENCRYPTED); }
+    let root = json_from_bytes(json).map_err(|_| "请选择 Proton Pass 导出的 JSON 或 ZIP。")?;
+    if root.0["encrypted"] == true { return Err("不支持该 Proton Pass JSON 加密方式。请选择原应用导出的 PGP ZIP。"); }
     if !root.0["encrypted"].is_null() && root.0["encrypted"] != false { return Err(INVALID); }
     // Proton stores the exporting application's version here, not a JSON schema version.
     let version = text(&root.0,"version");
@@ -223,7 +260,7 @@ pub(crate) fn proton(bytes: &[u8]) -> Result<Batch> {
                 else { key(value, account).map_err(KeyImportError::from) }
             });
             batch.unsupported += array(&item["files"]).len();
-            let fields = SecretJson(Value::Array(array(&data["extraFields"]).iter().take(64).filter_map(|field| {
+            let mut fields = SecretJson(Value::Array(array(&data["extraFields"]).iter().take(63).filter_map(|field| {
                 let kind = text(field,"type");
                 match kind {
                     "text" | "hidden" | "timestamp" => Some(json!({ "name":text(field,"fieldName"),
@@ -234,21 +271,19 @@ pub(crate) fn proton(bytes: &[u8]) -> Result<Batch> {
             }).collect()));
             let record = SecretJson(match text(data,"type") {
                 "login" | "alias" => {
-                    let urls = array(&content["urls"]).iter().filter_map(Value::as_str).filter(|v| valid_web_url(v)).take(64).map(|uri| json!({"uri":uri})).collect::<Vec<_>>();
+                    let urls = crate::typed_csv::proton_urls(content.get("autofillUrls"),
+                        array(&content["urls"]).iter().filter_map(Value::as_str), &mut batch.unsupported);
+                    let email = text(content, "itemEmail");
+                    if !email.is_empty() && email != username {
+                        fields.0.as_array_mut().unwrap().push(json!({"name":"Proton Pass 邮箱","value":email,"hidden":true}));
+                    }
                     let mut otps = content["totpUri"].as_str().filter(|s| !s.is_empty()).into_iter().chain(array(&data["extraFields"]).iter().filter_map(|f| f["data"]["totpUri"].as_str()).filter(|s| !s.is_empty()));
                     let first = otps.next().unwrap_or("");
                     batch.ignored_otp += otps.count();
                     json!({ "kind":"login","username":username,"password":text(content,"password"),"uris":urls,"totpUri":otp(first,&mut batch) })
                 }
-                "creditCard" => {
-                    let (month,year) = expiry(&content["expirationDate"]);
-                    json!({"kind":"payment_card","cardholderName":text(content,"cardholderName"),"cardNumber":text(content,"number"),
-                        "expMonth":month,"expYear":year,"cvv":text(content,"verificationNumber"),"cardPin":text(content,"pin")})
-                }
-                "identity" => json!({"kind":"identity","fullName":text(content,"fullName"),"email":text(content,"email"),"phone":text(content,"phoneNumber"),
-                    "addressLine":text(content,"streetAddress"),"city":text(content,"city"),"province":text(content,"stateOrProvince"),
-                    "postalCode":text(content,"zipOrPostalCode"),"company":text(content,"organization"),"country":text(content,"countryOrRegion"),
-                    "nationalIdOrPassport":text(content,"passportNumber")}),
+                "creditCard" => proton_card(content),
+                "identity" => proton_identity(content),
                 "note" => json!({"kind":"developer","subtype":"secure_note"}),
                 "sshKey" => json!({"kind":"developer","subtype":"ssh_key","privateKey":text(content,"privateKey"),"publicKey":text(content,"publicKey")}),
                 _ => { batch.unsupported += 1; continue; }

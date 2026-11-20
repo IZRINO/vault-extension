@@ -173,7 +173,7 @@ pub fn import(bytes: &[u8], password: &str) -> Result<String, &'static str> {
                     "country": text(id, "country"), "province": text(id, "state"), "city": text(id, "city"),
                     "addressLine": strings(id, &["address1", "address2", "address3"]).join("\n"), "postalCode": text(id, "postalCode"), "company": text(id, "company") })
             }
-            _ => json!({ "kind": "developer", "subtype": "api_token", "serviceOrProduct": "安全备注" }),
+            _ => json!({ "kind": "developer", "subtype": "secure_note" }),
         };
         // Our own compatibility field restores data without making imported source IDs authoritative.
         if extension.0["version"] == 1 && extension.0["data"]["kind"] == data["kind"] {

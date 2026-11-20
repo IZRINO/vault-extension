@@ -9,7 +9,8 @@ const descriptions = {
   cxf: { label: 'FIDO CXF 1.0', accept: '.cxf,.json,.jwe', password: true },
   keepass: { label: 'KeePass KDBX / XML / CSV', accept: '.kdbx,.xml,.csv', password: true },
   onepassword: { label: '1Password 1PUX', accept: '.1pux', password: false },
-  proton: { label: 'Proton Pass', accept: '.json,.zip', password: false },
+  proton: { label: 'Proton Pass', accept: '.json,.zip', password: true },
+  kaspersky: { label: 'Kaspersky 打印导出（英文 TXT）', accept: '.txt', password: false },
 };
 type Format = keyof typeof descriptions;
 export default function PortableMigration({ refresh }: { refresh(): Promise<void> }) {
@@ -44,7 +45,8 @@ export default function PortableMigration({ refresh }: { refresh(): Promise<void
         </SelectField>
         <label className="field">迁移文件<input ref={input} className="input" type="file" accept={descriptions[format].accept} disabled={busy} required
           onChange={event => { setSource(event.target.files?.[0]); setPreview(undefined); setPassword(''); }} /></label>
-        {descriptions[format].password && <SecretField label={format === 'keepass' ? 'KeePass 文件密码' : 'CXF JWE 文件密码（明文留空）'} value={password}
+        {descriptions[format].password && <SecretField label={format === 'keepass' ? 'KeePass 文件密码'
+          : format === 'proton' ? 'Proton Pass 文件密码（明文留空）' : 'CXF JWE 文件密码（明文留空）'} value={password}
           hint={format === 'keepass' ? '加密 KDBX 需要文件密码；明文 XML 或 CSV 请留空。' : undefined}
           maxLength={4096} autoComplete="off" onChange={value => { setPassword(value); setPreview(undefined); }} />}
         {!preview && <button className="btn btn-primary" disabled={busy || !source}>预览迁移内容</button>}

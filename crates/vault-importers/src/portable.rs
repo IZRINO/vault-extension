@@ -396,7 +396,8 @@ pub fn wasm_portable_import(format: &str, key: Vec<u8>, wrap: Vec<u8>, head: &[u
         "bitwarden-retained" if bytes.is_empty() => retained_bitwarden(&vault),
         "keepass" => crate::keepass_kdbx::read(&bytes, &password),
         "onepassword" => crate::vendor_archives::onepassword(&bytes),
-        "proton" => crate::vendor_archives::proton(&bytes),
+        "proton" => crate::vendor_archives::proton(&bytes, &password),
+        "kaspersky" => crate::kaspersky::read(&bytes),
         _ => Err(INVALID),
     }.map_err(JsValue::from_str)?;
     let preview = apply(&mut vault, batch, now as u64, format).map_err(JsValue::from_str)?;

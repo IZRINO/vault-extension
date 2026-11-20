@@ -20,6 +20,7 @@ function quickActions(item: ItemSummary): QuickAction[] {
   if (item.kind === 'login') return [{ key: 'username', label: '用户名', icon: User }, { key: 'password', label: '密码', icon: KeyRound }];
   if (item.kind === 'payment_card') return [{ key: 'cardNumber', label: '卡号', icon: CreditCard }];
   if (item.kind === 'developer') {
+    if (item.devSubtype === 'secure_note') return [];
     return item.devSubtype === 'ssh_key' ? [{ key: 'publicKey', label: '公钥', icon: Copy }]
       : [{ key: 'tokenOrLicense', label: item.devSubtype === 'license_key' ? '许可密钥' : '令牌', icon: Copy }];
   }

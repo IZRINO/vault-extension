@@ -1,4 +1,5 @@
 import type { MigrationPreview, VaultItem } from './vault-messages';
+import { localHost } from './autofill-policy';
 
 export const BITWARDEN_META = 'Bitwarden 保留字段';
 export interface MigrationBatch { rows: VaultItem[]; invalid: number; unsupported: number; ignoredOtp: number }
@@ -24,10 +25,12 @@ function fingerprint(item: VaultItem): string {
   const pick = (names: string[]) => names.map(key => typeof data[key] === 'string' ? data[key] : '');
   if (data.kind === 'login') {
     const uris = (Array.isArray(data.uris) ? data.uris : []).map(entry => {
+      const rule = entry.matchRule ?? 'base_domain';
       try {
         const url = new URL(entry.uri);
-        return url.href;
-      } catch { return entry.uri; }
+        // The stored model infers Host for local addresses; either rule already isolates origin there.
+        return JSON.stringify([url.href, rule === 'host' && localHost(url.hostname) ? 'base_domain' : rule]);
+      } catch { return JSON.stringify([entry.uri, rule]); }
     }).sort();
     content = [data.kind, ...pick(['username', 'password']), uris, otpIdentity(data.totpUri)];
   } else if (data.kind === 'payment_card') {
@@ -38,7 +41,7 @@ function fingerprint(item: VaultItem): string {
     content = [data.kind, ...pick(['subtype', 'serviceOrProduct', 'tokenOrLicense', 'publicKey', 'privateKey'])];
   }
   // Ignore a HOTP counter so importing an old export cannot reintroduce an earlier counter.
-  return JSON.stringify([content, item.note ?? '', [...(item.tags ?? [])].sort(),
+  return JSON.stringify([content, item.note ?? '', !!item.requireReprompt, [...(item.tags ?? [])].sort(),
     item.customFields.filter(field => field.name !== BITWARDEN_META).map(field => [field.name, field.value, field.hidden])]);
 }
 export function planMigration(batch: MigrationBatch, existing: VaultItem[]) {
