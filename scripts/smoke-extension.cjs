@@ -7,6 +7,7 @@ const { waitForSetupTab } = require('./browser-fixtures.cjs');
 const { webdavFixture } = require('./webdav-fixture.cjs');
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
+const output = path.resolve(root, process.env.VAULT_TEST_OUTPUT || 'test-results');
 const candidates = {
   edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   helium: 'C:/Program Files/imput/Helium/Application/chrome.exe',
@@ -265,11 +266,11 @@ async function run(name) {
     await popup.goto('chrome-extension://' + id + '/popup.html');
     await popup.getByRole('button', { name: '密码库', exact: true }).waitFor();
     assert(await popup.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-    await fs.mkdir(path.join(root, 'test-results'), { recursive: true });
-    await popup.screenshot({ path: path.join(root, 'test-results/' + name + '-popup.png') });
+    await fs.mkdir(output, { recursive: true });
+    await popup.screenshot({ path: path.join(output, name + '-popup.png') });
     await page.setViewportSize({ width: 330, height: 760 });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
-    await page.screenshot({ path: path.join(root, 'test-results/' + name + '-sidepanel.png'), fullPage: true });
+    await page.screenshot({ path: path.join(output, name + '-sidepanel.png'), fullPage: true });
     await page.evaluate(() => chrome.storage.session.set({ active: { key: Array(32).fill(0), wrap: [], lastActivityMs: Date.now() - 3600000, unlockedAtMs: Date.now() - 3600000 } }));
     const running = versions.find(entry => entry.scriptURL.startsWith('chrome-extension://' + id) && entry.runningStatus === 'running');
     if (running) await cdp.send('ServiceWorker.stopWorker', { versionId: running.versionId });
@@ -294,5 +295,5 @@ async function run(name) {
 (async () => {
   const results = [];
   for (const name of process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium']) results.push(await run(name));
-  await fs.writeFile(path.join(root, 'test-results/browser-smoke.json'), JSON.stringify(results, null, 2));
+  await fs.writeFile(path.join(output, 'browser-smoke.json'), JSON.stringify(results, null, 2));
 })().catch(error => { console.error(error); process.exitCode = 1; });

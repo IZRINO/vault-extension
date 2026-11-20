@@ -145,7 +145,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
         {!csv && !!preview.suspendedPasskeys && <p className="banner banner-warn">有 {preview.suspendedPasskeys} 枚通行密钥的签名计数待核实，暂不能登录。</p>}
         {!csv && (preview.ignoredPasskeys ?? 0) > 0 && <p className="banner banner-warn">有 {preview.ignoredPasskeys} 个通行密钥缺少可用私钥或使用了不支持的算法。</p>}
         {preview.ignoredOtp > 0 && <p className="banner banner-warn">有 {preview.ignoredOtp} 个验证码设置未启用，原值已保留为隐藏字段。请继续保留原验证器并检查这些记录。</p>}
-        {preview.unsupported > 0 && <p className="banner banner-warn">请保留原密码库，检查未导入的条目。此向导暂不导入独立 SSH 类型或附件内容。</p>}
+        {preview.unsupported > 0 && <p className="banner banner-warn">请保留原密码库，检查未导入的条目和附件。</p>}
         <ul className="facts">{preview.sample.map((row, index) => <li className="fact" key={index}><div className="fact-text">
           <span className="fact-value">{row.title}</span><span className="fact-label">{row.account || kinds[row.kind] || row.kind}</span>
         </div></li>)}</ul>

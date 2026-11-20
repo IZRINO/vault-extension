@@ -19,6 +19,8 @@ const browsers = {
 const master = 'Local-Passkey-E2E-Fixture#2026';
 const sourceMaster = 'Independent-Source-E2E-Fixture#2026';
 const filePassword = 'Local-Pack-E2E-Fixture#2026';
+const wildcardOrigin = 'https://login.vault-passkey.test:8443';
+const wildcardRule = 'https://*.vault-passkey.test:8443';
 const hash = data => createHash('sha256').update(data).digest();
 const decode = data => Buffer.from(data, 'base64url');
 
@@ -70,12 +72,12 @@ async function fixture() {
       window.settings = { kind: 'assert', conditional: false, uv: 'discouraged' };
       window.start = async () => {
         window.outcome = undefined;
-        const { kind, alg, conditional, uv, rp = 'localhost', allow, abort } = settings;
+        const { kind, alg, conditional, uv, rp = location.hostname, allow, abort, user = 22 } = settings;
         const challenge = from64(window.challenge);
         try {
           const result = kind === 'register'
             ? await navigator.credentials.create({ signal: abort?.signal, publicKey: {
-                rp: { id: rp, name: 'Local verifier' }, user: { id: new Uint8Array([21, 22, alg + 10]), name: 'local fixture ' + alg, displayName: 'Fixture' },
+                rp: { id: rp, name: 'Local verifier' }, user: { id: new Uint8Array([21, user, alg + 10]), name: 'local fixture ' + alg, displayName: 'Fixture' },
                 challenge, pubKeyCredParams: [{ type: 'public-key', alg }],
                 authenticatorSelection: { userVerification: uv, residentKey: 'required' }, attestation: 'none', extensions: { credProps: true }
               } })
@@ -130,6 +132,15 @@ async function fixture() {
       throw new Error(`Local WebAuthn verifier did not load (HTTP requests served: ${served - before})`, { cause: error });
     });
     assert.equal(response?.status(), 200, 'The loopback verifier must serve the ceremony page');
+    return page;
+  }, async wildcardPage(local) {
+    const page = await local.context.newPage();
+    // Playwright supplies all bytes for this reserved test origin, with no external RP.
+    await page.route(`${wildcardOrigin}/**`, route => route.fulfill({
+      contentType: 'text/html', body: html(randomBytes(32).toString('base64url')),
+    }));
+    await page.goto(`${wildcardOrigin}/`);
+    assert(await page.evaluate(() => window.isSecureContext));
     return page;
   }, done };
 }
@@ -289,7 +300,7 @@ async function verifyCanceledCeremonies(local, page, credential, timeout = false
   assert.equal((await local.send({ type: 'status' })).changesSinceBackup, before);
 }
 
-async function verifyNativeFallback(local, page) {
+async function verifyNativeFallback(local, page, wildcard) {
   const cdp = await local.context.newCDPSession(page);
   try {
     await cdp.send('WebAuthn.enable');
@@ -311,8 +322,7 @@ async function verifyNativeFallback(local, page) {
     assert.equal(nativeCredentials.length, 1);
     const nextCount = nativeCredentials[0].signCount + 1;
     const origin = new URL(page.url()).origin;
-    const flag = passkeyDisabled => local.send({ type: 'set-autofill-site', origin,
-      flags: { inlineDisabled: false, saveDisabled: false, passkeyDisabled } });
+    const flag = passkeyDisabled => local.send({ type: 'set-autofill-site', origin: wildcard ?? origin, flags: { passkeyDisabled } });
     await flag(true);
     await page.bringToFront();
     await set(page, { kind: 'assert', uv: 'required', allow: registered.value.id });
@@ -324,6 +334,18 @@ async function verifyNativeFallback(local, page) {
     assert(!panel(local), 'Per-site disable must not open a Vault Passkey prompt');
     assert.equal((await local.send({ type: 'list' })).length, before);
     await flag(false);
+    if (wildcard) {
+      await page.bringToFront();
+      await set(page, { kind: 'register', alg: -7, uv: 'required', user: 23 });
+      await page.getByText('Start ceremony').click();
+      const pending = await nextPanel(local);
+      await flag(true);
+      assert.equal((await result(page)).shape, true, 'A waiting ceremony must return to the virtual native authenticator');
+      await expect.poll(() => pending.isClosed()).toBe(true);
+      assert.equal((await getCredentials()).credentials.length, 2);
+      assert.equal((await local.send({ type: 'list' })).length, before);
+      await flag(false);
+    }
     await cdp.send('WebAuthn.removeVirtualAuthenticator', device);
   } finally { await cdp.detach(); }
 }
@@ -780,6 +802,9 @@ async function run() {
     assert.equal((await first.send({ type: 'webdav-sync' })).pending, false);
     await sign(first, page, keys[0], false, 0x19);
     await verifyNativeFallback(first, page);
+    const edgeWildcard = await site.wildcardPage(first);
+    try { await verifyNativeFallback(first, edgeWildcard, wildcardRule); }
+    finally { await edgeWildcard.close(); }
     const pack = await first.send({ type: 'export', password: filePassword, proof });
     await first.send({ type: 'lock' });
     const second = await open('helium', null);
@@ -793,6 +818,9 @@ async function run() {
     await sign(second, other, keys[1], false, 0x1d);
     await verifyCanceledCeremonies(second, other, keys[0]);
     await verifyNativeFallback(second, other);
+    const heliumWildcard = await site.wildcardPage(second);
+    try { await verifyNativeFallback(second, heliumWildcard, wildcardRule); }
+    finally { await heliumWildcard.close(); }
     assert.ok(dav.requests.slice(beforeJoin).every(({ method }) => ['GET', 'PROPFIND'].includes(method)));
 
     const restored = await open('helium', sourceMaster);
@@ -820,7 +848,7 @@ async function run() {
     console.log(JSON.stringify({ edge: 'ES256/Ed25519 registration, assertion, UV, conditional, lock cancellation',
       helium: ['WebDAV sign-in using both original keys', 'authenticated .vaultpack restored both original keys'],
       failedUploadBS0: true, verifiedRecoveryBS1: true, defaultCountNoWrite: true, incrementalCountPersisted: true,
-      independentMergeKeptSourceAndTargetIdentity: true, nativeFallbackOnceWithVirtualAuthenticator: true,
+      independentMergeKeptSourceAndTargetIdentity: true, nativeFallbackOnceWithVirtualAuthenticator: true, wildcardNativeFallback: true,
       abortAndNavigationCanceledOnBothBrowsers: true, promptTimeoutCanceledOnEdge: true, conflictReviewTabAndKeepBoth: true }));
   } finally {
     await Promise.all(locals.reverse().map(local => local.close()));

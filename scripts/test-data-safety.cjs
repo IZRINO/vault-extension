@@ -15,7 +15,7 @@ const sourcePassword = 'Safety-Test-Source#2026';
 const restorePassword = 'Safety-Test-Restore#2026';
 const backupPassword = 'Safety-Test-Backup#2026';
 const proof = secret => ({ method: 'master', secret });
-const output = path.join(root, 'test-results');
+const output = path.resolve(root, process.env.VAULT_TEST_OUTPUT || 'test-results');
 
 async function run(name) {
   const executablePath = process.env.VAULT_BROWSER_PATH || browsers[name];

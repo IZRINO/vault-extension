@@ -1,5 +1,6 @@
 import { getDomain } from 'tldts';
 import { RE2JS } from 're2js';
+import { defaultFlags, SITE_FLAG_KEYS, type SiteFlags, type SiteRuleState } from './autofill-settings';
 
 export { defaultFlags, type AutofillSettings, type SiteFlags } from './autofill-settings';
 const builtInGroups = [
@@ -18,6 +19,55 @@ export function localHost(host: string): boolean {
   return host === 'localhost' || !host.includes('.') || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.lan') ||
     host === '[::1]' || host.startsWith('[fc') || host.startsWith('[fd') || host.startsWith('[fe80:') ||
     /^\d+\.\d+\.\d+\.\d+$/.test(host);
+}
+function wildcardBase(host: string): string | null {
+  if (localHost(host) || host.length > 253 ||
+    !host.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return null;
+  return getDomain(host, { allowPrivateDomains: true });
+}
+
+export function validateSiteRule(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 8192) throw new Error('网站规则无效。');
+  const marker = /^https?:\/\/\*\./.exec(value);
+  if (marker) {
+    const base = webUrl(value.replace('://*.', '://'));
+    if (wildcardBase(base.hostname) && base.origin.replace('://', '://*.') === value) return value;
+  } else if (!value.includes('*') && webUrl(value).origin === value) return value;
+  throw new Error('网站规则必须指定协议和主机。子域规则不能用于公共后缀或内网地址。');
+}
+
+function wildcardRules(target: URL): string[] {
+  const host = target.hostname.replace(/\.$/, '');
+  const base = wildcardBase(host);
+  if (!base) return [];
+  const port = target.port ? `:${target.port}` : '';
+  const rules: string[] = [];
+  for (let suffix = host; ; suffix = suffix.slice(suffix.indexOf('.') + 1)) {
+    rules.push(`${target.protocol}//*.${suffix}${port}`);
+    if (suffix === base) return rules.reverse();
+  }
+}
+
+export function siteRuleMatches(rule: string, target: URL): boolean {
+  return rule === target.origin || wildcardRules(target).slice(0, -1).includes(rule);
+}
+
+export function resolveSiteFlags(sites: Readonly<Record<string, SiteFlags>>, target: URL): SiteFlags {
+  const resolved = { ...defaultFlags(), ...sites[target.origin] };
+  for (const rule of wildcardRules(target).slice(0, -1)) {
+    const flags = sites[rule];
+    if (flags) for (const key of SITE_FLAG_KEYS) resolved[key] ||= flags[key];
+  }
+  return resolved;
+}
+
+export function siteRulesFor(sites: Readonly<Record<string, SiteFlags>>, target: URL): SiteRuleState {
+  const choices = wildcardRules(target).map(rule => ({ rule, flags: sites[rule] ?? defaultFlags() }));
+  return {
+    exact: sites[target.origin] ?? defaultFlags(),
+    wildcardRules: choices,
+    effective: resolveSiteFlags(sites, target),
+  };
 }
 function domain(url: URL) {
   return getDomain(url.hostname, { allowPrivateDomains: true }) ?? url.hostname;

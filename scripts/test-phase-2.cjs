@@ -154,13 +154,14 @@ async function verify(name) {
     await verifyEncryptedEnte(page, send, name);
     await verifyAuditReminders(page, send, name);
     await verifyPasswordFormats(page, send, name);
+    await verifyVendorJson(page, send);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
       totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true,
-      offlineAuditAndDeveloperExpiry: true, protonPgpAndBitwardenCsv: true, errors }));
+      offlineAuditAndDeveloperExpiry: true, protonPgpAndBitwardenCsv: true, vendorJsonPreviewAndImport: true, errors }));
   } finally {
     try { await context?.close(); }
     finally {
@@ -243,6 +244,62 @@ async function verifyPasswordFormats(page, send, browser) {
   const saved = await list();
   assert(saved.some(item => item.title === 'Protected CSV login' && item.requireReprompt && item.pinned));
   assert(saved.some(item => item.title === 'CSV secure note' && item.requireReprompt && item.devSubtype === 'secure_note'));
+}
+
+async function verifyVendorJson(page, send) {
+  const synthetic = ' Vendor-JSON-Synthetic#2026 ';
+  const enpass = { uuid: 'fixture-enpass', title: 'Enpass JSON login', template_type: 'login.default', favorite: 1,
+    archived: 0, trashed: 0, note: 'Original\nnote', fields: [
+      { type: 'username', value: 'fixture-user' }, { type: 'password', value: synthetic },
+      { type: 'url', value: 'https://enpass.example.test' }, { type: 'totp', value: setupKey },
+    ] };
+  const dashlane = { id: 'fixture-dashlane', anonId: 'fixture-anon', title: 'Dashlane JSON login', login: 'fixture-user',
+    password: synthetic, url: 'https://dashlane.example.test/login', autoProtected: 'true', useFixedUrl: 'true',
+    lastBackupTime: '1760000000', localeFormat: 'UNIVERSAL' };
+  const lastpass = { id: '0002', name: 'LastPass JSON note', fullname: 'Fixture/LastPass JSON note', group: 'Fixture',
+    username: '', password: '', url: 'http://sn', note: synthetic, last_touch: '1760000000' };
+  const cases = [
+    { format: 'enpass', source: { folders: [], items: [enpass] }, title: enpass.title, attributes: { pinned: true, hasTotp: true } },
+    { format: 'dashlane-json', source: [dashlane], title: dashlane.title, attributes: { requireReprompt: true } },
+    { format: 'lastpass-json', source: [lastpass], title: lastpass.name, attributes: { requireReprompt: true, devSubtype: 'secure_note' } },
+  ];
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: /^其他密码库与 CXF/ }).click();
+  const list = () => send({ type: 'list' });
+  const confirm = page.getByRole('button', { name: '确认导入', exact: true });
+  const pick = buffer => page.getByLabel('迁移文件').setInputFiles({ name: 'vendor-fixture.json', mimeType: 'application/json', buffer });
+  const preview = page.getByRole('button', { name: '预览迁移内容', exact: true });
+  for (const { format, source, title, attributes } of cases) {
+    const bytes = Buffer.from(JSON.stringify(source)), before = (await list()).length;
+    await page.getByLabel('来源格式').selectOption(format);
+    await pick(bytes);
+    await preview.click();
+    await expect(page.getByRole('heading', { name: '可导入 1 条凭证', exact: true })).toBeVisible();
+    await expect(page.getByText(title, { exact: true })).toBeVisible();
+    assert(!(await page.locator('body').innerText()).includes(synthetic.trim()));
+    assert.equal((await list()).length, before);
+    await confirm.click();
+    await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+    assert.equal((await list()).length, before);
+    await confirm.click();
+    await page.getByRole('dialog').getByLabel('验证方式').selectOption('master');
+    await enterProof(page);
+    await expect.poll(async () => (await list()).length).toBe(before + 1);
+    const saved = (await list()).find(item => item.title === title);
+    assert(saved, 'Expected authorized vendor JSON import');
+    for (const [key, value] of Object.entries(attributes)) assert.equal(saved[key], value);
+    if (format === 'enpass') {
+      const detail = await send({ type: 'get', id: saved.id });
+      assert.equal(detail.data.password, synthetic);
+      assert.equal(detail.note, 'Original\nnote');
+      assert(!('totpUri' in detail.data), 'Ordinary details must not expose the migrated seed');
+    }
+    await pick(bytes);
+    await preview.click();
+    await expect(page.getByRole('heading', { name: '可导入 0 条凭证', exact: true })).toBeVisible();
+    await expect(confirm).toBeDisabled();
+    assert.equal((await list()).length, before + 1);
+  }
 }
 
 async function verifyEnte(page, send, name, setSteamTime, steamTime) {

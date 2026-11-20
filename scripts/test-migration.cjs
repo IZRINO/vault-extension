@@ -11,6 +11,8 @@ const nativeQr = process.env.VAULT_QR_NATIVE === '1';
 const browsers = { edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', helium: 'C:/Program Files/imput/Helium/Application/chrome.exe' };
 const master = 'Migration-Fixture-Master#2026', filePassword = 'Portable-File-Fixture#2026';
 const otp = 'otpauth://totp/QR-Fixture%3Aalice?secret=JBSWY3DPEHPK3PXP&issuer=QR-Fixture';
+const sshKey = { privateKey: '-----BEGIN OPENSSH PRIVATE KEY-----\r\nsynthetic-ssh-fixture\r\n-----END OPENSSH PRIVATE KEY-----\r\n',
+  publicKey: 'ssh-ed25519 synthetic-public-key fixture@example.test', keyFingerprint: 'SHA256:synthetic-fingerprint' };
 const source = { encrypted: false, folders: [{ id: 'folder-a', name: 'Fixture work' }], items: [
   { id: 'login-a', type: 1, name: 'Migrated Login', notes: 'Keep this note', folderId: 'folder-a', reprompt: 1, favorite: true,
     login: { username: 'fixture-alice', password: 'Migration-Login-Secret#2026', totp: 'JBSWY3DPEHPK3PXP',
@@ -19,7 +21,9 @@ const source = { encrypted: false, folders: [{ id: 'folder-a', name: 'Fixture wo
   { id: 'note-a', type: 2, name: 'Migrated Note', notes: 'Private fixture note', secureNote: { type: 0 } },
   { id: 'card-a', type: 3, name: 'Migrated Card', card: { cardholderName: 'Test User', number: '4111111111111111', brand: 'Visa', expMonth: '11', expYear: '2030', code: '123' } },
   { id: 'identity-a', type: 4, name: 'Migrated Identity', identity: { firstName: 'Ada', lastName: 'Lovelace', passportNumber: 'Fixture-Passport', ssn: 'Fixture-SSN', address1: 'One', address2: 'Two', city: 'Test City', country: 'GB' } },
+  { id: 'ssh-a', type: 5, name: 'Migrated SSH key', folderId: 'folder-a', reprompt: 1, favorite: true, sshKey },
 ] };
+const sourceCount = source.items.length;
 function portable(json, kdfType = 0) {
   const salt = randomBytes(16).toString('base64');
   const material = kdfType === 0 ? pbkdf2Sync(filePassword, salt, 10000, 32, 'sha256')
@@ -269,26 +273,39 @@ async function run(name, server) {
     await page.getByRole('button', { name: /^Bitwarden 密码库迁移/ }).click();
     const bytes = [...Buffer.from(JSON.stringify(portable(source)))];
     const argonBytes = [...Buffer.from(JSON.stringify(portable(source, 1)))];
-    assert.equal((await send({ type: 'preview-migration', format: 'bitwarden', bytes: argonBytes, password: filePassword })).ready, 4);
+    const argonPreview = await send({ type: 'preview-migration', format: 'bitwarden', bytes: argonBytes, password: filePassword });
+    assert.equal(argonPreview.ready, sourceCount);
+    assert.equal(argonPreview.unsupported, 0);
+    assert(!JSON.stringify(argonPreview).includes('synthetic-ssh-fixture'));
     const tampered = portable(source); tampered.data = tampered.data.slice(0, -4) + 'AAAA';
     assert.equal((await reply({ type: 'preview-migration', format: 'bitwarden', bytes: [...Buffer.from(JSON.stringify(tampered))], password: filePassword })).ok, false);
     assert.equal((await reply({ type: 'preview-migration', format: 'bitwarden', bytes, password: 'Wrong-fixture-password' })).ok, false);
     await page.getByLabel('Bitwarden JSON 文件', { exact: true }).setInputFiles({ name: 'portable.json', mimeType: 'application/json', buffer: Buffer.from(bytes) });
     await page.getByLabel('文件密码（加密 JSON 才需填写）', { exact: true }).fill(filePassword);
     await page.getByRole('button', { name: '预览迁移内容', exact: true }).click();
-    await expect(page.getByRole('heading', { name: '可导入 4 条凭证', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: `可导入 ${sourceCount} 条凭证`, exact: true })).toBeVisible();
     assert.equal((await send({ type: 'list' })).length, 0);
-    assert(!(await page.locator('body').innerText()).includes('Migration-Login-Secret'));
+    const previewText = await page.locator('body').innerText();
+    assert(!previewText.includes('Migration-Login-Secret') && !previewText.includes('synthetic-ssh-fixture'));
     await page.screenshot({ path: path.join(output, `migration-${name}-preview.png`) });
-    await page.getByRole('button', { name: '确认导入 4 条', exact: true }).click();
+    const confirmImport = page.getByRole('button', { name: `确认导入 ${sourceCount} 条`, exact: true });
+    await confirmImport.click();
     await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
     assert.equal((await send({ type: 'list' })).length, 0);
-    await page.getByRole('button', { name: '确认导入 4 条', exact: true }).click(); await proof(page);
-    await expect(page.getByText('已导入 4 条凭证。', { exact: true })).toBeVisible();
-    const summaries = await send({ type: 'list' }); assert.equal(summaries.length, 4);
+    await confirmImport.click(); await proof(page);
+    await expect(page.getByText(`已导入 ${sourceCount} 条凭证。`, { exact: true })).toBeVisible();
+    const summaries = await send({ type: 'list' }); assert.equal(summaries.length, sourceCount);
     const login = await send({ type: 'get', id: summaries.find(item => item.title === 'Migrated Login').id, proof: { method: 'master', secret: master } });
     assert.equal(login.data.password, source.items[0].login.password); assert(login.requireReprompt);
     assert.equal(login.tags[0], 'Fixture work');
+    const ssh = summaries.find(item => item.title === 'Migrated SSH key');
+    assert(ssh?.devSubtype === 'ssh_key' && ssh.requireReprompt && ssh.pinned);
+    assert(!JSON.stringify(ssh).includes('synthetic-ssh-fixture'));
+    assert.equal((await reply({ type: 'get', id: ssh.id })).ok, false);
+    const sshDetail = await send({ type: 'get', id: ssh.id, proof: { method: 'master', secret: master } });
+    assert.equal(sshDetail.data.privateKey, sshKey.privateKey);
+    assert.equal(sshDetail.data.publicKey, sshKey.publicKey);
+    assert.deepEqual(sshDetail.tags, ['Fixture work']);
     assert.equal((await send({ type: 'preview-migration', format: 'bitwarden', bytes, password: filePassword })).ready, 0);
     assert.equal((await reply({ type: 'export-migration', format: 'bitwarden', proof: { method: 'pin', secret: '123456' }, confirmPlaintext: true })).ok, false);
     await page.getByRole('button', { name: '导出凭证', exact: true }).click();
@@ -299,14 +316,19 @@ async function run(name, server) {
     const exported = JSON.parse(await fs.readFile(await download.path(), 'utf8'));
     assert(exported.encrypted && exported.passwordProtected);
     assert(!JSON.stringify(exported).includes('Migration-Login-Secret'));
-    assert.equal(openPortable(exported).items.find(item => item.type === 1).login.password, source.items[0].login.password);
+    const decrypted = openPortable(exported).items;
+    assert.equal(decrypted.find(item => item.type === 1).login.password, source.items[0].login.password);
+    assert.deepEqual(decrypted.find(item => item.type === 5).sshKey, sshKey);
     const exportBytes = [...Buffer.from(JSON.stringify(exported))];
     const decoded = await send({ type: 'preview-migration', format: 'bitwarden', bytes: exportBytes, password: filePassword });
-    assert.equal(decoded.ready, 0);
+    assert.deepEqual([decoded.ready, decoded.skipped, decoded.invalid, decoded.unsupported], [0, sourceCount, 0, 0]);
     const plain = await send({ type: 'export-migration', format: 'bitwarden', proof: { method: 'master', secret: master }, confirmPlaintext: true });
     const rows = JSON.parse(plain.text).items;
     assert.equal(rows.find(row => row.type === 1).login.fido2Credentials[0].credentialId, 'preserved-fixture');
     assert.equal(rows.find(row => row.type === 4).identity.address2, 'Two');
+    const sshRow = rows.find(row => row.type === 5);
+    assert.deepEqual(sshRow.sshKey, sshKey);
+    assert(!JSON.stringify(sshRow.fields).includes('synthetic-ssh-fixture'));
     await page.getByRole('button', { name: '启用已保留的通行密钥', exact: true }).click();
     await expect(page.getByLabel('Bitwarden JSON 文件', { exact: true })).toHaveCount(0);
     await page.getByRole('button', { name: '检查已有凭证', exact: true }).click();
@@ -349,9 +371,12 @@ async function run(name, server) {
     assert.equal((await send({ type: 'get', id: mapped.id })).data.password, ' p,"q');
     assert.equal((await send({ type: 'get', id: mapped.id })).note, 'two\r\nlines');
     const exportedCsv = await send({ type: 'export-migration', format: 'csv', proof: { method: 'master', secret: master }, confirmPlaintext: true });
-    assert.equal(exportedCsv.count, 2); assert.equal(exportedCsv.skipped, 3); assert(exportedCsv.text.includes('" p,""q"'));
+    assert.equal(exportedCsv.count, 2);
+    assert.equal(exportedCsv.skipped, source.items.filter(item => item.type !== 1).length);
+    assert(exportedCsv.text.includes('" p,""q"'));
     await page.screenshot({ path: path.join(output, `migration-${name}-csv.png`) });
 
+    const beforeScan = await send({ type: 'list' });
     const website = await context.newPage();
     await page.getByRole('button', { name: '密码库', exact: true }).click();
     await page.getByRole('button', { name: '新建', exact: true }).click();
@@ -411,7 +436,7 @@ async function run(name, server) {
     await scan();
     await click(choice);
     await expect(seed).toHaveValue(/otpauth:\/\/totp\/.*JBSWY3DPEHPK3PXP/);
-    assert.equal((await send({ type: 'list' })).length, 5, 'Scanning and choosing do not save a new entry');
+    assert.deepEqual(await send({ type: 'list' }), beforeScan, 'Scanning and choosing must not mutate the vault');
     await website.goto(base + '/empty');
     await website.getByText('No QR here', { exact: true }).waitFor();
     await website.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -429,7 +454,7 @@ async function run(name, server) {
     assert.deepEqual(errors, []);
     const result = { browser: name, version: context.browser().version(), portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,
       retainedPasskeyPreview: true, googleMultiImageDrop: true,
-      fourTypesAndPreservedFields: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrFirstColor: firstColor,
+      preservedFieldsAndSshRoundTrip: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrFirstColor: firstColor,
       first, following, popup, switchedTabInvalidated: true, canceledScanAndChoice: true, noSaveUntilConfirmed: true,
       noActiveTabRejected: true, canvasOverrideIgnored: true, googleBatchImages: true, encrypted2fasFixture, errors };
     console.log(JSON.stringify(result));

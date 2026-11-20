@@ -6,6 +6,15 @@
 
 ## 当前候选包 0.1.0
 
+- ZIP `test-results/Vault-2026-11-20-7e9e617da993-chrome.zip`，6,193,492 B。SHA-256 `7e9e617da993f93d8d99de9b4f0688325e882e252e5c070d0edd978cd1e3b888`。解压 `test-results/release-unpacked-7e9e617da993`，54 个文件与构建逐字节一致，树摘要 `cc783003c03bb39fa6ff08b771aa82b99ec6f1dd59ac0d7ac3372fdf271efa7f`。
+- 网站排除规则支持当前来源或其 DNS 子域范围，按协议和端口匹配。关闭内联图标后仍可主动用快捷键或右键填充。停止保存或 Passkey 接管即时作用于匹配站点，未提交的 Passkey 请求可回退原生认证器。精确规则继续生效，偏好密封在本机。清单、权限与 CSP 同上一包 `776beb2b25c0`。
+- 新增 Enpass 桌面 JSON、Dashlane CLI 密码和安全备注 JSON、LastPass CLI `show --json`。独立样本及[来源限制](agents/vendor-json-sources.md)已核对。Bitwarden type 5 SSH 保留原始密钥、指纹、备注及二次验证标记，导出使用原生 `sshKey` 对象。已经绑定旧密钥的来源指纹不会在换钥后沿用。预览不返回密钥，导入取消不写入。
+- Rust **77** 项（其中 vendored 3 项）、Vitest **139** 项（带公开厂商样本）、TypeScript 和九个 WASM 校验通过。主核 **250,848 B**（上限 **256,000 B**）；迁移 **3,565,798 B**，在按需 CSV 和迁移 Worker 中。旧加密 `.vaultpack` 恢复、固定 KDBX 3.1 / 4.0、错密、截断及 KDF 超限样本通过。多设备先升级，再使用新增安全备注类型，升级前留存旧版加密备份。
+- Edge `158.0.4370.33` 与 Helium `157.0.8103.78` 实际加载同一解压树。通过安装、原生侧栏、二期、亮码与暗码两轮迁移、自动填充、数据安全、Passkey 及历史恢复、主密码轮换与设备认领、异库备份合入及旧 Bitwarden 密钥启用。实体认证器、实际系统锁屏、原厂应用、真实网站及实际网盘交由用户试用。日志在 `test-results/release-checks-7e9e617da993/`。
+- 1000×800、420 px 二维码、每轮新配置，原生 Popup 首次扫出候选并完成绘制。Edge 亮/暗 **213.6 / 218.7 ms**，同口径前包 **214.7 / 217.4 ms**；Helium **108.7 / 110.9 ms**，通过 `<200 ms`。本包未重测千条库冷开。最新同机冷开测量在 `5a759f049e22`，Edge / Helium 列表 **549.26 / 546.95 ms**、已认证 WASM 恢复 **65.80 / 60.95 ms**，均超目标。正式准出待验收。[冷开测量口径](cold-wake-diagnostics.md)
+
+## 扩展密码库格式候选包 0.1.0
+
 - ZIP `test-results/Vault-2026-11-20-03ebf90b5c3d-chrome.zip`，6,158,246 B。SHA-256 `03ebf90b5c3d6415f8bf7f4f30f03c3f1d9e55805e7f607a3c7573f5668f7d0c`。解压 `test-results/release-unpacked-03ebf90b5c3d`，54 个文件与生产构建逐字节一致，树摘要 `1204055dde810710691174382539a0230b733af15ff34de77ab3e28e9010cf02`。
 - 新增已知 Proton Pass PGP ZIP、Bitwarden/Proton Pass/RoboForm CSV、限定表头的 1Password CSV、英文 Kaspersky 打印 TXT。浏览器 CSV 兼容 `origin`；同一条登录项内的禁填页优先，不把异常规则降为默认放行；补齐 Apple/iCloud 与京东/3.cn 等价组。安全备注不是 API 令牌；源归档不视为回收站。具体布局、夹具与不支持项见[迁移格式记录](agents/remaining-password-formats.md)。
 - **兼容提醒：**新版继续读取旧快照和旧加密 `.vaultpack`。旧客户端遇到新增安全备注类型会拒读，不会按旧格式写回。多设备使用 WebDAV 时，先升级所有设备，再使用新类型；升级前保留一份旧版加密备份。
@@ -58,8 +67,8 @@
 | T08–T12、T19 | 坚果云/Koofr 预设、只读判库、条件写探测、加入/建库、零条目及批量删除保护、2.5 秒防抖的不可变加密 WAL、熔断、显式开启时差补偿。 | 故障注入覆盖假 ETag、旧 ETag、重启、重放、熔断、锁库零新请求、时钟偏差。同步是最终一致，不能保证两台离线设备的 HOTP 互斥。 |
 | T13–T18、T20 | 三方字段合并、加密待裁决区、全页裁决、落选密码历史、主密码旋转、设备认领和加密来源记录、滚动五份历史、历史预览/恢复、异库合入。 | 一个离线登录命中多个远端候选时一同展示；更晚的重叠草稿加密留在本机，无关项仍可同步。双份继承二次验证，同一递增凭证只保留一份可用计数。自动覆盖并发 WAL、条件提交、两处压实中断、30 天回收站边界、历史重放拒绝、计数恢复、不同身份合入。找不到祖先或不能保留新字段时停止写回；两家真实 WebDAV 尚未验收。 |
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
-| T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey、KeePass KDBX/XML/CSV、1Password 1PUX、Proton JSON/ZIP 与受支持的 PGP ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。未代签 KeePassXC-Browser 或其他厂商应用与外部网站的真实互通。 |
-| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，新增类型感知格式及 Kaspersky TXT，歧义退回手工映射。 | 有独立合成回归，以及 [2FAS、Aegis、andOTP、Stratum 公开夹具](agents/authenticator-backup-fixtures.md)；原生来源样本尚未齐备，不等同厂家或设备验收。 |
+| T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey 与原生 SSH 对象、KeePass KDBX/XML/CSV、1Password 1PUX、Proton JSON/ZIP 与受支持的 PGP ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。厂商应用与真实网站互通待验收。 |
+| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。架构另要求的 Enpass、Dashlane 与 LastPass JSON 已接入已核对的入口。 | 有独立合成回归及 [2FAS、Aegis、andOTP、Stratum 公开夹具](agents/authenticator-backup-fixtures.md)。原生来源样本尚未齐备，见[厂商 JSON 边界](agents/vendor-json-sources.md)。 |
 | T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 冷开 `<50 ms` 未达，正式发布准出和真实站点/设备验收不能签收。 |
 
 ### 格式限制

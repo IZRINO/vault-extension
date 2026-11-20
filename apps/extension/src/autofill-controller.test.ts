@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AutofillController } from './autofill-controller';
+import type { AutofillSettings } from './autofill-settings';
 import type { VaultController } from './vault-controller';
 
 const extensionId = 'fixture-extension';
@@ -9,13 +10,17 @@ const menu = { id: extensionId, url: `chrome-extension://${extensionId}/inline-m
 let controller: AutofillController;
 let tabUrl: string;
 let unlocked: boolean;
+let settings: AutofillSettings;
+let tabWait: Promise<void> | undefined;
 let handle: ReturnType<typeof vi.fn>;
 let sendMessage: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   tabUrl = top; unlocked = true;
+  settings = { sites: {}, equivalentDomains: [] };
+  tabWait = undefined;
   handle = vi.fn(async (message: { type: string }) => {
     if (message.type === 'status') return { unlocked };
-    if (message.type === 'autofill-settings') return { sites: {}, equivalentDomains: [] };
+    if (message.type === 'autofill-settings') return settings;
     if (!unlocked) throw new Error('请先解锁密码库。');
     if (message.type === 'autofill-candidates') return [{ id: 'credential-a', title: 'Fixture account', account: 'user' }];
     if (message.type === 'autofill-read') return { values: { username: 'user', password: 'fixture-secret' } };
@@ -27,12 +32,57 @@ beforeEach(() => {
   });
   vi.stubGlobal('browser', {
     runtime: { id: extensionId, getURL: (path: string) => `chrome-extension://${extensionId}${path}` },
-    tabs: { get: async () => ({ id: 1, url: tabUrl }), sendMessage },
+    tabs: { get: async () => { await tabWait; return { id: 1, url: tabUrl }; }, sendMessage },
     storage: { local: { get: async () => ({}) } },
   });
   controller = new AutofillController({ handle } as unknown as VaultController);
 });
 describe('autofill authorization', () => {
+  it('cannot reuse a grant removed while its tab is being checked', async () => {
+    const { token } = await controller.handle({ type: 'begin', kind: 'login' }, source) as { token: string };
+    const wait = Promise.withResolvers<void>();
+    tabWait = wait.promise;
+    const pending = controller.handle({ type: 'menu', token }, menu);
+    controller.clear(source.tab.id);
+    wait.resolve();
+    await expect(pending).rejects.toThrow('失效');
+    expect(handle).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'autofill-candidates' }));
+  });
+
+  it('keeps a save grant when another site or an independent preference changes', async () => {
+    const { token } = await controller.handle({ type: 'capture', username: 'user', password: 'synthetic' }, source) as { token: string };
+    controller.siteChanged('https://*.other.test', { saveDisabled: true });
+    controller.siteChanged('https://*.example.com', { passkeyDisabled: true, inlineDisabled: true });
+    await expect(controller.handle({ type: 'menu', token }, menu)).resolves.toMatchObject({ capture: { account: 'user' } });
+    controller.siteChanged('https://*.example.com', { saveDisabled: true });
+    await expect(controller.handle({ type: 'menu', token }, menu)).rejects.toThrow('失效');
+  });
+
+  it('rejects website rule management and applies new restrictions to pending fill and capture grants', async () => {
+    const { sites } = settings;
+    await expect(controller.handle({ type: 'site-rules', origin: source.origin }, source)).rejects.toThrow('仅密码库');
+    await expect(controller.handle({ type: 'site', origin: 'https://*.example.com', flags: { inlineDisabled: true } }, source)).rejects.toThrow('仅密码库');
+    const { token } = await controller.handle({ type: 'begin', kind: 'login' }, source) as { token: string };
+    sites['https://*.example.com'] = { inlineDisabled: true, saveDisabled: false, passkeyDisabled: true };
+    await expect(controller.handle({ type: 'menu', token }, menu)).rejects.toThrow('已停用');
+    await expect(controller.handle({ type: 'begin', kind: 'login' }, source)).rejects.toThrow('已停用');
+    const capture = await controller.handle({ type: 'capture', username: 'user', password: 'synthetic' }, source) as { token: string };
+    sites['https://*.example.com'].saveDisabled = true;
+    await expect(controller.handle({ type: 'pending' }, source)).resolves.toBeNull();
+    await expect(controller.handle({ type: 'save', token: capture.token, confirmCrossOrigin: true }, menu)).rejects.toThrow('已停用');
+    expect(handle).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'upsert' }));
+  });
+
+  it('keeps deliberate fill available when the website only disables the inline icon', async () => {
+    settings.sites['https://*.example.com'] = { inlineDisabled: true, saveDisabled: true, passkeyDisabled: false };
+    await expect(controller.handle({ type: 'begin', kind: 'login' }, source)).rejects.toThrow('已停用');
+    const { token } = await controller.handle({ type: 'begin', kind: 'login', manual: true }, source) as { token: string };
+    controller.siteChanged('https://*.example.com', { inlineDisabled: true });
+    await expect(controller.handle({ type: 'fill', token, id: 'credential-a', confirmCrossOrigin: false }, menu)).rejects.toThrow('来源风险');
+    await controller.handle({ type: 'fill', token, id: 'credential-a', confirmCrossOrigin: true }, menu);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects source spoofing and returns only an opaque grant to a real content document', async () => {
     for (const sender of [{ ...source, id: 'other-extension' }, { ...source, origin: 'https://evil.test' },
       { ...source, documentId: undefined }, { ...source, tab: { id: 1, url: 'https://other.test' } }]) {

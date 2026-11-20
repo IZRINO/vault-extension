@@ -6,6 +6,7 @@ mod bitwarden;
 mod migration_csv;
 mod authenticators;
 mod cxf;
+mod enpass;
 mod keepass_kdbx;
 mod keepass_text;
 mod portable;
@@ -15,6 +16,8 @@ mod proton_pgp;
 mod typed_csv;
 mod kaspersky;
 mod vendor_archives;
+mod vendor_cli;
+mod vendor_json;
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RECORDS: usize = 5001; // header + 5,000 data records

@@ -1,19 +1,20 @@
 import type { VaultController } from './vault-controller';
 import type { AutofillMessage, FillKind, FillSource, MenuState } from './autofill-messages';
 import type { VaultItem, VaultStatus } from './vault-messages';
-import { defaultFlags, sameSite, webUrl, type AutofillSettings, type SiteFlags } from './autofill-policy';
+import { defaultFlags, resolveSiteFlags, sameSite, siteRuleMatches, siteRulesFor, validateSiteRule, webUrl, type AutofillSettings, type SiteFlags } from './autofill-policy';
 import { isVaultPage } from './sender-policy';
 
 interface Grant {
   source: FillSource; kind: FillKind; expires: number; menuDocument?: string;
   performing?: boolean;
+  manual: boolean;
   capture?: { username: string; password: string };
 }
 type Sender = { id?: string; url?: string; origin?: string; documentId?: string; frameId?: number; tab?: { id?: number; url?: string } };
 const kinds = new Set(['login', 'username', 'otp', 'card', 'identity']);
 export class AutofillController {
   private grants = new Map<string, Grant>();
-  private actions = new Map<number, symbol>();
+  private actions = new Map<number, { url: URL; capture: boolean; manual: boolean }>();
   constructor(private vault: VaultController) {}
   clear(tabId?: number) {
     if (tabId == null) this.actions.clear(); else this.actions.delete(tabId);
@@ -21,6 +22,17 @@ export class AutofillController {
       if (tabId == null || grant.source.tabId === tabId) {
         this.consume(token);
       }
+    }
+  }
+  siteChanged(rule: string, flags: Partial<SiteFlags>) {
+    if (!flags.inlineDisabled && !flags.saveDisabled) return;
+    const disables = (url: URL, capture: boolean, manual: boolean) =>
+      (capture ? flags.saveDisabled : !manual && flags.inlineDisabled) === true && siteRuleMatches(rule, url);
+    for (const [tabId, action] of this.actions) {
+      if (disables(action.url, action.capture, action.manual)) this.actions.delete(tabId);
+    }
+    for (const [token, grant] of this.grants) {
+      if (disables(webUrl(grant.source.url), !!grant.capture, grant.manual)) this.consume(token);
     }
   }
   private consume(token: string) {
@@ -51,33 +63,34 @@ export class AutofillController {
       sender.origin !== 'chrome-extension://' + browser.runtime.id ||
       sender.url !== browser.runtime.getURL('/inline-menu.html') ||
       (grant.menuDocument && grant.menuDocument !== sender.documentId)) throw new Error('填充窗口已失效，请重新点击网页中的锁图标。');
-    const tab = await browser.tabs.get(grant.source.tabId);
+    const source = grant.source;
+    const tab = await browser.tabs.get(source.tabId);
+    if (this.grants.get(token) !== grant || grant.source !== source || grant.expires <= Date.now() ||
+        (grant.menuDocument && grant.menuDocument !== sender.documentId)) throw new Error('填充窗口已失效，请重新点击网页中的锁图标。');
     if (webUrl(tab.url).href !== grant.source.topUrl) { this.consume(token); throw new Error('网页已导航，已取消填充。'); }
     grant.menuDocument = sender.documentId;
     return grant;
   }
   async handle(message: AutofillMessage, sender: Sender): Promise<unknown> {
-    if (message.type === 'site') {
+    if (message.type === 'site' || message.type === 'site-rules') {
       if (!isVaultPage(sender, browser.runtime.id)) throw new Error('仅密码库界面可以修改网站设置。');
-      const origin = webUrl(message.origin).origin;
-      const settings = await this.settings();
-      if (message.flags) {
-        if (Object.keys(message.flags).length !== 3 ||
-          !['inlineDisabled', 'saveDisabled', 'passkeyDisabled'].every(key => typeof message.flags![key as keyof SiteFlags] === 'boolean')) throw new Error('网站设置无效。');
-        await this.vault.handle({ type: 'set-autofill-site', origin, flags: message.flags });
-        settings.sites[origin] = message.flags;
-        this.clear();
-        await browser.tabs.query({}).then(tabs => Promise.allSettled(tabs.filter(tab => tab.id != null)
-          .map(tab => browser.tabs.sendMessage(tab.id!, { target: 'vault-fill', type: 'settings-changed' }))));
+      if (message.type === 'site' && message.flags !== undefined) {
+        return await this.vault.handle({ type: 'set-autofill-site', origin: message.origin, flags: message.flags });
       }
-      return settings.sites[origin] ?? defaultFlags();
+      const { sites } = await this.settings();
+      return message.type === 'site-rules'
+        ? siteRulesFor(sites, webUrl(message.origin))
+        : sites[validateSiteRule(message.origin)] ?? defaultFlags();
     }
     if (['begin', 'flags', 'capture', 'pending'].includes(message.type)) {
-      const action = message.type === 'begin' || message.type === 'capture' ? Symbol() : undefined;
-      if (action && sender.id === browser.runtime.id && Number.isInteger(sender.tab?.id)) this.actions.set(sender.tab!.id!, action);
+      const manual = message.type === 'begin' && message.manual === true;
+      const action = (message.type === 'begin' || message.type === 'capture') &&
+        sender.id === browser.runtime.id && Number.isInteger(sender.tab?.id)
+        ? { url: webUrl(sender.url), capture: message.type === 'capture', manual } : undefined;
+      if (action) this.actions.set(sender.tab!.id!, action);
       const source = await this.source(sender);
       const settings = await this.settings();
-      const flags = settings.sites[webUrl(source.url).origin] ?? defaultFlags();
+      const flags = resolveSiteFlags(settings.sites, webUrl(source.url));
       if (message.type === 'flags') return flags;
       if (message.type === 'pending') {
         for (const [token, grant] of this.grants) {
@@ -92,7 +105,7 @@ export class AutofillController {
       }
       if (message.type !== 'begin' && message.type !== 'capture') throw new Error('无效操作。');
       const capturing = message.type === 'capture';
-      if ((!capturing && flags.inlineDisabled) || (capturing && flags.saveDisabled)) throw new Error('此网站已停用这项功能。');
+      if (capturing ? flags.saveDisabled : !manual && flags.inlineDisabled) throw new Error('此网站已停用这项功能。');
       if (capturing && (typeof message.username !== 'string' || message.username.length > 1024 ||
         typeof message.password !== 'string' || !message.password || message.password.length > 4096)) throw new Error('捕获的凭证无效。');
       if (!capturing && !kinds.has(message.kind)) throw new Error('不支持的填充类型。');
@@ -105,7 +118,7 @@ export class AutofillController {
       this.clear(source.tabId);
       if (this.grants.size >= 20) this.clear();
       const token = crypto.randomUUID() + crypto.randomUUID();
-      this.grants.set(token, { source, kind: capturing ? 'login' : message.kind, expires: Date.now() + 120000,
+      this.grants.set(token, { source, kind: capturing ? 'login' : message.kind, expires: Date.now() + 120000, manual,
         capture: capturing ? { username: message.username, password: message.password } : undefined });
       setTimeout(() => {
         const grant = this.grants.get(token);
@@ -131,6 +144,11 @@ export class AutofillController {
     const settings = await this.settings();
     const source = webUrl(grant.source.url), top = webUrl(grant.source.topUrl);
     const crossOrigin = !sameSite(source, top, settings.equivalentDomains);
+    const flags = resolveSiteFlags(settings.sites, source);
+    if (grant.capture ? flags.saveDisabled : !grant.manual && flags.inlineDisabled) {
+      this.consume(message.token);
+      throw new Error('此网站已停用这项功能。');
+    }
     if (message.type === 'menu') {
       const status = await this.vault.handle({ type: 'status' }) as VaultStatus;
       const candidates = await this.vault.handle({ type: 'autofill-candidates', url: source.href, kind: grant.kind, groups: settings.equivalentDomains }) as MenuState['candidates'];
@@ -141,11 +159,10 @@ export class AutofillController {
     if (!['fill', 'save'].includes(message.type)) throw new Error('无效操作。');
     if (grant.performing) throw new Error('正在处理本次请求，请稍候。');
     if ((crossOrigin || source.protocol === 'http:') && message.confirmCrossOrigin !== true) throw new Error('请先确认网页来源风险。');
-    const flags = settings.sites[source.origin] ?? defaultFlags();
     grant.performing = true;
     try {
     if (message.type === 'fill') {
-      if (flags.inlineDisabled || grant.capture) throw new Error('此填充请求已失效。');
+      if (grant.capture) throw new Error('此填充请求已失效。');
       // Ask the original document to revalidate its live target before decrypting.
       const valid = await browser.tabs.sendMessage(grant.source.tabId, { target: 'vault-fill', type: 'probe', token: message.token }, { documentId: grant.source.documentId });
       if (!valid?.ready || valid.url !== grant.source.url) throw new Error('输入框或网页已改变，请重新点击。');

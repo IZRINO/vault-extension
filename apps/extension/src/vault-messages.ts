@@ -8,7 +8,8 @@ export const MAX_AUTH_BACKUP_BYTES = 4 * 1024 * 1024;
 export const AUTH_BACKUP_FORMATS = ['google', '2fas', 'aegis', 'raivo', 'andotp', 'stratum', 'freeotp-plus', 'winauth'] as const;
 export type AuthBackupFormat = typeof AUTH_BACKUP_FORMATS[number];
 export type AuthBackupInput = { format: AuthBackupFormat; bytes?: number[]; images?: string[]; password?: string };
-export const PORTABLE_FORMATS = ['bitwarden', 'bitwarden-retained', 'cxf', 'keepass', 'onepassword', 'proton', 'kaspersky'] as const;
+export const VENDOR_JSON_FORMATS = ['enpass', 'dashlane-json', 'lastpass-json'] as const;
+export const PORTABLE_FORMATS = ['bitwarden', 'bitwarden-retained', 'cxf', 'keepass', 'onepassword', 'proton', 'kaspersky', ...VENDOR_JSON_FORMATS] as const;
 export type MigrationFormat = typeof PORTABLE_FORMATS[number] | 'csv';
 export type CsvMapping = Partial<Record<'title' | 'url' | 'username' | 'password' | 'note' | 'totp' | 'tags' | 'trashed', number>>;
 export interface MigrationPreview {
@@ -97,7 +98,7 @@ export type VaultMessage =
   | { type: 'autofill-read'; id: string; url: string; kind: import('./autofill-messages').FillKind; groups: string[][]; fields?: string[]; proof?: Proof }
   | { type: 'set-equivalent-domains'; groups: string[][] }
   | { type: 'autofill-settings' }
-  | { type: 'set-autofill-site'; origin: string; flags: import('./autofill-settings').SiteFlags }
+  | { type: 'set-autofill-site'; origin: string; flags: Partial<import('./autofill-settings').SiteFlags> }
   | { type: 'status' | 'open' | 'lock' | 'list' | 'audit' | 'remove-pin' | 'remove-prf' }
   | { type: 'create'; masterPassword: string; calibrate?: boolean }
   | { type: 'unlock'; password: string }

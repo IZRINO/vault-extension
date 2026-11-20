@@ -277,7 +277,7 @@ async function run(name) {
 (async () => {
   const results = [];
   for (const name of process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium']) results.push(await run(name));
-  const output = path.join(root, 'test-results');
+  const output = path.resolve(root, process.env.VAULT_TEST_OUTPUT || 'test-results');
   await fs.mkdir(output, { recursive: true });
   await fs.writeFile(path.join(output, 'sidepanel.json'), JSON.stringify(results, null, 2) + '\n');
 })().catch(error => { console.error(error); process.exitCode = 1; });

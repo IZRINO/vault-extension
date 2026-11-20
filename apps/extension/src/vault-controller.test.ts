@@ -424,6 +424,30 @@ describe('real WASM + background session integration', () => {
     await damaged.handle({ type: 'unlock', password: 'Rotated-Master-Password#2026' });
     await expect(damaged.handle({ type: 'autofill-settings' })).rejects.toBeDefined();
   });
+
+  it('seals wildcard restrictions and applies them to Passkey after reopening the vault', async () => {
+    const rule = 'https://*.example.com:8443', origin = 'https://login.example.com:8443';
+    const controller = await unlocked();
+    await controller.handle({ type: 'set-autofill-site', origin: rule, flags: { passkeyDisabled: true } });
+    const saved = await controller.handle({ type: 'set-autofill-site', origin: rule, flags: { saveDisabled: true } });
+    expect(saved).toEqual({ inlineDisabled: false, saveDisabled: true, passkeyDisabled: true });
+    await controller.handle({ type: 'set-autofill-site', origin, flags: { inlineDisabled: true } });
+    expect(JSON.stringify(state.local)).not.toContain('example.com');
+    await controller.lock();
+    const reopened = await unlocked();
+    expect(await reopened.passkeyAvailable(origin)).toBe(false);
+    expect(await reopened.passkeyAvailable('https://eu.login.example.com:8443')).toBe(false);
+    expect(await reopened.passkeyAvailable('https://example.com:8443')).toBe(true);
+    expect(await reopened.passkeyAvailable('https://login.example.com')).toBe(true);
+    await expect(reopened.handle({ type: 'set-autofill-site', origin: 'https://*.github.io', flags: { passkeyDisabled: true } })).rejects.toThrow();
+    await reopened.handle({ type: 'set-autofill-site', origin: rule, flags: { passkeyDisabled: false, saveDisabled: false } });
+    expect(await reopened.passkeyAvailable(origin)).toBe(true);
+    expect(await reopened.handle({ type: 'autofill-settings' })).toEqual({
+      sites: { [origin]: { inlineDisabled: true, saveDisabled: false, passkeyDisabled: false } },
+      equivalentDomains: [],
+    });
+  });
+
   it('migrates development plaintext preferences only after an encrypted save succeeds', async () => {
     const legacy = { sites: {}, equivalentDomains: [['example.com', 'example.net']] };
     state.local.autofill = legacy;

@@ -1,4 +1,5 @@
 import type { VaultController } from '../vault-controller';
+import { siteRuleMatches } from '../autofill-policy';
 import { readRequest, type PasskeyCandidate, type PasskeyOutcome, type PasskeySelection, type TrustedRequest } from './protocol';
 
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
@@ -25,9 +26,12 @@ export class PasskeyController {
   private pending = new Map<number, Ceremony>();
   constructor(private vault: VaultController) {}
 
-  stop(tabId?: number, origin?: string) {
+  stop(tabId?: number, rule?: string) {
     for (const entry of this.pending.values()) {
-      if ((tabId == null || entry.source.tabId === tabId) && (!origin || entry.source.origin === origin)) this.finish(entry, { type: 'cancel' });
+      if ((tabId == null || entry.source.tabId === tabId) && (!rule || siteRuleMatches(rule, new URL(entry.source.origin)))) {
+        // A request already performing may have committed a credential or counter.
+        this.finish(entry, { type: rule && !entry.performing ? 'native' : 'cancel' });
+      }
     }
   }
 
@@ -90,13 +94,16 @@ export class PasskeyController {
       started = true;
       void (async () => {
         const source = await this.source(port.sender);
-        const enabled = await this.vault.passkeyAvailable(source.origin);
-        if (message.request === 'capability') { send({ type: 'capability', available: enabled }); return; }
+        if (message.request === 'capability') {
+          send({ type: 'capability', available: await this.vault.passkeyAvailable(source.origin) });
+          return;
+        }
         const request = readRequest(message.request);
-        if (!live || !enabled || !request || this.pending.has(source.tabId) || this.pending.size >= 6) { send({ type: 'native' }); return; }
+        if (!live || !request || this.pending.has(source.tabId) || this.pending.size >= 6) { send({ type: 'native' }); return; }
         const trusted: TrustedRequest = { ...request, origin: source.origin, rpId: request.rpId ?? new URL(source.origin).hostname };
         await this.revalidate(source, !trusted.conditional);
-        if (!live || this.pending.has(source.tabId)) return send({ type: 'cancel' });
+        if (!await this.vault.passkeyAvailable(source.origin)) return send({ type: 'native' });
+        if (!live || this.pending.has(source.tabId) || this.pending.size >= 6) return send({ type: 'cancel' });
         const duration = trusted.conditional ? 120_000 : 60_000;
         const record: Ceremony = {
           port, source, request: trusted, ticket: crypto.randomUUID(), deadline: Date.now() + duration,

@@ -10,7 +10,7 @@ export interface MenuState {
   kind: FillKind; candidates: FillCandidate[]; capture?: { account: string; updating: boolean };
 }
 export type AutofillMessage =
-  | { type: 'begin'; kind: FillKind }
+  | { type: 'begin'; kind: FillKind; manual?: true }
   | { type: 'flags' }
   | { type: 'pending' }
   | { type: 'capture'; username: string; password: string }
@@ -18,7 +18,8 @@ export type AutofillMessage =
   | { type: 'fill'; token: string; id: string; confirmCrossOrigin: boolean; copyOtp?: boolean; proof?: Proof }
   | { type: 'save'; token: string; confirmCrossOrigin: boolean; proof?: Proof }
   | { type: 'close'; token: string }
-  | { type: 'site'; origin: string; flags?: SiteFlags };
+  | { type: 'site'; origin: string; flags?: Partial<SiteFlags> }
+  | { type: 'site-rules'; origin: string };
 
 export async function autofillRequest<T>(message: AutofillMessage): Promise<T> {
   const reply = await browser.runtime.sendMessage({ target: 'vault-autofill', ...message });

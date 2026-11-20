@@ -5,6 +5,7 @@ import { CLIPBOARD_ALARM, clearExpiredClipboard } from '../src/clipboard';
 import type { VaultMessage } from '../src/vault-messages';
 import { AutofillController } from '../src/autofill-controller';
 import type { AutofillMessage } from '../src/autofill-messages';
+import type { SiteFlags } from '../src/autofill-settings';
 import { restoreDavBadge } from '../src/sync/connection';
 import { PasskeyController } from '../src/passkeys/controller';
 import { PASSKEY_PORT } from '../src/passkeys/protocol';
@@ -20,6 +21,15 @@ export default defineBackground(() => {
     browser.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
   ]);
   void ready.then(restoreDavBadge).catch(() => undefined);
+  const notifyAutofill = (type: 'settings-changed' | 'site-settings-changed') => {
+    void browser.tabs.query({}).then(tabs => Promise.allSettled(tabs.filter(tab => tab.id != null)
+      .map(tab => browser.tabs.sendMessage(tab.id!, { target: 'vault-fill', type })))).catch(() => undefined);
+  };
+  const siteChanged = (rule: string, flags: Partial<SiteFlags>) => {
+    if (flags.passkeyDisabled === true) passkeys.stop(undefined, rule);
+    autofill.siteChanged(rule, flags);
+    if (flags.inlineDisabled !== undefined || flags.saveDisabled !== undefined) notifyAutofill('site-settings-changed');
+  };
   browser.runtime.onConnect.addListener(port => {
     if (port.name === PASSKEY_PORT) passkeys.connect(port);
     if (port.name === QR_SCAN_PORT) {
@@ -32,7 +42,7 @@ export default defineBackground(() => {
     if (message?.target === 'vault-autofill') {
       void ready.then(() => autofill.handle(message as AutofillMessage, sender)).then(
         value => {
-          if (message.type === 'site' && message.flags?.passkeyDisabled === true) passkeys.stop(undefined, new URL(message.origin).origin);
+          if (message.type === 'site' && message.flags !== undefined) siteChanged(message.origin, message.flags);
           respond({ ok: true, value });
         },
         error => respond({ ok: false, error: error instanceof Error ? error.message : '填充失败，请重试。' }),
@@ -60,12 +70,18 @@ export default defineBackground(() => {
     // The trusted open request can start compiling the static binary while storage access
     // levels are being applied. Vault/session reads still wait for that protection.
     if (message.type === 'open') void loadVaultCore().catch(() => undefined);
-    void ready.then(() => vault.handle(message as VaultMessage)).then(
+    const handle = ready.then(() => vault.handle(message as VaultMessage));
+    const isMigrationInput = message.type === 'preview-migration' || message.type === 'import-migration' || message.type === 'csv-headers';
+    // Chrome delivers an independent JSON copy to this listener.
+    const completed = isMigrationInput ? handle.finally(() => {
+      if (Array.isArray(message.bytes)) message.bytes.fill(0);
+    }) : handle;
+    void completed.then(
       value => {
+        if (message.type === 'set-autofill-site') siteChanged(message.origin, message.flags);
         if (['unlock', 'unlock-pin', 'unlock-prf', 'recover', 'create', 'webdav-create', 'webdav-join', 'webdav-update-key', 'set-equivalent-domains'].includes(message.type)) {
           autofill.clear();
-          void browser.tabs.query({}).then(tabs => Promise.allSettled(tabs.filter(tab => tab.id != null)
-            .map(tab => browser.tabs.sendMessage(tab.id!, { target: 'vault-fill', type: 'settings-changed' })))).catch(() => undefined);
+          notifyAutofill('settings-changed');
         }
         respond({ ok: true, value });
       },

@@ -1,7 +1,45 @@
 import { describe, expect, it } from 'vitest';
-import { loginUrisMatch, sameSite, uriMatches, validateGroups, webUrl } from './autofill-policy';
+import { loginUrisMatch, resolveSiteFlags, sameSite, siteRuleMatches, siteRulesFor, uriMatches, validateGroups, validateSiteRule, webUrl } from './autofill-policy';
 
 describe('autofill site boundaries', () => {
+  it('combines exact and wildcard restrictions without an exception that enables a disabled function', () => {
+    const exact = { inlineDisabled: true, saveDisabled: false, passkeyDisabled: false };
+    const wildcard = { inlineDisabled: false, saveDisabled: true, passkeyDisabled: true };
+    const sites = {
+      'https://login.example.com:8443': exact,
+      'https://*.example.com:8443': wildcard,
+      'https://*.login.example.com:8443': { inlineDisabled: true, saveDisabled: false, passkeyDisabled: false },
+    };
+    const site = webUrl('https://login.example.com:8443/form');
+    expect(siteRuleMatches('https://*.example.com:8443', site)).toBe(true);
+    expect(siteRuleMatches('https://*.login.example.com:8443', site)).toBe(false);
+    expect(siteRuleMatches('https://*.example.com', site)).toBe(false);
+    expect(siteRulesFor(sites, site)).toMatchObject({
+      exact, wildcardRules: [
+        { rule: 'https://*.example.com:8443', flags: wildcard },
+        { rule: 'https://*.login.example.com:8443', flags: sites['https://*.login.example.com:8443'] },
+      ],
+      effective: { inlineDisabled: true, saveDisabled: true, passkeyDisabled: true },
+    });
+    expect(resolveSiteFlags(sites, webUrl('https://eu.login.example.com:8443/'))).toEqual({
+      inlineDisabled: true, saveDisabled: true, passkeyDisabled: true,
+    });
+    for (const target of ['https://example.com:8443', 'https://login.example.com', 'http://login.example.com:8443',
+      'https://not-example.com:8443', 'https://login.example.com.invalid:8443']) {
+      expect(resolveSiteFlags(sites, webUrl(target))).toEqual({ inlineDisabled: false, saveDisabled: false, passkeyDisabled: false });
+    }
+  });
+
+  it('accepts canonical subdomain rules within a registrable suffix and bounds them to one scheme and port', () => {
+    expect(validateSiteRule('https://*.alice.github.io:8443')).toBe('https://*.alice.github.io:8443');
+    expect(validateSiteRule('http://127.0.0.1:8080')).toBe('http://127.0.0.1:8080');
+    for (const invalid of [
+      'https://*.github.io', 'https://*.co.uk', 'https://*.*.example.com', 'https://other*.example.com',
+      'http://*.localhost', 'http://*.127.0.0.1:8080', 'https://*.nas.lan', 'https://*.example.com/path',
+      'https://*.example.com:443', 'https://*.example.com#fragment', 'https://*.example.com.',
+      'https://user@*.example.com', 'file://*.example.com', 'https://*.example.com:*',
+    ]) expect(() => validateSiteRule(invalid)).toThrow();
+  });
   it('honors a page exclusion before other URIs on the same account', () => {
     const uris = [{ uri: 'https://accounts.example.com' },
       { uri: 'https://settings.example.com/no-fill', matchRule: 'never' }];

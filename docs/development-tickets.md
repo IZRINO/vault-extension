@@ -311,10 +311,13 @@
 
 Ente Auth 加密 JSON v1 已实现本机导入；离线体检已提示「高敏登录项未关联验证器」，开发者凭证列表与详情已提醒 30 天内到期及已到期。迁移新增 KeePass XML/CSV、FreeOTP+、WinAuth、Bitwarden CSV、Proton Pass CSV 与指定 PGP ZIP、RoboForm CSV、英文 Kaspersky 打印 TXT，以及限定表头的 1Password CSV；浏览器 CSV 可归一 `origin` 或 `url`。见[候选记录](release-candidate-status.md#当前候选包-010)和[格式边界与夹具](agents/remaining-password-formats.md)。T06 的 Ente Auth、Bitwarden 原生应用往返仍待验收，不以合成样本代签。
 
+架构 §4.2 的子域排除已覆盖内联图标、保存提示和 Passkey 接管。§4.5.1 接入 Enpass 桌面 JSON、Dashlane CLI 密码与安全备注 JSON、LastPass CLI `show --json`。T35 仍按四家原生 CSV 验收。Bitwarden SSH 新增原生 type 5 导入与导出，沿用合成及公开夹具核验，本机以外的来源应用互通待试用。[厂商格式与公开样本](agents/vendor-json-sources.md)
+
 下表为尚未确认的兼容边界，不擅自升级成 T36 的发布门槛。
 
 | 格式或算法 | 相关工单 | 当前证据边界 |
 | --- | --- | --- |
 | 1Password CSV、其他原厂方言、Opera 实际导出 | T29、T35 | 合成回归不能证明当前各平台、语言和所有导出选项兼容；1Password CSV 目前只覆盖已列出的表头。 |
-| 其他供应商 JSON、Kaspersky 非英文打印稿或受保护备份 | T35 | 未接入无已验证格式规范或夹具的输入；原厂的 Kaspersky CSV 模板属于导入方向，不是密码库原生导出。 |
+| NordPass、RoboForm、Kaspersky 凭证 JSON | 架构 §4.5.1 | 已核对的可移植入口是 NordPass 和 RoboForm CSV、Kaspersky 英文打印 TXT。尚无这三家的独立凭证 JSON 结构证据。 |
+| Kaspersky 非英文打印稿与厂商加密备份 | 架构 §4.5.1 | 已验证的打印样本为英文。Dashlane `.dash` 和 Kaspersky `.edb` 有独立加密封装。 |
 | 可选 RS256 | 有实际只支持该算法的 RP 需求时，接 T22 | 独立服务端注册及验签通过；不阻塞计划指定的 ES256、EdDSA。 |

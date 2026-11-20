@@ -5,11 +5,11 @@ const fs = require('node:fs/promises');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
+const { evaluateNativePopup, waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
-const output = path.join(root, 'test-results');
+const output = path.resolve(root, process.env.VAULT_TEST_OUTPUT || 'test-results');
 const browsers = {
   edge: 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   helium: 'C:/Program Files/imput/Helium/Application/chrome.exe',
@@ -44,6 +44,48 @@ function html(body) {
     button{font:inherit;padding:10px;margin:8px 0}.otp{width:24px}iframe{width:560px;height:540px;border:1px solid #ccc}
     </style></head><body>${body}</body></html>`;
 }
+async function disableSubdomainFromPopup(context, id, origin, wildcard, read) {
+  const cdp = await context.browser().newBrowserCDPSession();
+  const list = async type => (await cdp.send('Target.getTargets', { filter: [{ type, exclude: false }] })).targetInfos;
+  let popup;
+  try {
+    const tab = (await list('tab')).find(target => target.url === `${origin}/plain`);
+    assert(tab, 'The test form must be the current toolbar tab');
+    const prior = new Set((await list('page')).map(target => target.targetId));
+    await cdp.send('Extensions.triggerAction', { id, targetId: tab.targetId });
+    await expect.poll(async () => {
+      popup = (await list('page')).find(target => target.url === `chrome-extension://${id}/popup.html` && !prior.has(target.targetId));
+      return !!popup;
+    }).toBe(true);
+    const evaluate = (fn, ...args) => evaluateNativePopup(cdp, popup.targetId, `(${fn})(...${JSON.stringify(args)})`);
+    await expect.poll(() => evaluate((targetOrigin, rule) => {
+      const summary = [...document.querySelectorAll('summary')].find(node => node.textContent.includes(new URL(targetOrigin).host));
+      if (!summary) return false;
+      if (!summary.parentElement.open) summary.click();
+      const select = summary.parentElement.querySelector('select');
+      if (!select || ![...select.options].some(option => option.value === rule)) return false;
+      select.value = rule;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }, origin, wildcard)).toBe(true);
+    for (const [label, flag] of [
+      ['显示填充图标', 'inlineDisabled'], ['提示保存新密码', 'saveDisabled'], ['允许接管通行密钥', 'passkeyDisabled'],
+    ]) {
+      await expect.poll(() => evaluate((name, rule) => {
+        const select = document.querySelector('details[open] select');
+        const input = [...document.querySelectorAll('label')].find(label => label.textContent === name)?.control;
+        if (select?.value !== rule || !input || input.disabled) return false;
+        if (input.checked) input.click();
+        return true;
+      }, label, wildcard)).toBe(true);
+      await expect.poll(async () => (await read(wildcard))[flag]).toBe(true);
+    }
+  } finally {
+    if (popup) await cdp.send('Target.closeTarget', { targetId: popup.targetId }).catch(() => undefined);
+    await cdp.detach();
+  }
+}
+
 async function server() {
   const instance = http.createServer((request, response) => {
     if (process.env.VAULT_NAV_DEBUG === '1') console.log('fixture request:', request.headers.host, request.url);
@@ -98,7 +140,7 @@ async function run(name, primary, secondary) {
     context = await chromium.launchPersistentContext(profile, {
       executablePath: process.env.VAULT_BROWSER_PATH || browsers[name], headless: process.env.VAULT_HEADED == null ? name !== 'helium' : process.env.VAULT_HEADED !== '1',
       args: ['--disable-extensions-except=' + extension, '--load-extension=' + extension,
-        '--host-resolver-rules=MAP *.test 127.0.0.1', '--no-proxy-server'], viewport: { width: 1000, height: 800 },
+        '--host-resolver-rules=MAP *.test 127.0.0.1', '--no-proxy-server', '--enable-unsafe-extension-debugging'], viewport: { width: 1000, height: 800 },
     });
     const errors = [];
     context.on('weberror', error => errors.push(error.error().message));
@@ -244,6 +286,55 @@ async function run(name, primary, secondary) {
     await page.goto(origin + '/controlled');
     frame = await open(page, page.getByLabel('Password', { exact: true }));
     await frame.getByRole('button', { name: '关闭填充菜单', exact: true }).click();
+
+    const scopeHost = 'login.vault-scope.test';
+    const scopePort = primary.address().port;
+    const scopedOrigin = `http://${scopeHost}:${scopePort}`;
+    const wildcard = `http://*.vault-scope.test:${scopePort}`;
+    const scopedRule = (rule, flags) => vault.evaluate(async ({ rule, flags }) => {
+      const reply = await chrome.runtime.sendMessage({ target: 'vault-autofill', type: 'site', origin: rule, flags });
+      if (!reply.ok) throw new Error(reply.error);
+      return reply.value;
+    }, { rule, flags });
+    await page.goto(scopedOrigin + '/plain');
+    await page.getByLabel('Password', { exact: true }).click();
+    await expect(page.locator('[data-vault-ui]')).toBeVisible();
+    await disableSubdomainFromPopup(context, id, scopedOrigin, wildcard, scopedRule);
+    await page.bringToFront();
+    assert.deepEqual(await scopedRule(wildcard), {
+      inlineDisabled: true, saveDisabled: true, passkeyDisabled: true,
+    });
+    await expect(page.locator('[data-vault-ui]')).toHaveCount(0);
+    await page.getByLabel('Password', { exact: true }).click();
+    await page.keyboard.press('Alt+Shift+L');
+    frame = await menu(page);
+    await frame.getByRole('button', { name: '关闭填充菜单', exact: true }).click();
+    await expect(page.locator('[data-vault-ui]')).toHaveCount(0);
+    const savePrompt = page.waitForEvent('framenavigated', {
+      predicate: frame => frame.url().endsWith('/inline-menu.html'), timeout: 900,
+    }).then(() => true, error => { if (error.name !== 'TimeoutError') throw error; return false; });
+    await page.getByLabel('Account', { exact: true }).fill('wildcard-synthetic');
+    await page.getByLabel('Password', { exact: true }).fill('Wildcard-fixture-password');
+    await page.getByRole('button', { name: 'Log in', exact: true }).click();
+    await page.waitForURL('**/success');
+    assert.equal(await savePrompt, false, 'Submitting on an excluded subdomain must not show a save prompt');
+    assert(!(await send({ type: 'list' })).some(item => item.account === 'wildcard-synthetic'));
+    const sealed = await vault.evaluate(() => chrome.storage.local.get(['autofill', 'autofillSealed']));
+    assert(sealed.autofillSealed && !Object.hasOwn(sealed, 'autofill'));
+    assert(!JSON.stringify(sealed).includes('vault-scope.test'));
+    await send({ type: 'lock' });
+    await send({ type: 'unlock', password: master });
+    assert(await scopedRule(wildcard).then(flags => flags.passkeyDisabled));
+    for (const host of [`${scopeHost}:${secondary.address().port}`, `vault-scope.test:${scopePort}`]) {
+      await page.goto(`http://${host}/plain`);
+      await page.getByLabel('Password', { exact: true }).click();
+      await expect(page.locator('[data-vault-ui]')).toBeVisible();
+    }
+    await scopedRule(wildcard, { inlineDisabled: false, saveDisabled: false, passkeyDisabled: false });
+    await page.goto(scopedOrigin + '/plain');
+    await page.getByLabel('Password', { exact: true }).click();
+    await expect(page.locator('[data-vault-ui]')).toBeVisible();
+
     await send({ type: 'upsert', itemJson: JSON.stringify({ title: 'Fixture checkout card',
       data: { kind: 'payment_card', cardholderName: 'Fixture User', cardNumber: '4111111111111111', expMonth: '11', expYear: '2030', cvv: '123' } }) });
     await page.goto(origin + '/card');
@@ -264,7 +355,9 @@ async function run(name, primary, secondary) {
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, controlledReact: true, multiStep: true, honeyPotsEmpty: true,
       closedShadow: true, openShadowForms: true, crossFrameConfirmation: true, portIsolation: true,
-      splitOtp: true, protectedFill: true, customVisibleField: true, captureAfterNavigation: true, updatePasswordHistory: true, shortcutAndClose: true, encryptedSitePreferences: true, paymentAndIdentity: true, errors }));
+      splitOtp: true, protectedFill: true, customVisibleField: true, captureAfterNavigation: true, updatePasswordHistory: true, shortcutAndClose: true,
+      encryptedSitePreferences: true, wildcardScopeAndPortIsolation: true, wildcardNativePopup: true,
+      paymentAndIdentity: true, errors }));
   } catch (error) {
     for (const [index, page] of (context?.pages() ?? []).entries()) {
       console.error('failure page:', page.url(), 'frames:', page.frames().map(frame => frame.url()));

@@ -11,6 +11,9 @@ const descriptions = {
   onepassword: { label: '1Password 1PUX', accept: '.1pux', password: false },
   proton: { label: 'Proton Pass', accept: '.json,.zip', password: true },
   kaspersky: { label: 'Kaspersky 打印导出（英文 TXT）', accept: '.txt', password: false },
+  enpass: { label: 'Enpass 桌面版明文 JSON', accept: '.json', password: false },
+  'dashlane-json': { label: 'Dashlane CLI 明文 JSON', accept: '.json', password: false },
+  'lastpass-json': { label: 'LastPass CLI 明文 JSON', accept: '.json', password: false },
 };
 type Format = keyof typeof descriptions;
 export default function PortableMigration({ refresh }: { refresh(): Promise<void> }) {

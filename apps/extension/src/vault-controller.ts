@@ -4,7 +4,8 @@ import { copyWithExpiry } from './clipboard';
 import * as store from './vault-storage';
 import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP_LENGTH, MAX_VAULTPACK_BYTES, type BackupExport, type BackupReceipt, type BrowserCsvPreview, type EntePreview, type HotpCode, type ItemDetailData, type ItemSummary, type OtpWorkerCode, type Proof, type TimedOtpCode, type VaultItem, type VaultMessage, type VaultOpening, type VaultPackPreview, type VaultStatus } from './vault-messages';
 import { planEnteImport, type EnteBatch } from './ente-auth';
-import { loginUrisMatch, validateGroups, webUrl, type AutofillSettings } from './autofill-policy';
+import { defaultFlags, loginUrisMatch, resolveSiteFlags, validateGroups, validateSiteRule, webUrl, type AutofillSettings } from './autofill-policy';
+import { SITE_FLAG_KEYS, validSiteFlags } from './autofill-settings';
 import type { FillCandidate, FillKind, FillPayload } from './autofill-messages';
 import { planMigration, type MigrationBatch } from './migration';
 import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTABLE_FORMATS, type AuthBackupPreview, type MigrationExport, type MigrationPreview } from './vault-messages';
@@ -33,7 +34,7 @@ async function digestHex(bytes: Uint8Array<ArrayBuffer>) {
   return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
-const internalFields = new Set(['Bitwarden 保留字段', 'Bitwarden 未识别的验证码设置', 'CSV 未识别的验证码设置', 'CSV 源自定义字段', 'CSV 源归档状态', 'Vault 迁移来源']);
+const internalFields = new Set(['Bitwarden 保留字段', 'Bitwarden 未识别的验证码设置', 'CSV 未识别的验证码设置', 'CSV 源自定义字段', 'CSV 源归档状态', '厂商 JSON 源字段', 'Vault 迁移来源']);
 type AuthorizationScope = 'vaultpack:receipt:v1' | 'otp:read:v1';
 async function authorize(key: Uint8Array, scope: AuthorizationScope, payload: Uint8Array) {
   try {
@@ -157,12 +158,17 @@ export class VaultController {
   }
 
   passkeyAvailable(origin: string): Promise<boolean> {
-    return this.enqueue(async check => !!this.session && !(await this.readAutofillSettings(check)).sites[origin]?.passkeyDisabled);
+    return this.enqueue(async check => !!this.session && !await this.passkeyDisabled(origin, check));
+  }
+
+  private async passkeyDisabled(origin: string, check: () => void) {
+    const { sites } = await this.readAutofillSettings(check);
+    return resolveSiteFlags(sites, webUrl(origin)).passkeyDisabled;
   }
 
   passkeyCandidates(request: TrustedRequest): Promise<PasskeyCandidate[]> {
     return this.enqueue(async check => {
-      if (!this.session || (await this.readAutofillSettings(check)).sites[request.origin]?.passkeyDisabled) throw new Error('Passkey 已停用或密码库已锁定。');
+      if (!this.session || await this.passkeyDisabled(request.origin, check)) throw new Error('Passkey 已停用或密码库已锁定。');
       const { key, wrap } = this.session;
       const { head, snap } = this.files!;
       const json = await derive<string>('passkey:candidates', [key, wrap, head, snap, JSON.stringify(request)]);
@@ -175,7 +181,7 @@ export class VaultController {
     return this.enqueue(async generationCheck => {
       const check = () => { generationCheck(); current(); };
       check();
-      if (!this.session || (await this.readAutofillSettings(check)).sites[request.origin]?.passkeyDisabled) throw new Error('Passkey 已停用或密码库已锁定。');
+      if (!this.session || await this.passkeyDisabled(request.origin, check)) throw new Error('Passkey 已停用或密码库已锁定。');
       if (selection.proof) await this.verify(selection.proof, check);
       check();
       const { key, wrap } = this.session;
@@ -1058,11 +1064,14 @@ export class VaultController {
         return null;
       }
       case 'set-autofill-site': {
-        const origin = webUrl(message.origin).origin;
+        const rule = validateSiteRule(message.origin);
+        if (!validSiteFlags(message.flags, true)) throw new Error('网站设置无效。');
         const settings = await this.readAutofillSettings(check);
-        settings.sites[origin] = message.flags;
+        const flags = { ...defaultFlags(), ...settings.sites[rule], ...message.flags };
+        if (SITE_FLAG_KEYS.some(key => flags[key])) settings.sites[rule] = flags;
+        else delete settings.sites[rule];
         await this.saveAutofillSettings(settings, check);
-        return null;
+        return flags;
       }
       case 'autofill-current': {
         const url = webUrl(message.url);
@@ -1372,9 +1381,9 @@ export class VaultController {
     const settings = value as AutofillSettings;
     if (!settings.sites || typeof settings.sites !== 'object' || Array.isArray(settings.sites) ||
       Object.keys(settings.sites).length > 1000) throw new Error('网站偏好最多保存 1,000 个网站。');
-    for (const [origin, flags] of Object.entries(settings.sites)) {
-      if (webUrl(origin).origin !== origin || !flags || typeof flags !== 'object' || Object.keys(flags).length !== 3 ||
-        !['inlineDisabled', 'saveDisabled', 'passkeyDisabled'].every(key => typeof flags[key as keyof typeof flags] === 'boolean')) throw new Error('网站偏好格式无效。');
+    for (const [rule, flags] of Object.entries(settings.sites)) {
+      validateSiteRule(rule);
+      if (!validSiteFlags(flags)) throw new Error('网站偏好格式无效。');
     }
     return { sites: structuredClone(settings.sites), equivalentDomains: validateGroups(settings.equivalentDomains) };
   }

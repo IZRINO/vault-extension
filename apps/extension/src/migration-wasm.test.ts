@@ -428,6 +428,191 @@ function restoredItem(v: ReturnType<typeof fresh>) {
   return restoredItems(v)[0];
 }
 
+describe('Enpass desktop JSON migration', () => {
+  const field = (type: string, value: string, extra = {}) => ({ type, value, label: type, sensitive: 0, deleted: 0, ...extra });
+  const entry = (uuid: string, title: string, extra = {}) => ({
+    uuid, title, template_type: 'login.default', favorite: 0, archived: 0, trashed: 0, fields: [], ...extra,
+  });
+
+  it('previews without writing and restores typed logins, notes, and source state without overwrite', () => {
+    const vault = fresh(), secret = ' fixture-password! ', note = 'Line 1\nLine 2\n ';
+    const login = entry('fixture-login', 'Enpass login', {
+      favorite: 1, auto_submit: 1, note, folders: ['child', 'other'],
+      fields: [
+        field('email', 'backup@example.test'), field('username', 'fixture-user'),
+        field('password', secret, { sensitive: 1 }),
+        field('password', 'deleted-password', { deleted: 1 }),
+        field('url', 'https://login.example.test/path'), field('url', 'https://second.example.org'),
+        field('url', 'https://user:pass@ignored.example.test'), field('.Android#', 'com.example.fixture'),
+        field('totp', base32), field('pin', 'fixture-pin'),
+        field('script', 'fixture-opaque'),
+      ],
+    });
+    const source = {
+      folders: [
+        { uuid: 'root', title: 'Home', parent_uuid: '' },
+        { uuid: 'child', title: 'Web', parent_uuid: 'root' },
+        { uuid: 'other', title: 'Work', parent_uuid: '' },
+      ],
+      items: [
+        login,
+        entry('fixture-archived', 'Archived login', { archived: 1, fields: [
+          field('password', 'archived-password'), field('url', 'https://old.example.test'), field('totp', 'bad seed!'),
+        ] }),
+        entry('fixture-note', 'Enpass note', { template_type: 'note.default', note: 'Offline\nnote' }),
+        entry('fixture-deleted', 'Trashed login', { trashed: 1, fields: [field('password', 'trashed-password')] }),
+      ],
+    };
+    const bytes = Buffer.from('\uFEFF' + str(source));
+    const preview = imported(vault, 'enpass', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 4, invalid: 0, unsupported: 3, ignoredOtp: 1, passkeys: 0 });
+    expect(str(preview.report)).not.toMatch(/fixture-password|fixture-pin|fixture-opaque|GEZDGNBV|trashed-password/);
+    expect(preview.head.length).toBe(0);
+    expect(preview.snap.length).toBe(0);
+    expect(restoredItems(vault)).toHaveLength(0);
+
+    const saved = imported(vault, 'enpass', bytes), opened = { ...vault, ...saved };
+    const records = restoredItems(opened);
+    const item = records.find(item => item.title === 'Enpass login');
+    expect(item).toMatchObject({ pinned: true, note, tags: ['Home/Web', 'Work'], data: {
+      kind: 'login', username: 'fixture-user', password: secret,
+      uris: [{ uri: 'https://login.example.test/path', matchRule: 'host' }, { uri: 'https://second.example.org', matchRule: 'host' }],
+    } });
+    expect(codeAt(item)).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+    expect(item.customFields).toEqual(expect.arrayContaining([expect.objectContaining({ name: '厂商 JSON 源字段', hidden: true })]));
+    expect(records.find(item => item.title === 'Archived login')).toMatchObject({
+      trashed: false, data: { uris: [{ uri: 'https://old.example.test', matchRule: 'never' }] },
+    });
+    expect(records.find(item => item.title === 'Enpass note')).toMatchObject({
+      note: 'Offline\nnote', data: { kind: 'developer', subtype: 'secure_note' },
+    });
+    expect(records.find(item => item.title === 'Trashed login')).toMatchObject({ trashed: true });
+    const again = imported(opened, 'enpass', bytes);
+    expect(again.report).toMatchObject({ ready: 0, skipped: 4 });
+    expect(again.snap.length).toBe(0);
+    const replacement = entry('fixture-login', 'Changed title', { fields: [field('password', 'changed-password')] });
+    expect(imported(opened, 'enpass', bin({ ...source, items: [replacement] })).report).toMatchObject({ ready: 0, skipped: 1 });
+  });
+
+  it('rejects unrelated wrappers, and counts malformed or oversized records without activating them', () => {
+    const vault = fresh();
+    for (const source of [{ encrypted: false, items: [] }, { items: [] }, { folders: [], items: {} }, { folders: [], items: [], version: 99 }]) {
+      expect(() => imported(vault, 'enpass', bin(source))).toThrow();
+    }
+    const duplicate = str({ folders: [], items: [entry('archived', 'Archived duplicate', {
+      archived: 1, fields: [field('password', 'fixture-secret'), field('url', 'https://example.test')],
+    })] }).replace('"archived":1', '"archived":1,"arch\\u0069ved":0');
+    expect(() => imported(vault, 'enpass', Buffer.from(duplicate))).toThrow();
+    const preview = imported(vault, 'enpass', bin({ folders: [], items: [
+      entry('flag', 'Unrecognized state', { archived: 'true', fields: [field('password', 'fixture-secret')] }),
+      entry('width', 'Too many fields', { fields: Array.from({ length: 257 }, () => field('password', 'fixture-secret')) }),
+      entry('unknown', 'Unknown template', { template_type: 'unknown.export', fields: [field('password', 'fixture-secret')] }),
+      entry('broken-field', 'Malformed password', { fields: [
+        field('url', 'https://wrong.example.test'), { type: 'password', value: 42 },
+      ] }),
+    ] }), '', false);
+    expect(preview.report).toMatchObject({ ready: 0, invalid: 3, unsupported: 1 });
+  });
+
+  it('keeps distinct source state and recovers known computer passwords without web autofill', () => {
+    const vault = fresh();
+    const fields = [field('password', ' ambiguous-looking password '), field('url', 'https://fixture.example.test/login')];
+    const source = { folders: [], items: [
+      entry('live', 'Similar title', { fields: [...fields, field('pin', 'active pin')] }),
+      entry('trash', 'Similar title', { trashed: 1, fields: [...fields, field('pin', 'active pin')] }),
+      entry('different-pin', 'Similar title', { fields: [...fields, field('pin', 'other pin')] }),
+      entry('server', 'Server account', { template_type: 'computer.server', fields, note: 'Offline note' }),
+    ] };
+    const saved = imported(vault, 'enpass', bin(source));
+    expect(saved.report).toMatchObject({ ready: 4, skipped: 0 });
+    const records = restoredItems({ ...vault, ...saved });
+    expect(records.filter(item => item.title === 'Similar title')).toHaveLength(3);
+    expect(records.find(item => item.trashed)).toMatchObject({ trashedAtMs: now * 1000 });
+    expect(records.find(item => item.title === 'Server account')).toMatchObject({ note: 'Offline note',
+      data: { kind: 'login', password: fields[0]!.value, uris: [] },
+    });
+    const duplicateId = { ...source, items: [source.items[0], { ...source.items[0], trashed: 1 }] };
+    expect(() => imported(vault, 'enpass', bin(duplicateId))).toThrow();
+  });
+});
+
+describe('vendor CLI JSON migration', () => {
+  it('maps Dashlane password and secure-note output, keeping protection and exact URL constraints', () => {
+    const vault = fresh();
+    const account = {
+      id: 'fixture-dashlane', anonId: 'fixture-anon', lastBackupTime: '1760000000', localeFormat: 'UNIVERSAL',
+      title: 'Dashlane login', url: 'https://dashlane.example.test/base', userSelectedUrl: 'https://selected.example.test/only-here',
+      login: 'fixture-dash-user',
+      secondaryLogin: 'alternate', password: ' fixture-dash-password ', note: 'Dashlane\r\nnote',
+      category: 'Personal', autoProtected: 'true', subdomainOnly: 'true', useFixedUrl: 'true',
+      otpSecret: 'foreign or invalid fallback', otpUrl: `otpauth://totp/?secret=${base32}&period=30&digits=6&lock=false`,
+    };
+    const note = { id: 'fixture-note', anonId: '', lastBackupTime: '1760000001', localeFormat: 'UNIVERSAL',
+      title: 'Dashlane note', content: 'Fixture secure note', secured: 'true', type: 'NO_TYPE' };
+    const bytes = bin([account, { ...account, id: 'fixture-invalid', autoProtected: '?' }]);
+    const preview = imported(vault, 'dashlane-json', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 1, invalid: 1, ignoredOtp: 0, passkeys: 0 });
+    expect(str(preview.report)).not.toMatch(/fixture-dash-password|GEZDGNBV|alternate/);
+    expect(preview.snap.length).toBe(0);
+    const login = imported(vault, 'dashlane-json', bytes);
+    const opened = { ...vault, ...login };
+    const saved = restoredItem(opened);
+    expect(saved).toMatchObject({ title: 'Dashlane login', tags: ['Personal'], requireReprompt: true, note: account.note, data: {
+      kind: 'login', username: account.login, password: account.password, uris: [{ uri: account.userSelectedUrl, matchRule: 'exact' }],
+    } });
+    expect(codeAt(saved)).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+    const noteResult = imported(opened, 'dashlane-json', bin([note]));
+    expect(restoredItems({ ...opened, ...noteResult }).find(item => item.title === note.title)).toMatchObject({
+      requireReprompt: true, note: note.content, data: { kind: 'developer', subtype: 'secure_note' },
+    });
+    expect(imported(opened, 'dashlane-json', bytes).report).toMatchObject({ ready: 0, skipped: 1, invalid: 1 });
+    expect(() => imported(vault, 'dashlane-json', bin([{ title: 'generic', username: 'me', password: 'p', url: account.url }]))).toThrow();
+    const duplicate = str([account]).replace('"autoProtected":"true"', '"autoProtected":"true","autoProtected":"false"');
+    expect(() => imported(vault, 'dashlane-json', Buffer.from(duplicate))).toThrow();
+  });
+
+  it('keeps Dashlane path scopes with fixed URL off and does not collapse different reprompt states', () => {
+    const vault = fresh();
+    const item = {
+      id: 'one', anonId: '', lastBackupTime: '1760000000', localeFormat: 'UNIVERSAL',
+      title: 'Path restricted', url: 'https://dashlane.example.test/tenant-a/login', login: 'fixture',
+      password: 'synthetic', useFixedUrl: 'false', subdomainOnly: 'true', autoProtected: 'false',
+    };
+    const saved = imported(vault, 'dashlane-json', bin([item, { ...item, id: 'two', autoProtected: 'true' }]));
+    expect(saved.report).toMatchObject({ ready: 2, skipped: 0 });
+    const records = restoredItems({ ...vault, ...saved });
+    expect(records.map(row => row.requireReprompt).sort()).toEqual([false, true]);
+    for (const row of records) expect(row.data.uris).toEqual([{ uri: item.url, matchRule: 'exact' }]);
+  });
+
+  it('maps LastPass CLI records and the http://sn note marker, without inferring unknown protections or OTP', () => {
+    const vault = fresh(), item = {
+      id: '0001', name: 'LastPass login', fullname: 'Shared/Archive/LastPass login', group: 'Archive', share: 'Shared',
+      username: 'fixture-lp-user', password: ' fixture-lp-password ', url: 'https://lastpass.example.test/login',
+      last_modified_gmt: '1760000000', last_touch: '1760000001', note: 'LP\r\nnote',
+    };
+    const note = { ...item, id: '0002', name: 'LastPass note', fullname: 'Archive/LastPass note', share: undefined,
+      url: 'http://sn', username: '', password: '', note: 'NoteType:Server\nFixture note contents' };
+    const bytes = bin([item, note]);
+    const preview = imported(vault, 'lastpass-json', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 2, ignoredOtp: 0, unsupported: 0 });
+    expect(str(preview.report)).not.toMatch(/fixture-lp-password|Fixture note contents/);
+    expect(preview.snap.length).toBe(0);
+    const saved = imported(vault, 'lastpass-json', bytes), opened = { ...vault, ...saved };
+    const records = restoredItems(opened);
+    expect(records.find(row => row.title === item.name)).toMatchObject({ tags: ['Shared/Archive'], requireReprompt: true,
+      note: item.note, data: { kind: 'login', password: item.password, username: item.username, uris: [{ uri: item.url, matchRule: 'host' }] },
+    });
+    expect(records.find(row => row.title === note.name)).toMatchObject({ requireReprompt: true, note: note.note,
+      data: { kind: 'developer', subtype: 'secure_note' } });
+    const repeat = imported(opened, 'lastpass-json', bin([{ ...item, name: 'Changed name', password: 'changed-password' }, note]));
+    expect(repeat.report).toMatchObject({ ready: 0, skipped: 2 });
+    expect(repeat.snap.length).toBe(0);
+    expect(() => imported(vault, 'dashlane-json', bytes)).toThrow();
+    expect(() => imported(vault, 'lastpass-json', bin({ encrypted: true, data: [item] }))).toThrow();
+  });
+});
+
 type OnePuxField = { id: string; value: Record<string, unknown> };
 type OnePuxSourceItem = {
   categoryUuid: string;
@@ -442,10 +627,10 @@ async function readPublishedFixture(file: string, gitBlob: string) {
   return bytes;
 }
 
-async function sanitizedOnePux(file: string) {
+async function exportedFixtureLiteral(file: string, gitBlob: string, constant: string, enpassLoginFields?: unknown[]) {
   const ts = (await import('typescript')).default;
-  const bytes = await readPublishedFixture(file, 'bf1e87c9c1d8e61223873c83e5dd9a997f603ffb');
-  const source = ts.createSourceFile('sanitized-export.ts', bytes.toString('utf8'), ts.ScriptTarget.Latest, true);
+  const bytes = await readPublishedFixture(file, gitBlob);
+  const source = ts.createSourceFile('public-fixture.ts', bytes.toString('utf8'), ts.ScriptTarget.Latest, true);
   function literal(node: import('typescript').Node): unknown {
     if (ts.isObjectLiteralExpression(node)) return Object.fromEntries(node.properties.map(prop => {
       if (!ts.isPropertyAssignment(prop) || !(ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) || ts.isNumericLiteral(prop.name))) {
@@ -453,7 +638,12 @@ async function sanitizedOnePux(file: string) {
       }
       return [prop.name.text, literal(prop.initializer)];
     }));
-    if (ts.isArrayLiteralExpression(node)) return node.elements.map(literal);
+    if (ts.isArrayLiteralExpression(node)) return node.elements.flatMap(element => {
+      if (ts.isSpreadElement(element) && enpassLoginFields && element.expression.getText(source) === 'login.items[0].fields') {
+        return enpassLoginFields;
+      }
+      return [literal(element)];
+    });
     if (ts.isStringLiteralLike(node)) return node.text;
     if (ts.isNumericLiteral(node)) return Number(node.text);
     if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(node.operand)) {
@@ -464,10 +654,54 @@ async function sanitizedOnePux(file: string) {
     throw new Error('Expected a literal fixture value');
   }
   const value = source.statements.flatMap(node => ts.isVariableStatement(node) ? [...node.declarationList.declarations] : [])
-    .find(node => node.name.getText() === 'SanitizedExport')?.initializer;
-  if (!value) throw new Error('Expected the public SanitizedExport fixture');
-  return literal(value) as { accounts: { vaults: { items: OnePuxSourceItem[] }[] }[] };
+    .find(node => node.name.getText() === constant)?.initializer;
+  if (!value) throw new Error('Expected the pinned public fixture');
+  return literal(value);
 }
+
+const vendorFixtures = process.env.VAULT_VENDOR_FIXTURE_DIR;
+if (vendorFixtures) {
+  it('imports the independently published Enpass login, note, folders, and Android fixture layouts', async () => {
+    const types = [
+      ['login', '6626b8c9e4b61cd759eb9ed5e955c92a108a6e66', 'login', 'login', 1, 0],
+      ['note', '37c1658b5175f7f17639ca0331235bbc5fe420b6', 'note', 'developer', 0, 0],
+      ['folders', '9af44f057bfc9feb907b46e4ce411ce3cb1f3262', 'folders', 'developer', 0, 0],
+      ['login-android-url', '91dca5fe99ab14e8172fb7bf5363ced0cbc856d8', 'loginAndroidUrl', 'login', 1, 4],
+    ] as const;
+    const vault = fresh();
+    let enpassLoginFields: unknown[] | undefined;
+    for (const [file, digest, constant, kind, ignoredOtp, unsupported] of types) {
+      const source = await exportedFixtureLiteral(join(vendorFixtures, file + '.ts'), digest, constant, enpassLoginFields) as {
+        items: { note: string; title: string; fields?: { type: string; value: string }[] }[];
+      };
+      const saved = imported(vault, 'enpass', bin(source));
+      const item = source.items[0]!, restored = restoredItem({ ...vault, ...saved });
+      expect(saved.report).toMatchObject({ ready: 1, invalid: 0, unsupported, ignoredOtp });
+      expect(restored).toMatchObject({ title: item.title, note: item.note, data: { kind } });
+      if (file === 'folders') expect(restored.tags).toEqual(['Social/Twitter']);
+      if (file === 'login') enpassLoginFields = item.fields;
+      if (kind === 'login') {
+        expect(restored.data).toMatchObject({ username: item.fields?.find(x => x.type === 'email')?.value,
+          password: item.fields?.find(x => x.type === 'password')?.value, totpUri: null,
+          uris: [{ uri: item.fields?.find(x => x.type === 'url')?.value, matchRule: 'host' }] });
+      }
+    }
+  });
+
+  it('imports the pinned LastPass CLI JSON emitted by its native mock test', async () => {
+    const raw = await readPublishedFixture(join(vendorFixtures, 'lastpass-tests'), 'b64a1ee4fad33c9c0c61948277dc469700338b8f');
+    const output = /function test_show_json\n\{[\s\S]*?<<__EOM__\n([\s\S]*?\n)__EOM__\n/.exec(raw.toString('utf8'))?.[1];
+    if (!output) throw new Error('Pinned LastPass fixture output missing');
+    expect(createHash('sha256').update(output).digest('hex')).toBe('d172623adbb87b81ca5564be35b51d6daf6b57c9eaa99ab33802439b5489fc5d');
+    const [source] = JSON.parse(output);
+    const vault = fresh(), saved = imported(vault, 'lastpass-json', Buffer.from(output));
+    expect(saved.report).toMatchObject({ ready: 1, invalid: 0, passkeys: 0, ignoredOtp: 0 });
+    expect(restoredItem({ ...vault, ...saved })).toMatchObject({ title: source.name, note: source.note, tags: [source.group],
+      requireReprompt: true, data: { kind: 'login', username: source.username, password: source.password,
+        uris: [{ uri: source.url, matchRule: 'host' }] } });
+  });
+}
+
 type VerifyingKey = { fields: { credentialId: string; userHandle: string }; pair: { publicKey: KeyObject }; verifyAlgorithm: string | null };
 function checkSignature(v: ReturnType<typeof fresh>, key: VerifyingKey, discoverable: boolean) {
   const challenge = url64(Buffer.alloc(32, 77));
@@ -532,7 +766,9 @@ describe('portable import writes sealed credentials that can sign', () => {
 
   const onePuxFixture = process.env.VAULT_ONEPUX_FIXTURE;
   if (onePuxFixture) it('replays an unmodified public 1PUX export payload with the supported types and no invented Passkeys', async () => {
-    const source = await sanitizedOnePux(onePuxFixture);
+    const source = await exportedFixtureLiteral(onePuxFixture, 'bf1e87c9c1d8e61223873c83e5dd9a997f603ffb', 'SanitizedExport') as {
+      accounts: { vaults: { items: OnePuxSourceItem[] }[] }[];
+    };
     const items = source.accounts.flatMap(account => account.vaults.flatMap(vault => vault.items));
     const fields = (item: OnePuxSourceItem) => (item.details.sections ?? []).flatMap(section => section.fields ?? []);
     const get = (item: OnePuxSourceItem, id: string, type: string) => fields(item).find(field => field.id === id)?.value[type];

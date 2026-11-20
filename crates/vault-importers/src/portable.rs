@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use vault_core::{crypto::csprng_fill, model::{CredentialData, CustomField, VaultItem, VaultSnapshot, generate_uuid_v4}};
+use vault_core::{crypto::csprng_fill, model::{CredentialData, CustomField, DeveloperCredentialSubtype, VaultItem, VaultSnapshot, generate_uuid_v4}};
 use vault_passkeys::{Passkey, bundle, sealed::{open_vault, seal_vault}};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -13,8 +13,8 @@ pub(crate) type MappingError = &'static str;
 type Result<T> = std::result::Result<T, MappingError>;
 pub(crate) const INVALID: MappingError = "来源文件无效、损坏或超过处理限制。";
 pub(crate) const LIMIT: usize = 16 * 1024 * 1024;
-const MAX_ROWS: usize = 5000;
-const SOURCE: &str = "Vault 迁移来源";
+pub(crate) const MAX_ROWS: usize = 5000;
+pub(crate) const SOURCE: &str = "Vault 迁移来源";
 
 #[cfg(test)]
 mod keepass_text_tests {
@@ -262,18 +262,27 @@ fn source_key(row: &VaultItem) -> Option<String> {
     let id = text(&meta.0, "sourceId");
     (!id.is_empty()).then(|| format!("bitwarden:{id}"))
 }
-fn signature(row: &VaultItem, distinguish_groups: bool) -> [u8; 32] {
+fn hash_text(hash: &mut Sha256, text: &str) {
+    hash.update(text.len().to_le_bytes());
+    hash.update(text.as_bytes());
+}
+fn signature(row: &VaultItem, keepass: bool, vendor_json: bool) -> [u8; 32] {
+    let ssh = matches!(&row.data, CredentialData::Developer(data) if data.subtype == DeveloperCredentialSubtype::SshKey);
+    let include_protection = vendor_json || ssh;
     let json = row.to_json_value();
     let data = Zeroizing::new(json.get_field("data").map(|value| value.stringify()).unwrap_or_default());
     let mut hash = Sha256::new();
-    for value in [&*data, &row.title, &row.note] {
-        hash.update(value.len().to_le_bytes());
-        hash.update(value.as_bytes());
+    for value in [&*data, &row.title, &row.note] { hash_text(&mut hash, value); }
+    if include_protection { hash.update(row.tags.len().to_le_bytes()); }
+    if keepass || include_protection {
+        for tag in &row.tags { hash_text(&mut hash, tag); }
     }
-    if distinguish_groups {
-        for tag in &row.tags {
-            hash.update(tag.len().to_le_bytes());
-            hash.update(tag.as_bytes());
+    if include_protection {
+        hash.update([row.pinned as u8, row.require_reprompt as u8, row.trashed as u8]);
+        for field in row.custom_fields.iter().filter(|field| field.name != SOURCE && !(ssh && field.name == META)) {
+            hash_text(&mut hash, &field.name);
+            hash_text(&mut hash, &field.value);
+            hash.update([field.hidden as u8]);
         }
     }
     hash.finalize().into()
@@ -288,6 +297,7 @@ struct Sample { title: String, kind: &'static str, account: String }
 
 fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) -> Result<Preview> {
     let keepass = format == "keepass";
+    let vendor_json = matches!(format, "enpass" | "dashlane-json" | "lastpass-json");
     let mut report = Preview { invalid: batch.invalid, unsupported: batch.unsupported, ignored_otp: batch.ignored_otp,
         ignored_passkeys: batch.ignored_passkeys, unsupported_passkey_versions: batch.unsupported_passkey_versions, ..Default::default() };
     let mut sources = BTreeMap::new();
@@ -297,7 +307,7 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
     let mut hotp = BTreeSet::new();
     for (index, row) in vault.items.iter().enumerate() {
         if let Some(id) = source_key(row) { sources.insert(id, index); }
-        signatures.insert(signature(row, keepass), index);
+        signatures.insert(signature(row, keepass, vendor_json), index);
         ids.insert(row.id.clone(), index);
         if let CredentialData::Login(login) = &row.data {
             for key in bundle::read(&login.passkey_data)? { known_keys.insert((key.rp_id.clone(), key.credential_id.clone())); }
@@ -307,7 +317,7 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
     }
     for mut row in batch.records.drain(..) {
         let index = ids.get(&row.id).copied().or_else(|| source_key(&row).and_then(|id| sources.get(&id).copied()))
-            .or_else(|| signatures.get(&signature(&row, keepass)).copied());
+            .or_else(|| signatures.get(&signature(&row, keepass, vendor_json)).copied());
         let mut incoming = match &row.data {
             CredentialData::Login(login) => bundle::read(&login.passkey_data)?,
             _ => Vec::new(),
@@ -354,8 +364,9 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
         row.id = generate_uuid_v4().map_err(|_| INVALID)?;
         if row.created_at_ms == 0 { row.created_at_ms = now; }
         if row.updated_at_ms == 0 { row.updated_at_ms = now; }
+        if vendor_json && row.trashed && row.trashed_at_ms.is_none() { row.trashed_at_ms = Some(now); }
         if let Some(id) = source_key(&row) { sources.insert(id, vault.items.len()); }
-        signatures.insert(signature(&row, keepass), vault.items.len());
+        signatures.insert(signature(&row, keepass, vendor_json), vault.items.len());
         record_sample(&mut report, &row);
         vault.items.push(row);
     }
@@ -371,6 +382,28 @@ fn record_sample(report: &mut Preview, row: &VaultItem) {
     if report.sample.len() < 5 {
         let account = match &row.data { CredentialData::Login(data) => data.username.clone(), _ => String::new() };
         report.sample.push(Sample { title: row.title.clone(), kind: row.data.kind_name(), account });
+    }
+}
+
+#[cfg(test)]
+mod ssh_import_tests {
+    use super::*;
+
+    #[test]
+    fn does_not_collapse_ssh_keys_with_different_reprompt_settings() {
+        let source = json!({"type":5,"id":"original","name":"Fixture SSH",
+            "sshKey":{"privateKey":"synthetic","publicKey":"public"}});
+        let mut protected = source.clone();
+        protected["id"] = json!("other");
+        protected["reprompt"] = json!(1);
+        let bytes = json!({"items":[source,protected]}).to_string();
+        let mut vault = VaultSnapshot::new_empty("test-vault".into(), "test-snapshot".into(), 1);
+        let load = || read_bitwarden(bytes.as_bytes(), "").unwrap();
+        let report = apply(&mut vault, load(), 2, "bitwarden").unwrap();
+        assert_eq!((report.ready, report.skipped), (2, 0));
+        assert!(!vault.items[0].require_reprompt && vault.items[1].require_reprompt);
+        let duplicate = apply(&mut vault, load(), 3, "bitwarden").unwrap();
+        assert_eq!((duplicate.ready, duplicate.skipped), (0, 2));
     }
 }
 
@@ -398,6 +431,9 @@ pub fn wasm_portable_import(format: &str, key: Vec<u8>, wrap: Vec<u8>, head: &[u
         "onepassword" => crate::vendor_archives::onepassword(&bytes),
         "proton" => crate::vendor_archives::proton(&bytes, &password),
         "kaspersky" => crate::kaspersky::read(&bytes),
+        "enpass" => crate::enpass::read(&bytes, &password),
+        "dashlane-json" => crate::vendor_cli::read(&bytes, &password, crate::vendor_cli::Vendor::Dashlane),
+        "lastpass-json" => crate::vendor_cli::read(&bytes, &password, crate::vendor_cli::Vendor::LastPass),
         _ => Err(INVALID),
     }.map_err(JsValue::from_str)?;
     let preview = apply(&mut vault, batch, now as u64, format).map_err(JsValue::from_str)?;

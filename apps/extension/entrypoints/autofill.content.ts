@@ -13,6 +13,7 @@ export default defineContentScript({
     let token: string | undefined;
     let menuTarget: Control | undefined;
     let menuKind: FillKind | undefined;
+    let manualMenu = false;
     let lastUrl = location.href;
     let restoring = false;
     let pendingSubmit = 0;
@@ -33,7 +34,7 @@ export default defineContentScript({
     };
     const remove = () => {
       stopHandshake?.(); stopHandshake = undefined;
-      host?.remove(); host = undefined; token = undefined; menuTarget = undefined; menuKind = undefined;
+      host?.remove(); host = undefined; token = undefined; menuTarget = undefined; menuKind = undefined; manualMenu = false;
     };
     const position = (box: HTMLElement, target?: Control, menu = false) => {
       const rect = target?.getBoundingClientRect();
@@ -47,9 +48,9 @@ export default defineContentScript({
       const top = rect ? menu ? upwards ? rect.top - height - 4 : rect.bottom + 4 : narrow ? rect.top - 30 : rect.top + (rect.height - 28) / 2 : 12;
       box.style.cssText = `all:initial;position:fixed;left:${Math.max(8, Math.min(left, innerWidth - width - 8))}px;top:${Math.max(8, top)}px;width:${width}px;height:${height}px;z-index:2147483647;display:block`;
     };
-    const showMenu = (value: string, target?: Control, kind?: FillKind) => {
+    const showMenu = (value: string, target?: Control, kind?: FillKind, manual = false) => {
       remove();
-      token = value; menuTarget = target; menuKind = kind;
+      token = value; menuTarget = target; menuKind = kind; manualMenu = manual;
       host = document.createElement('div');
       host.setAttribute('data-vault-ui', '');
       position(host, target, true);
@@ -68,15 +69,15 @@ export default defineContentScript({
       root.append(iframe);
       document.documentElement.append(host);
     };
-    const begin = async () => {
+    const begin = async (manual?: true) => {
       if (opening || token) return;
       if (!active || !visible(active) || !safeAction(active)) { note('请先选择可见的输入框。跨域提交的表单需要在原网站手动填写。'); return; }
       const kind = fillKind(active);
-      if (!kind || flags.inlineDisabled) return;
+      if (!kind || (!manual && flags.inlineDisabled)) return;
       opening = true;
       try {
-        const { token } = await autofillRequest<{ token: string }>({ type: 'begin', kind });
-        if (!ctx.isInvalid && active && visible(active)) showMenu(token, active, kind);
+        const { token } = await autofillRequest<{ token: string }>({ type: 'begin', kind, manual });
+        if (!ctx.isInvalid && (manual || !flags.inlineDisabled) && active && visible(active)) showMenu(token, active, kind, manual);
       } catch (error) { note(error instanceof Error ? error.message : '无法打开填充菜单。'); }
       finally { opening = false; }
     };
@@ -114,7 +115,7 @@ export default defineContentScript({
       restoring = true;
       try {
         const response = await autofillRequest<{ token: string } | null>({ type: 'pending' });
-        if (response && !ctx.isInvalid) showMenu(response.token);
+        if (response && !ctx.isInvalid && !flags.saveDisabled) showMenu(response.token);
       } catch { /* A page without an unlocked vault has no save prompt. */ }
       finally { restoring = false; }
     };
@@ -128,7 +129,7 @@ export default defineContentScript({
       if (!password || password.value.length > 4096) return;
       const username = fields.find(field => ['username', 'email'].includes(fieldKey(field) ?? ''))?.value ?? recentUsername;
       void autofillRequest<{ token: string } | null>({ type: 'capture', username, password: password.value })
-        .then(response => { if (response && !ctx.isInvalid) showMenu(response.token); }).catch(() => undefined);
+        .then(response => { if (response && !ctx.isInvalid && !flags.saveDisabled) showMenu(response.token); }).catch(() => undefined);
     };
     ctx.addEventListener(document, 'focusin', event => {
       if (!event.isTrusted) return;
@@ -145,7 +146,7 @@ export default defineContentScript({
       const key = event as KeyboardEvent;
       if (!key.isTrusted) return;
       if (key.code === 'KeyL' && key.altKey && key.shiftKey && !key.ctrlKey && !key.metaKey) {
-        key.preventDefault(); void begin(); return;
+        key.preventDefault(); void begin(true); return;
       }
       if (key.key === 'Escape') {
         if (token) void autofillRequest({ type: 'close', token }).catch(() => undefined);
@@ -191,11 +192,21 @@ export default defineContentScript({
     const onMessage = (message: Record<string, unknown>, sender: { id?: string }, respond: (value: unknown) => void) => {
       if (sender.id !== browser.runtime.id || message?.target !== 'vault-fill') return;
       if (message.type === 'settings-changed') { remove(); void refreshFlags(); return; }
+      if (message.type === 'site-settings-changed') {
+        void refreshFlags().then(() => {
+          if (ctx.isInvalid) return;
+          if (token) {
+            if (menuKind ? !manualMenu && flags.inlineDisabled : flags.saveDisabled) remove();
+          } else if (flags.inlineDisabled) remove();
+          else if (active?.matches(':focus')) icon(active);
+        });
+        return;
+      }
       if (message.type === 'notice' && typeof message.text === 'string') { note(message.text); return; }
       if (message.type === 'open') {
         let focused = document.activeElement;
         while (focused?.shadowRoot?.activeElement) focused = focused.shadowRoot.activeElement;
-        if (document.hasFocus() && (focused === active || message.reason === 'context-menu')) void begin();
+        if (document.hasFocus() && (focused === active || message.reason === 'context-menu')) void begin(true);
         return;
       }
       if (!token || message.token !== token) { respond({ ready: false, filled: false }); return; }

@@ -1,5 +1,5 @@
 import init, { wasm_csv_headers, wasm_export_login_csv, wasm_parse_mapped_csv, wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
-import type { Reply } from '../src/vault-messages';
+import { VENDOR_JSON_FORMATS, type Reply } from '../src/vault-messages';
 
 export default defineUnlistedScript(() => {
   self.onmessage = async ({ data }: MessageEvent<{ operation: string; args: unknown[] }>) => {
@@ -29,9 +29,11 @@ export default defineUnlistedScript(() => {
     } catch (error) {
       reply = { ok: false, error: typeof error === 'string' ? error : '无法读取迁移文件，请检查文件格式和密码。' };
     } finally {
-      // The OpenPGP library also holds authenticated plaintext in internal scratch buffers.
-      // This worker is single-use; clear even freed linear-memory pages before closing it.
-      if (memory && data.operation === 'portable-import' && data.args[0] === 'proton') {
+      // Clear parser scratch buffers (including freed pages) before replying to the parent.
+      const format = data.args[0];
+      if (memory && ((data.operation === 'portable-import'
+        && (format === 'bitwarden' || format === 'proton' || (VENDOR_JSON_FORMATS as readonly unknown[]).includes(format)))
+        || (data.operation === 'portable-export' && format === 'bitwarden'))) {
         new Uint8Array(memory.buffer).fill(0);
       }
       for (const arg of data.args) if (arg instanceof Uint8Array) arg.fill(0);
