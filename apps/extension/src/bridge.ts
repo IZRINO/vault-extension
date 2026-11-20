@@ -1,8 +1,23 @@
 import type { Reply } from './vault-messages';
 
 let tail: Promise<unknown> = Promise.resolve();
-// Serialize the shared offscreen document lifecycle, including clipboard alarms.
+let activeDocument: { opening: Promise<void>; clipboardCleanup: Promise<unknown> } | undefined;
+
+async function send<T>(operation: string, payload: unknown): Promise<T> {
+  const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault-offscreen', operation, payload });
+  if (!response?.ok) throw new Error(response?.error ?? '离屏任务失败');
+  return response.value;
+}
+
+// Serialize the shared document's lifecycle and worker jobs. Clipboard expiry
+// can join the open document while a worker computes; teardown waits for it.
 export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
+  if (operation === 'clear-clipboard' && activeDocument) {
+    const active = activeDocument;
+    const run = active.clipboardCleanup.then(() => active.opening).then(() => send<T>(operation, payload));
+    active.clipboardCleanup = run.catch(() => undefined);
+    return run;
+  }
   const result = Promise.withResolvers<T>();
   const run = tail.then(async () => {
     const opening = (async () => {
@@ -11,18 +26,20 @@ export function offscreen<T>(operation: string, payload: unknown): Promise<T> {
           justification: 'Run local vault tasks in isolated workers and clear copied secrets.' });
       }
     })();
+    const active = { opening, clipboardCleanup: Promise.resolve() as Promise<unknown> };
+    activeDocument = active;
     try {
       // Capture can run while the privileged document starts. All lifecycle work remains serialized.
       const [, prepared] = await Promise.all([opening, typeof payload === 'function' ? payload() : payload]);
-      const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault-offscreen', operation, payload: prepared });
-      if (!response?.ok) throw new Error(response?.error ?? '离屏任务失败');
       // Deliver the completed task without paying document teardown latency.
       // `tail` still includes teardown, so the next operation cannot race it.
-      result.resolve(response.value);
+      result.resolve(await send<T>(operation, prepared));
     } catch (error) {
       result.reject(error);
     } finally {
+      activeDocument = undefined;
       await opening.catch(() => undefined);
+      await active.clipboardCleanup;
       if (await browser.offscreen.hasDocument()) await browser.offscreen.closeDocument();
     }
   });

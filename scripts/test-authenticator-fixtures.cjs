@@ -23,6 +23,11 @@ const others = [
 ];
 const now = 1700000009;
 const samplePassword = 'test';
+const enteFixtures = new Map([
+  ['legacy', '2311f1891dccd69b2cdd2585c4ba2638a77cc3d391442423a6b62ab2292892bf'],
+  ['standard', '13e5c98c33e0ac4e95f6f36668c5f2c11b3cb5a8b1bab26b7cec8d3a11e6b97d'],
+  ['native', '5262904087b069bae5e7dac2a01e12a16d43b96113c38fefc6221b25c4b5c041'],
+]);
 
 async function wasm(crate) {
   const module = crate.replaceAll('-', '_');
@@ -119,10 +124,69 @@ async function raivoArchive() {
   }
 }
 
+async function enteBackup(variant) {
+  const sha256 = enteFixtures.get(variant);
+  assert(sha256, 'Unknown Ente Auth fixture');
+  const [imports, otp] = await Promise.all(['vault-ente-auth', 'vault-otp'].map(wasm));
+  const password = ' Ente-夹具🔐 ';
+  const seed = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+  const parse = (bytes, proof = password) => JSON.parse(imports.wasm_parse_ente_auth(bytes, '[]', proof));
+  const file = `ente-auth-${variant}.json`;
+  const bytes = await fs.readFile(path.join(__dirname, '..', 'crates', 'vault-ente-auth', 'tests', 'fixtures', file));
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), sha256, file);
+  const backup = JSON.parse(bytes);
+  const started = performance.now();
+  const result = parse(bytes);
+  const elapsedMs = Math.round(performance.now() - started);
+  assert.equal(result.invalid + result.skipped, 0, file);
+  assert.equal(result.rows.length, 3, file);
+  const [totp, hotp, steam] = result.rows;
+  assert.deepEqual({ issuer: totp.issuer, account: totp.account, pinned: totp.pinned, note: totp.note, tags: totp.tags },
+    { issuer: 'GitHub', account: 'tester', pinned: true, note: '加密备份', tags: ['工单', 'work'] });
+  assert.equal(hotp.issuer, 'Lab');
+  assert.equal(steam.trashed, true);
+  for (const [row, kind, algorithm, counter, digits] of [
+    [totp, 'totp', 'sha256', Math.floor(now / 60), 8],
+    [hotp, 'hotp', 'sha1', 1, 6],
+    [steam, 'steam', 'sha1', Math.floor(now / 30), 5],
+  ]) {
+    const uri = new URL(row.setupKey);
+    assert.equal(uri.hostname, kind, file);
+    assert.equal(JSON.parse(otp.wasm_otp_at(row.setupKey, now, 0)).value,
+      independentCode(seed, algorithm, counter, digits, kind === 'steam'), `${file} ${kind}`);
+  }
+  if (variant === 'legacy') {
+    const changed = doc => parse(Buffer.from(JSON.stringify(doc)));
+    const ciphertext = Buffer.from(backup.encryptedData, 'base64');
+    ciphertext[ciphertext.length - 1] ^= 1;
+    const header = Buffer.from(backup.encryptionNonce, 'base64');
+    header[0] ^= 1;
+    assert.throws(() => imports.wasm_parse_ente_auth(bytes, '[]'), /请输入 Ente Auth 文件密码/);
+    assert.throws(() => parse(bytes, 'wrong'), /文件密码错误/);
+    assert.throws(() => changed({ ...backup, encryptedData: ciphertext.toString('base64') }), /已损坏/);
+    assert.throws(() => changed({ ...backup, encryptionNonce: header.toString('base64') }), /已损坏/);
+    assert.throws(() => changed({ ...backup, encryptionNonce: Buffer.alloc(23).toString('base64') }), /格式无效/);
+    assert.throws(() => changed({ ...backup, version: 2 }), /版本不受支持/);
+    for (const [memLimit, opsLimit] of [[2 ** 30 + 1024, 1], [2 ** 30, 5], [8193, 1], [8192, 0]]) {
+      assert.throws(() => changed({ ...backup, kdfParams: { ...backup.kdfParams, memLimit, opsLimit } }), /密钥派生参数/);
+    }
+  }
+  console.log(JSON.stringify({ fixture: file, sha256, restored: result.rows.length, otpAndDisplayVerified: true,
+    memLimit: backup.kdfParams.memLimit, opsLimit: backup.kdfParams.opsLimit, elapsedMs }));
+}
+
 async function run() {
   const dir = process.argv[2];
-  assert(dir && process.argv.length === 3, 'Usage: node scripts/test-authenticator-fixtures.cjs <public fixture directory>');
+  if (dir === '--ente' && process.argv.length === 4) return enteBackup(process.argv[3]);
+  assert(dir && process.argv.length === 3, 'Usage: node scripts/test-authenticator-fixtures.cjs <public fixture directory>|--raivo|--ente');
   if (dir === '--raivo') return raivoArchive();
+  if (dir === '--ente') {
+    // Match the disposable extension worker: grown linear memory is not reused.
+    for (const variant of enteFixtures.keys()) {
+      execFileSync(process.execPath, [__filename, '--ente', variant], { stdio: 'inherit', windowsHide: true, timeout: 120000 });
+    }
+    return;
+  }
   const [imports, otp] = await Promise.all(['vault-importers', 'vault-otp'].map(wasm));
   const read = async (name, hash) => {
     const bytes = await fs.readFile(path.join(dir, name));

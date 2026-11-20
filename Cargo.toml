@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
+exclude = ["crates/vault-ente-auth/vendor/crypto_secretstream"]
 members = [
     "crates/vault-core",
     "crates/vault-importers",
+    "crates/vault-ente-auth",
     "crates/vault-otp",
     "crates/vault-qr",
     "crates/vault-preferences",

@@ -64,6 +64,11 @@ function otpPayload(item: VaultItem, setup: string) {
   return new TextEncoder().encode(JSON.stringify([item.id, item.revision, item.updatedAtMs, item.requireReprompt, setup]));
 }
 
+function sessionExpired(session: store.SessionState, settings: store.LocalSettings): boolean {
+  const now = Date.now();
+  return session.lastActivityMs > now || now - session.lastActivityMs >= settings.autoLockMinutes * 60000;
+}
+
 export class VaultController {
   private core?: Core;
   private engine?: Engine;
@@ -220,6 +225,17 @@ export class VaultController {
     return locking;
   }
 
+  async lockExpiredSession(): Promise<boolean> {
+    const { session, settings } = this;
+    if (!session || !settings) {
+      return !(await this.handle({ type: 'status' }) as VaultStatus).unlocked;
+    }
+    // Don't queue an expired in-memory session behind a slow derivation.
+    if (!sessionExpired(session, settings)) return false;
+    await this.lock();
+    return true;
+  }
+
   private needsRemoteKey(files: store.VaultFiles) {
     return files.remoteKeyUpdate ?? store.loadRemoteAnchor(files.vaultId).then(anchor => !!anchor?.observedHead);
   }
@@ -243,8 +259,7 @@ export class VaultController {
       this.settings = settings;
       this.files = files;
       if (!saved) return;
-      const now = Date.now();
-      if (!files || idle === 'locked' || saved.lastActivityMs > now || now - saved.lastActivityMs >= settings.autoLockMinutes * 60000) {
+      if (!files || idle === 'locked' || sessionExpired(saved, settings)) {
         await this.lock(false);
         return;
       }
@@ -1286,7 +1301,10 @@ export class VaultController {
       case 'import-ente': {
         if (!Array.isArray(message.bytes) || !message.bytes.length || message.bytes.length > MAX_ENTE_BYTES ||
             !message.bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
-          throw new Error('请选择不超过 2 MiB 的 Ente Auth 文本文件。');
+          throw new Error('Ente Auth 文本不能超过 2 MiB，加密 JSON 不能超过 3 MiB。');
+        }
+        if (message.password !== undefined && (typeof message.password !== 'string' || message.password.length > 4096)) {
+          throw new Error('Ente Auth 文件密码格式无效。');
         }
         const bytes = new Uint8Array(message.bytes);
         try {
@@ -1300,7 +1318,7 @@ export class VaultController {
             .filter(item => item.kind === 'login').map(item => JSON.parse(engine.get_item_json(item.id, true)) as VaultItem);
           const setups = existing.filter(item => typeof item.data.totpUri === 'string')
             .map(item => ({ setupKey: item.data.totpUri, title: item.title, account: item.data.username }));
-          const batch = JSON.parse(await derive<string>('parse-ente', [bytes, JSON.stringify(setups)])) as EnteBatch;
+          const batch = JSON.parse(await derive<string>('parse-ente', [bytes, JSON.stringify(setups), message.password])) as EnteBatch;
           check();
           const plan = planEnteImport(batch, existing, message.type === 'import-ente' ? message.merges : []);
           if (message.type === 'preview-ente') return { ...plan.preview, stamp } satisfies EntePreview;

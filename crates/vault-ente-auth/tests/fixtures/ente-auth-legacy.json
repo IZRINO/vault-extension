@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "kdfParams": {
+    "memLimit": 8192,
+    "opsLimit": 1,
+    "salt": "NIMNmc7uskxCCqXjRk3Iug=="
+  },
+  "encryptedData": "pwUmLMK8almCFbQ5nO2uZ8Mga2798S9Xs3QHKlx5Te0+mWm2f3IA8iRrFGrzf4Imp46Yinfy/hOOXlLWsnLu7HAe0UPE7DtlDMNZywrUDzWM1EFql1CYHFhV5+IzeYkvdFZOR0Fr3pAzjHYJ2GudKk3G/lto43WCWgfpja/oYXEiaD7LrAv1tUI7n5CXNxOwvOG5SXs7hNHElVX5eKkS0db3ROmdvxObiaUqzrYEsQz5M/NG6lhPHlV3xQzuKV0Q4Du2G5/YOIY4h3/ov1oaF4ZjJIlb2D9LtqbjaE77p5tJH95T1+7uM7PushBm/T4Nat5y1cuMyjPFFfsalBS6qLAKOV6hH/8XgMrZpAVzmWTLmNQAf6SfewU5lExdrtMC8KyP8F4wuCu6/cPJ/TVTUvUrOy5oKZ0w5sHu9+8nQYIfSpMVTpD2VkOjKwnDBelf+KhD3WQh90/fDeMFeG+sN1R7sX/Gtoa/hR4Lk7YsvDnLleiGWdnr9+OZ7HCsF5rHsRQxZbT00Dx2ZE1lgjg4c2fBtonocAazMpR1QfIuu+QZHEwdFsQdtnq6zMHL8ixMwp0PWvrnmxQRM//jw5rMCmuzIzHdiH6He+uDPMKmWMgcMXWJlYVtjh1eEh2gV2ojgbRgM2oWm0z9jCUN3dUw3QM0FLHILWYK2S0hde1mbqK7Pc2VlQ==",
+  "encryptionNonce": "RQx2za2z5aJoRX7Bi9QrFyJWMMu2Mhc5"
+}

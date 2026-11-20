@@ -2,9 +2,17 @@
 
 2026-11-20。对应[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)与[工单 T01–T38](development-tickets.md)。生产 ZIP 不等于正式准出；不代签，也不把模拟证据当作系统设备、第三方服务或应用互通的证据。
 
-当前可安装包为 **Vault 0.1.0**。前一包千条库冷开未达标；当前包未完成性能准出复测。需真实设备、第三方环境的验收由用户自行进行。
+当前可安装包为 **Vault 0.1.0**。当前包的二期回归已通过；双浏览器千条库冷开复测仍未达标，不能正式准出。需真实设备、第三方环境的验收由用户自行进行。
 
 ## 当前候选包 0.1.0
+
+- ZIP `test-results/Vault-2026-11-20-5a759f049e22-chrome.zip`，5,036,883 B。SHA-256 `5a759f049e22df124d5b269e026d5624114e1fade4da8a92221fc78265636e54`。加载解压目录 `test-results/release-unpacked-5a759f049e22`，53 个文件与生产构建逐字节一致；解压树摘要 `be27de5e5c29ca0b7265b4ed14fdef64dc70df75fe1096c69d627cf094f6c021`。
+- 从包内校验了主核和 9 份 Worker 内联 WASM。清单、CSP、权限和主核（**255,662 B** / 上限 **256,000 B**）与上一包相同；Ente WASM **197,496 B**，只在导入或导出时加载。没有 `chrome.identity` 或 `chrome.storage.sync`。Rust **58** 项（另有依赖测试）、默认 Vitest **108** 项、TypeScript 和八个 WASM 构建检查通过。
+- 新增 Ente 文件密码加密 JSON v1 **本机导入**，保留 Ente 文本导出。独立 libsodium 样本的 8 KiB/1、256 MiB/16、1 GiB/4 三档在生产 WASM 通过；前两档另用官方 CLI 对照。1 GiB 档是合成参数测试，并非原生 App 导出。[样本和预算](agents/ente-auth-encrypted-research.md#样本与独立验算)。
+- Edge `158.0.4370.33`、Helium `157.0.8103.78` 同包通过二期回归：明文预览、合并和导出，低成本加密样本导入，缺密码、错密、损坏密文和 header、超限、错版本，全程验证预览不写库、改名不影响导入、去重及 HOTP 不回退。可见 HTTP 夹具只复核界面和错误提示，控制台及失败请求均无异常；真正解密与写库证据来自实际扩展。完整 12/12 功能矩阵仍是 `3a2fa7b7d66f` 的证据。
+- 同包 Edge / Helium 各 10 次千条库原生冷开，列表 DOM 中位数 **549.26 / 546.95 ms**，已认证 WASM 恢复 **65.80 / 60.95 ms**，两端均未过 `<50 ms` / `<5 ms`。[分段和报告](cold-wake-diagnostics.md#ente-候选包同包复测)。本机包证据在 `test-results/release-checks-5a759f049e22/`。未推送、未上架。
+
+## Zstd 对照候选包 0.1.0
 
 - ZIP `test-results/Vault-2026-11-20-8a016565deff-chrome.zip`，6,164,200 B。SHA-256 `8a016565deff9f9bf69ac38b60e22285c4bd300ecfaa8b15c81cb4988859d0ab`。加载解压目录 `test-results/release-unpacked-8a016565deff`，52 个文件与 ZIP 逐字节一致；按冷开脚本口径的树摘要 `83593aef506066683068478c87b2a7aef74a089cf9b43da64936c0252d8597e0`。
 - 主核 **255,662 B**，上限 **256,000 B**。相对前一包仅核心 WASM 和 7 个引用它的按需 Worker 产物变化，MV3 清单、CSP、权限和前端完全相同。检查实际 ZIP 中的 10 份 WASM 载荷均与对应构建产物一致；导入 WASM **2,518,450 B**，仍只进入按需导入 Worker。包内没有 `chrome.identity` 或 `chrome.storage.sync` 引用。
@@ -29,7 +37,7 @@
 
 | 工单 | 本轮实现或继承 | 证据与边界 |
 | --- | --- | --- |
-| T01–T07、T37、T38 | 原生侧栏、填充/保存/改密、截图扫码、CSV 拖拽与键盘、Bitwarden 与 Ente 文本迁移；整库导出验证当前主密码，明文另确认；日常 TOTP/Steam 返回码、HOTP 严格落盘后返回码，编辑才读种子。 | 扫码只绑定点击时的标签页；切换、导航或取消会让候选失效。双浏览器本地靶场覆盖填充授权、备份确认和 OTP 路径。真实网站/原生右键、Ente 与 Bitwarden 官方应用、实际系统锁屏和实体 Hello 未验证。T01 已按历史决定关闭，不代表性能通过。 |
+| T01–T07、T37、T38 | 原生侧栏、填充/保存/改密、截图扫码、CSV 拖拽与键盘、Bitwarden 与 Ente 文本迁移、Ente 加密 JSON v1 本机导入；整库导出验证当前主密码，明文另确认；日常 TOTP/Steam 返回码、HOTP 严格落盘后返回码，编辑才读种子。 | 扫码只绑定点击时的标签页；切换、导航或取消会让候选失效。双浏览器本地靶场覆盖填充授权、备份确认和 OTP 路径。真实网站/原生右键、Ente 与 Bitwarden 官方应用、实际系统锁屏和实体 Hello 未验证。T01 已按历史决定关闭，不代表性能通过。 |
 | T08–T12、T19 | 坚果云/Koofr 预设、只读判库、条件写探测、加入/建库、零条目及批量删除保护、2.5 秒防抖的不可变加密 WAL、熔断、显式开启时差补偿。 | 故障注入覆盖假 ETag、旧 ETag、重启、重放、熔断、锁库零新请求、时钟偏差。同步是最终一致，不能保证两台离线设备的 HOTP 互斥。 |
 | T13–T18、T20 | 三方字段合并、加密待裁决区、全页裁决、落选密码历史、主密码旋转、设备认领和加密来源记录、滚动五份历史、历史预览/恢复、异库合入。 | 一个离线登录命中多个远端候选时一同展示；更晚的重叠草稿加密留在本机，无关项仍可同步。双份继承二次验证，同一递增凭证只保留一份可用计数。自动覆盖并发 WAL、条件提交、两处压实中断、30 天回收站边界、历史重放拒绝、计数恢复、不同身份合入。找不到祖先或不能保留新字段时停止写回；两家真实 WebDAV 尚未验收。 |
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
@@ -42,7 +50,8 @@
 - CXF 标准交换是 1.0 JSON；本项目文件密码包装的 JWE 不是标准 CXF 加密交换，接收端需明确支持该包装。
 - Bitwarden 账号绑定加密 JSON 需在来源重新导出为支持的格式；不导入硬件绑定或没有可导出私钥的 Passkey。对无法确认的递增计数暂停取用，不标为可登录。
 - KeePass 须为支持的口令 KDBX（不支持额外密钥文件或挑战响应）；KDF / 解压预算外直接拒绝。1PUX 与 Proton 只迁移允许的版本和可用字段；附件、源文件没提供的秘密、加密外层及未知类型不承诺保留。
-- [原工单末尾](development-tickets.md#架构有目标分期未定归属的差异)的 Ente 加密 JSON、额外导出格式、提醒、RS256 等仍是未排期项，不算已实现。
+- Ente 文件密码加密导入支持 v1，内存最多 1 GiB、加密封装最多 3 MiB，不支持云同步数据和应用数据库。资源不足时可能无法导入原生高内存档；无需降参，来源可选择文本导出。反向只导出带 `codeDisplay` 的文本。
+- [工单索引末尾](development-tickets.md#架构与工单范围的差异)的额外格式、提醒及可选 RS256 等其余条目，不算已实现。
 
 ## 复现
 
@@ -61,6 +70,8 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 `node scripts/test-passkeys.cjs --history-only` 只跑双端 WebDAV 历史恢复；不带参数时也会执行它。使用独立配置、本机 HTTP WebDAV 和双栈回环 RP，不连接真实网盘。
 
 `node scripts/test-passkeys.cjs --retained-bitwarden-only` 使用当前构建的 WASM 复现旧版导入的保留字段，从加密备份走完整设置页启用和独立验签。`--proton-only <夹具目录>` 验证官方 WASM 生成的凭证，夹具见[来源与复现](agents/portable-migration-fixtures.md#proton-pass)。
+
+`node scripts/test-authenticator-fixtures.cjs --ente` 各在独立进程跑一份 Ente 文件，避免复用已增长的 WASM 堆。`node scripts/test-phase-2.cjs` 从解压候选在 Edge、Helium 跑实际扩展的文本和加密迁移界面。
 
 `node scripts/test-sync-lifecycle.cjs` 验证远端主密码轮换、重新配置本机包装及重装设备认领；使用相同的本机故障服务和独立配置。
 加 `--backup-only` 则验证使用目标恢复码加入已有远端库，再合入独立 `.vaultpack`；只在用户显式启用写入并验证条件写后同步。

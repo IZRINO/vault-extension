@@ -2,7 +2,7 @@ export type Proof = { method: 'master' | 'pin'; secret: string };
 export type BackupImportProof = Proof | { method: 'recovery'; secret: string };
 export const MAX_VAULTPACK_BYTES = 16 * 1024 * 1024;
 export const MAX_BROWSER_CSV_BYTES = 2 * 1024 * 1024;
-export const MAX_ENTE_BYTES = 2 * 1024 * 1024;
+export const MAX_ENTE_BYTES = 3 * 1024 * 1024;
 export const MAX_MIGRATION_BYTES = 16 * 1024 * 1024;
 export const MAX_AUTH_BACKUP_BYTES = 4 * 1024 * 1024;
 export const AUTH_BACKUP_FORMATS = ['google', '2fas', 'aegis', 'raivo', 'andotp', 'stratum'] as const;
@@ -120,8 +120,8 @@ export type VaultMessage =
   | { type: 'import'; bytes: number[]; password: string; proof: BackupImportProof; stamp: string }
   | { type: 'preview-browser-csv'; bytes: number[] }
   | { type: 'import-browser-csv'; bytes: number[]; stamp: string; proof: Proof }
-  | { type: 'preview-ente'; bytes: number[] }
-  | { type: 'import-ente'; bytes: number[]; stamp: string; merges: EnteMerge[]; proof: Proof }
+  | { type: 'preview-ente'; bytes: number[]; password?: string }
+  | { type: 'import-ente'; bytes: number[]; password?: string; stamp: string; merges: EnteMerge[]; proof: Proof }
   | { type: 'export-ente'; proof: Proof; confirmPlaintext: boolean }
   | { type: 'read-otp'; id: string; handle: string }
   | { type: 'next-hotp'; id: string; proof?: Proof }

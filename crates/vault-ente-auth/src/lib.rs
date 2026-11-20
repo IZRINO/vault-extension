@@ -1,13 +1,78 @@
 use std::collections::BTreeSet;
-use serde::Serialize;
+use argon2::{Algorithm, Argon2, Block, Params, Version};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use crypto_secretstream::{Header, Key, PullStream, Stream, Tag};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vault_otp::{Otp, parse, uri_decode, uri_encode};
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BACKUP_BYTES: usize = 3 * 1024 * 1024;
 const MAX_ROWS: usize = 5000;
-const INVALID: &str = "无法读取验证器文件，请从 Ente Auth 导出未加密的 UTF-8 文本。";
+const INVALID: &str = "无法读取验证器文件，请选择 Ente Auth 导出的文本或加密 JSON。";
+const INVALID_BACKUP: &str = "Ente Auth 加密备份格式无效。";
+const BACKUP_AUTH: &str = "Ente Auth 文件密码错误，或加密备份已损坏。";
+const MAX_KDF_MEMORY: u64 = 1024 * 1024 * 1024;
+const MAX_KDF_WORK: u64 = 4 * MAX_KDF_MEMORY;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Backup {
+    version: u32,
+    kdf_params: KdfParams,
+    encrypted_data: String,
+    encryption_nonce: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KdfParams {
+    mem_limit: u64,
+    ops_limit: u32,
+    salt: String,
+}
+
+fn decrypt_backup(backup: Backup, password: Option<&str>) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    if backup.version != 1 { return Err("此 Ente Auth 加密备份版本不受支持。"); }
+    let KdfParams { mem_limit, ops_limit, salt } = backup.kdf_params;
+    // Accept the native 1 GiB / 4 profile and its lower-memory fallbacks, not
+    // arbitrary work requested by a file. Never substitute different parameters.
+    if !(8192..=MAX_KDF_MEMORY).contains(&mem_limit) || !mem_limit.is_multiple_of(1024) ||
+        ops_limit == 0 || u64::from(ops_limit) > MAX_KDF_WORK / mem_limit {
+        return Err("Ente Auth 备份的密钥派生参数超出本机导入上限。");
+    }
+    let password = password.filter(|s| !s.is_empty()).ok_or("请输入 Ente Auth 文件密码。")?;
+    if password.len() > 4096 { return Err("Ente Auth 文件密码太长。"); }
+    let salt = STANDARD.decode(salt).map_err(|_| INVALID_BACKUP)?;
+    if salt.len() != 16 { return Err(INVALID_BACKUP); }
+    // This is a secretstream header, despite the historical JSON field name.
+    let header = STANDARD.decode(backup.encryption_nonce).map_err(|_| INVALID_BACKUP)?;
+    let header = Header::try_from(header.as_slice()).map_err(|_| INVALID_BACKUP)?;
+    let mut buffer = Zeroizing::new(STANDARD.decode(backup.encrypted_data).map_err(|_| INVALID_BACKUP)?);
+    if !(Stream::ABYTES..=MAX_BYTES + Stream::ABYTES).contains(&buffer.len()) {
+        return Err(INVALID_BACKUP);
+    }
+
+    let params = Params::new((mem_limit / 1024) as u32, ops_limit, 1, Some(Key::BYTES))
+        .map_err(|_| INVALID_BACKUP)?;
+    let mut key = Zeroizing::new([0; Key::BYTES]);
+    {
+        let mut blocks = Zeroizing::new(Vec::new());
+        blocks.try_reserve_exact(params.block_count()).map_err(|_| "本机内存不足，无法解密 Ente Auth 备份。")?;
+        blocks.resize(params.block_count(), Block::default());
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into_with_memory(password.as_bytes(), &salt, &mut *key, &mut *blocks)
+            .map_err(|_| BACKUP_AUTH)?;
+    }
+    // Ente Auth uses one authenticated secretstream message with empty AAD.
+    // Older readers/writers allow a MESSAGE tag as well as this format's FINAL.
+    let stream_key = Key::try_from(key.as_slice()).map_err(|_| INVALID_BACKUP)?;
+    let tag = PullStream::init(header, &stream_key).pull(&mut *buffer, &[]).map_err(|_| BACKUP_AUTH)?;
+    if !matches!(tag, Tag::Final | Tag::Message) { return Err(INVALID_BACKUP); }
+    Ok(buffer)
+}
 
 /// serde_json::Value has no Zeroize implementation. Scrub every string on drop.
 struct SensitiveJson(Value);
@@ -69,6 +134,7 @@ fn normalize(line: &str) -> Result<Otp, &'static str> {
         }
         if key == "codeDisplay" {
             let display = display_json(&value)?;
+            value.zeroize();
             *value = serde_json::to_string(&display.0).map_err(|_| INVALID)?;
         }
         params.push((key.into(), std::mem::take(&mut *value)));
@@ -79,7 +145,10 @@ fn normalize(line: &str) -> Result<Otp, &'static str> {
     let mut normalized = Zeroizing::new(format!("otpauth://{kind}/{}?", uri_encode(&uri_decode(label, false)?)));
     for (index, (key, value)) in params.iter().enumerate() {
         if index != 0 { normalized.push('&'); }
-        normalized.push_str(&format!("{key}={}", uri_encode(value)));
+        let encoded = Zeroizing::new(uri_encode(value));
+        normalized.push_str(key);
+        normalized.push('=');
+        normalized.push_str(&encoded);
     }
     parse(&normalized)
 }
@@ -140,6 +209,26 @@ fn read(bytes: &[u8], existing: &str) -> Result<String, &'static str> {
     serde_json::to_string(&batch).map_err(|_| INVALID)
 }
 
+fn read_input(bytes: &[u8], existing: &str, password: Option<&str>) -> Result<String, &'static str> {
+    if bytes.is_empty() || bytes.len() > MAX_BACKUP_BYTES {
+        return Err("Ente Auth 文本不能超过 2 MiB，加密 JSON 不能超过 3 MiB。");
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| INVALID)?.trim_start_matches('\u{feff}').trim_start();
+    if text.starts_with('{') || password.is_some() {
+        if let Ok(backup) = serde_json::from_str::<Backup>(text) {
+            let plaintext = decrypt_backup(backup, password)?;
+            return read(&plaintext, existing);
+        }
+        // Reject identifiable but corrupt JSON backups. A lone malformed text
+        // line beginning with "{" must not discard other valid URI lines.
+        if password.is_some() || ["\"encryptedData\"", "\"encryptionNonce\"", "\"kdfParams\""]
+            .iter().any(|key| text.contains(key)) || serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok() {
+            return Err(INVALID_BACKUP);
+        }
+    }
+    read(bytes, existing)
+}
+
 fn export(items: &str) -> Result<String, &'static str> {
     let items = SensitiveJson(serde_json::from_str(items).map_err(|_| INVALID)?);
     let items = items.0.as_array().ok_or(INVALID)?;
@@ -166,8 +255,10 @@ fn export(items: &str) -> Result<String, &'static str> {
 }
 
 #[wasm_bindgen]
-pub fn wasm_parse_ente_auth(bytes: Vec<u8>, existing_setups: String) -> Result<String, JsValue> {
-    read(&Zeroizing::new(bytes), &Zeroizing::new(existing_setups)).map_err(JsValue::from_str)
+pub fn wasm_parse_ente_auth(bytes: Vec<u8>, existing_setups: String, password: Option<String>) -> Result<String, JsValue> {
+    let password = password.map(Zeroizing::new);
+    read_input(&Zeroizing::new(bytes), &Zeroizing::new(existing_setups), password.as_ref().map(|s| s.as_str()))
+        .map_err(JsValue::from_str)
 }
 
 #[wasm_bindgen]
@@ -181,6 +272,15 @@ mod tests {
     const SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
     fn batch(text: &str) -> Value { serde_json::from_str(&read(text.as_bytes(), "[]").unwrap()).unwrap() }
+
+    #[test]
+    fn keeps_plaintext_rows_after_a_malformed_brace_line() {
+        let text = format!("{{invalid line}}\notpauth://totp/Example?secret={SECRET}");
+        let result: Value = serde_json::from_str(&read_input(text.as_bytes(), "[]", None).unwrap()).unwrap();
+        assert_eq!(result["invalid"], 1);
+        assert_eq!(result["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(read_input(b"{\"kdfParams\":", "[]", None), Err(INVALID_BACKUP));
+    }
 
     #[test]
     fn repairs_legacy_exports_and_preserves_display_metadata() {

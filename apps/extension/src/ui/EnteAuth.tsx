@@ -7,7 +7,7 @@ import { download } from './lib';
 import { useOps } from './Main';
 
 async function readFile<T>(file: File, consume: (bytes: number[]) => Promise<T>): Promise<T> {
-  if (!file.size || file.size > MAX_ENTE_BYTES) throw new Error('请选择不超过 2 MiB 的 Ente Auth 文本文件。');
+  if (!file.size || file.size > MAX_ENTE_BYTES) throw new Error('请选择非空的 Ente Auth 文件：文本最多 2 MiB，加密 JSON 最多 3 MiB。');
   const raw = new Uint8Array(await file.arrayBuffer());
   const bytes = Array.from(raw);
   try { return await consume(bytes); }
@@ -25,34 +25,49 @@ export default function EnteAuth({ refresh }: { refresh(): Promise<void> }) {
   const [merges, setMerges] = useState<EnteMerge[]>([]);
   const [riskAccepted, setRiskAccepted] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const password = useRef<HTMLInputElement>(null);
   const summary = useRef<HTMLHeadingElement>(null);
+  const jsonName = file?.name.toLowerCase().endsWith('.json') || file?.type === 'application/json';
+  const resetPreview = () => { setPreview(undefined); setMerges([]); };
   useEffect(() => { if (preview) summary.current?.focus(); }, [preview]);
 
   return <>
     <div className="chips" role="group" aria-label="验证器迁移操作">
       <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => setMode('import')}>导入验证码</button>
-      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { setMode('export'); setRiskAccepted(false); }}>导出验证码</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => {
+        setFile(undefined); resetPreview(); setMode('export'); setRiskAccepted(false);
+      }}>导出验证码</button>
     </div>
     {mode === 'import' ? <>
-      <p className="lede">在 Ente Auth 中导出未加密文本，然后在这里预览。验证码可以单独保存，也可以由你勾选合并到已有登录项。</p>
-      <div className="banner banner-warn"><p>文本包含生成验证码的密钥。请勿上传或分享；导入完成后，请妥善处理原文件。</p></div>
+      <p className="lede">选择 Ente Auth 导出的加密 JSON 或文本。预览后可单独保存验证码，也可勾选合并到已有登录项。</p>
+      {file && !jsonName && <div className="banner banner-warn"><p>如果是明文文件，其中包含生成验证码的密钥，请勿上传或分享。</p></div>}
       <form className="form" onSubmit={event => {
         event.preventDefault();
         if (!file || busy) return;
         void work(async () => {
-          setPreview(undefined); setMerges([]);
-          setPreview(await readFile(file, bytes => request<EntePreview>({ type: 'preview-ente', bytes })));
+          resetPreview();
+          setPreview(await readFile(file, bytes => request<EntePreview>({
+            type: 'preview-ente', bytes, password: password.current?.value || undefined,
+          })));
         });
       }}>
-        <label className="field">Ente Auth 文本文件<input ref={input} className="input" type="file" accept=".txt,text/plain" required disabled={busy}
-          onChange={event => { setFile(event.target.files?.[0]); setPreview(undefined); setMerges([]); }} /></label>
-        <p className="hint">支持时间验证码、HOTP 和 Steam Guard。每次最多 2 MiB、5,000 个验证码。</p>
+        <label className="field">Ente Auth 文件<input ref={input} className="input" type="file" accept=".txt,.json,text/plain,application/json" required disabled={busy}
+          onChange={event => {
+            if (password.current) password.current.value = '';
+            setFile(event.target.files?.[0]); resetPreview();
+          }} /></label>
+        {file && <label className="field">Ente Auth 文件密码
+          <input ref={password} className="input" type="password" autoComplete="off" maxLength={4096}
+            disabled={busy} onChange={resetPreview} />
+          <span className="hint">明文文件请留空。加密文件用导出时设置的密码，解密只在本机进行。</span>
+        </label>}
+        <p className="hint">文本最多 2 MiB，加密 JSON 最多 3 MiB，每次最多 5,000 个验证码。</p>
         {!preview && <button className="btn btn-primary" disabled={busy || !file}><Ico of={FileUp} />预览验证码</button>}
       </form>
       {preview && <section className="section">
         <h2 ref={summary} tabIndex={-1}>可导入 {preview.ready} 个验证码</h2>
         <p className="hint">重复跳过 {preview.skipped} 个，无法读取 {preview.invalid} 个。已有验证码和计数器不会被覆盖。</p>
-        {preview.invalid > 0 && <p className="hint">请保留原有验证器，检查未能读取的记录。加密文件需要先在 Ente Auth 中另行导出为文本。</p>}
+        {preview.invalid > 0 && <p className="hint">请保留原有验证器，检查未能读取的记录。</p>}
         {preview.trashed > 0 && <p className="hint">其中 {preview.trashed} 个会保留在回收站，不会自动恢复。</p>}
         {preview.sample.length > 0 && <ul className="facts">
           {preview.sample.map((row, index) => <li className="fact" key={index}><div className="fact-text">
@@ -76,16 +91,22 @@ export default function EnteAuth({ refresh }: { refresh(): Promise<void> }) {
             if (!file) return;
             const proof = await dialogs.proof();
             try {
-              const count = await readFile(file, bytes => request<number>({ type: 'import-ente', bytes, stamp: preview.stamp, merges, proof }));
-              setFile(undefined); setPreview(undefined); setMerges([]);
+              const count = await readFile(file, bytes => request<number>({
+                type: 'import-ente', bytes, password: password.current?.value || undefined, stamp: preview.stamp, merges, proof,
+              }));
+              if (password.current) password.current.value = '';
+              setFile(undefined); resetPreview();
               if (input.current) input.current.value = '';
               await refresh(); notify(`已导入 ${count} 个验证码。`);
             } catch (error) {
-              if (error instanceof Error && error.message.includes('重新预览')) { setPreview(undefined); setMerges([]); }
+              if (error instanceof Error && error.message.includes('重新预览')) resetPreview();
               throw error;
             } finally { proof.secret = ''; }
           })}>确认导入 {preview.ready} 个</button>}
-          <button type="button" className="btn" disabled={busy} onClick={() => { setPreview(undefined); setMerges([]); }}>返回选择文件</button>
+          <button type="button" className="btn" disabled={busy} onClick={() => {
+            if (password.current) password.current.value = '';
+            resetPreview(); input.current?.focus();
+          }}>返回选择文件</button>
         </div>
       </section>}
     </> : <form className="form" onSubmit={event => {

@@ -2,7 +2,6 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
-mod ente_auth;
 mod bitwarden;
 mod migration_csv;
 mod authenticators;

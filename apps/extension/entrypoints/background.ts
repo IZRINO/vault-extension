@@ -97,9 +97,9 @@ export default defineBackground(() => {
   });
   browser.alarms.onAlarm.addListener(alarm => {
     if (alarm.name === DAV_ALARM) void ready.then(() => vault.handle({ type: 'webdav-scheduled' })).catch(() => undefined);
-    if (alarm.name === LOCK_ALARM) void vault.handle({ type: 'status' }).then(status => {
-      if (!(status as { unlocked: boolean }).unlocked) { autofill.clear(); passkeys.stop(); }
-    });
+    if (alarm.name === LOCK_ALARM) void ready.then(() => vault.lockExpiredSession()).then(locked => {
+      if (locked) { autofill.clear(); passkeys.stop(); }
+    }).catch(() => undefined);
     if (alarm.name === CLIPBOARD_ALARM) void clearExpiredClipboard().catch(() => undefined);
   });
   browser.runtime.onStartup.addListener(() => { registerMenu(); passkeys.stop(); void vault.lock(); });

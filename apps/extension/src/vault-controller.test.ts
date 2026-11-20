@@ -1,8 +1,9 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
-import initCsv, { wasm_export_ente_auth, wasm_parse_browser_csv, wasm_parse_ente_auth, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv,
+import initCsv, { wasm_parse_browser_csv, wasm_csv_headers, wasm_parse_mapped_csv, wasm_export_login_csv,
   wasm_parse_authenticator_backup, wasm_portable_import, wasm_portable_export } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import initEnte, { wasm_export_ente_auth, wasm_parse_ente_auth } from '../../../crates/vault-ente-auth/pkg/vault_ente_auth.js';
 import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import initPreferences, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav,
   wasm_sign_authorization, wasm_verify_authorization } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
@@ -18,6 +19,7 @@ import type { JournalCommit, LocalSettings, RemoteAnchor, SessionState, VaultFil
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
   settings: { autoLockMinutes: 15, pinFailures: 0 } as LocalSettings, pause: undefined as Promise<void> | undefined,
+  pauseEnte: undefined as (() => Promise<void>) | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
   failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown>,
   observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined,
@@ -73,7 +75,10 @@ vi.mock('./bridge', () => ({
     if (operation === 'parse-mapped-csv') return wasm_parse_mapped_csv(args[0] as Uint8Array, args[1] as string);
     if (operation === 'export-login-csv') return wasm_export_login_csv(args[0] as string);
     if (operation === 'parse-browser-csv') return prepareBrowserCsv(wasm_parse_browser_csv(args[0] as Uint8Array));
-    if (operation === 'parse-ente') return wasm_parse_ente_auth(args[0] as Uint8Array, args[1] as string);
+    if (operation === 'parse-ente') {
+      if (state.pauseEnte) await state.pauseEnte();
+      return wasm_parse_ente_auth(args[0] as Uint8Array, args[1] as string, args[2] as string | undefined);
+    }
     if (operation === 'export-ente') return wasm_export_ente_auth(args[0] as string);
     if (operation === 'generate-hotp' || operation === 'generate-otp') return wasm_otp_at(args[0] as string, args[1] as number ?? 0, args[2] as number ?? 0);
     if (operation === 'validate-totp') {
@@ -107,6 +112,7 @@ let recoveryCode: string;
 beforeAll(async () => {
   await init({ module_or_path: await readFile(new URL('../../../crates/vault-core/pkg/vault_core_bg.wasm', import.meta.url)) });
   await initCsv({ module_or_path: await readFile(new URL('../../../crates/vault-importers/pkg/vault_importers_bg.wasm', import.meta.url)) });
+  await initEnte({ module_or_path: await readFile(new URL('../../../crates/vault-ente-auth/pkg/vault_ente_auth_bg.wasm', import.meta.url)) });
   await initOtp({ module_or_path: await readFile(new URL('../../../crates/vault-otp/pkg/vault_otp_bg.wasm', import.meta.url)) });
   await initPreferences({ module_or_path: await readFile(new URL('../../../crates/vault-preferences/pkg/vault_preferences_bg.wasm', import.meta.url)) });
   await initSync({ module_or_path: await readFile(new URL('../../../crates/vault-sync/pkg/vault_sync_bg.wasm', import.meta.url)) });
@@ -117,6 +123,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   state.files = structuredClone(fixture); state.session = undefined; state.pause = undefined;
+  state.pauseEnte = undefined;
   state.pauseSessionClear = undefined;
   state.idleState = 'active';
   state.failSave = false;
@@ -872,6 +879,64 @@ describe('Ente migration and counter-based codes', () => {
     expect((await controller.handle({ type: 'list' }) as ItemSummary[]).length).toBe(1);
     const repeat = await controller.handle({ type: 'preview-ente', bytes }) as EntePreview;
     expect(repeat).toMatchObject({ ready: 0, skipped: 1 });
+  });
+
+  it('previews and imports an Ente v1 password-encrypted backup without disclosing seeds or rolling back HOTP', async () => {
+    const controller = await unlocked();
+    const bytes = Array.from(await readFile(new URL(
+      '../../../crates/vault-ente-auth/tests/fixtures/ente-auth-legacy.json', import.meta.url,
+    )));
+    const input = { bytes, password: ' Ente-夹具🔐 ' };
+    const before = structuredClone(state.files);
+    const pending = state.pendingWal.length;
+    const preview = await controller.handle({ type: 'preview-ente', ...input }) as EntePreview;
+    expect(preview).toMatchObject({ ready: 3, invalid: 0, skipped: 0, trashed: 1 });
+    expect(preview.sample.map(row => row.kind)).toEqual(['totp', 'hotp', 'steam']);
+    expect(JSON.stringify(preview)).not.toMatch(/GEZDGNBV|otpauth:|加密备份|Ente-夹具/);
+    await expect(controller.handle({ type: 'preview-ente', bytes })).rejects.toThrow('文件密码');
+    await expect(controller.handle({ type: 'import-ente', bytes, password: input.password.trim(),
+      stamp: preview.stamp, merges: [], proof })).rejects.toThrow('文件密码');
+    expect(state.files).toEqual(before);
+    expect(state.pendingWal).toHaveLength(pending);
+    expect(await controller.handle({ type: 'import-ente', ...input, stamp: preview.stamp, merges: [], proof })).toBe(3);
+    const items = await controller.handle({ type: 'list' }) as ItemSummary[];
+    const totp = items.find(item => item.title === 'GitHub')!;
+    const hotp = items.find(item => item.title === 'Lab')!;
+    expect(totp.pinned).toBe(true);
+    expect(await controller.handle({ type: 'get', id: totp.id })).toMatchObject({ note: '加密备份', tags: ['工单', 'work'] });
+    expect(items.find(item => item.title === 'Steam')?.trashed).toBe(true);
+    expect(await controller.handle({ type: 'next-hotp', id: hotp.id, proof })).toEqual({ kind: 'hotp', counter: '1', value: '287082' });
+    const repeat = await controller.handle({ type: 'preview-ente', ...input }) as EntePreview;
+    expect(repeat).toMatchObject({ ready: 0, skipped: 3 });
+    expect(await controller.handle({ type: 'next-hotp', id: hotp.id, proof })).toEqual({ kind: 'hotp', counter: '2', value: '359152' });
+  });
+
+  it('locks an expired session during Ente decryption and rejects its pending import', async () => {
+    state.settings.autoLockMinutes = 1;
+    const controller = await unlocked();
+    const bytes = Array.from(await readFile(new URL(
+      '../../../crates/vault-ente-auth/tests/fixtures/ente-auth-legacy.json', import.meta.url,
+    )));
+    const input = { bytes, password: ' Ente-夹具🔐 ' };
+    const preview = await controller.handle({ type: 'preview-ente', ...input }) as EntePreview;
+    const before = structuredClone(state.files);
+    const started = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    state.pauseEnte = () => { started.resolve(); return resume.promise; };
+    const completed = expect(controller.handle({ type: 'import-ente', ...input, stamp: preview.stamp, merges: [], proof }))
+      .rejects.toThrow('密码库已锁定');
+    await started.promise;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(state.session!.lastActivityMs + 60_000);
+    try {
+      await expect(controller.lockExpiredSession()).resolves.toBe(true);
+      expect(state.session).toBeUndefined();
+    } finally {
+      now.mockRestore();
+      resume.resolve();
+      await completed;
+    }
+    expect(state.files).toEqual(before);
+    expect(state.pendingWal).toHaveLength(0);
   });
 
   it('preserves independent tokens and trash and rejects a stale import after file or vault changes', async () => {

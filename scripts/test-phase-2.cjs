@@ -15,7 +15,7 @@ const browsers = {
 const password = 'Phase-Two-Local-Test#2026';
 const csvPassword = 'Sample-Csv-Secret#2026';
 const setupKey = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'; // RFC 6238 test fixture, never a real account.
-const output = path.join(root, 'test-results');
+const output = path.resolve(root, process.env.VAULT_TEST_OUTPUT || 'test-results');
 function fixtureCode(ms, steam = false) {
   const counter = Buffer.alloc(8);
   counter.writeBigUInt64BE(BigInt(Math.floor(ms / 30000)));
@@ -90,7 +90,7 @@ async function verify(name) {
       return reply.value;
     }, message);
     await send({ type: 'create', masterPassword: password, calibrate: false });
-    assert(!wasmRequests.some(url => url.includes('vault_importers')), 'Unlock must not load the optional importer');
+    assert(!wasmRequests.some(url => /vault_(?:ente_auth|importers)/.test(url)), 'Unlock must not load the optional importers');
     await send({ type: 'upsert', itemJson: JSON.stringify({
       title: 'Existing login', data: { kind: 'login', username: 'old', password: 'Existing-Test-Secret', uris: [{ uri: 'https://existing.example' }] },
     }) });
@@ -150,12 +150,13 @@ async function verify(name) {
     await page.getByRole('button', { name: '复制验证码', exact: true }).click();
     await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe(fixtureCode(fixtureTime + 1000));
     await verifyEnte(page, send, name, () => setClock(fixtureTime + 30000), fixtureTime + 30000);
+    await verifyEncryptedEnte(page, send, name);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
-      totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, steamAndHotp: true, errors }));
+      totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true, errors }));
   } finally {
     try { await context?.close(); }
     finally {
@@ -190,7 +191,7 @@ async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   ].join('\n');
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await page.getByRole('button', { name: /^Ente Auth 验证器迁移/ }).click();
-  await page.getByLabel('Ente Auth 文本文件').setInputFiles({ name: 'ente-auth-export.txt', mimeType: 'text/plain', buffer: Buffer.from(content) });
+  await page.getByLabel('Ente Auth 文件', { exact: true }).setInputFiles({ name: 'ente-auth-export.txt', mimeType: 'text/plain', buffer: Buffer.from(content) });
   await page.getByRole('button', { name: '预览验证码', exact: true }).click();
   await expect(page.getByRole('heading', { name: '可导入 5 个验证码' })).toBeVisible();
   await expect(page.getByText(/重复跳过 1 个，无法读取 1 个/)).toBeVisible();
@@ -309,6 +310,68 @@ async function enterProof(page) {
   await dialog.getByRole('button', { name: '验证', exact: true }).click();
 }
 
+async function verifyEncryptedEnte(page, send, name) {
+  const before = await send({ type: 'list' });
+  const changes = (await send({ type: 'status' })).changesSinceBackup;
+  const fixture = variant => fs.readFile(path.join(
+    root, 'crates', 'vault-ente-auth', 'tests', 'fixtures', `ente-auth-${variant}.json`,
+  ));
+  await page.getByRole('button', { name: '导入验证码', exact: true }).click();
+  const file = page.getByLabel('Ente Auth 文件', { exact: true });
+  const select = (bytes, filename = 'ente-backup.json') => file.setInputFiles({
+    name: filename, mimeType: 'application/octet-stream', buffer: bytes,
+  });
+  const filePassword = page.getByLabel('Ente Auth 文件密码', { exact: false });
+  const preview = page.getByRole('button', { name: '预览验证码', exact: true });
+  const correct = ' Ente-夹具🔐 ';
+  const legacy = await fixture('legacy'), json = JSON.parse(legacy);
+  const flipped = field => {
+    const bytes = Buffer.from(json[field], 'base64');
+    bytes[bytes.length - 1] ^= 1;
+    return Buffer.from(JSON.stringify({ ...json, [field]: bytes.toString('base64') }));
+  };
+  const failure = async (bytes, pass, error) => {
+    await select(bytes);
+    if (pass) await filePassword.fill(pass);
+    await preview.click();
+    await expect(page.getByRole('alert')).toContainText(error);
+    await expect(page.getByRole('button', { name: /^确认导入/ })).toHaveCount(0);
+    assert.deepEqual(await send({ type: 'list' }), before);
+    assert.equal((await send({ type: 'status' })).changesSinceBackup, changes);
+  };
+  await failure(legacy, '', '请输入 Ente Auth 文件密码');
+  await failure(legacy, 'Wrong fixture password', '文件密码错误');
+  await failure(flipped('encryptedData'), correct, '加密备份已损坏');
+  await failure(flipped('encryptionNonce'), correct, '加密备份已损坏');
+  await failure(Buffer.from(JSON.stringify({ ...json, version: 2 })), correct, '版本不受支持');
+  await failure(Buffer.from(JSON.stringify({ ...json, kdfParams: { ...json.kdfParams, memLimit: 2 ** 30 + 1024 } })),
+    correct, '密钥派生参数超出');
+  // The first-party format is detected by its JSON contents even after renaming.
+  await select(await fixture('native'), 'renamed-backup.txt');
+  await expect(filePassword).toHaveValue('');
+  await filePassword.fill(correct);
+  await preview.click();
+  await expect(page.getByRole('heading', { name: '可导入 2 个验证码' })).toBeVisible({ timeout: 120000 });
+  await expect(page.getByText(/重复跳过 1 个，无法读取 0 个/)).toBeVisible();
+  assert.deepEqual(await send({ type: 'list' }), before, 'Preview must not write to the vault');
+  assert(!(await page.locator('body').innerText()).includes(setupKey), 'Preview must not reveal the seed');
+  await screenshot(page, name, 'ente-encrypted-preview');
+  await page.getByRole('button', { name: '确认导入 2 个', exact: true }).click();
+  // The text-export regression has enabled a local PIN; choose the master
+  // explicitly to keep testing the file password and vault proof separately.
+  await page.getByRole('dialog').getByLabel('验证方式').selectOption('master');
+  await enterProof(page);
+  await expect(page.getByText('已导入 2 个验证码。')).toBeVisible({ timeout: 120000 });
+  const after = await send({ type: 'list' });
+  assert.equal(after.length, before.length + 2);
+  const imported = after.filter(item => !before.some(old => old.id === item.id));
+  assert(imported.some(item => item.title === 'GitHub' && item.pinned));
+  assert(imported.some(item => item.title === 'Steam' && item.trashed));
+  const counter = before.find(item => item.title === 'Counter');
+  assert((await send({ type: 'get-edit', id: counter.id })).data.totpUri.includes('counter=2'));
+  await expect(filePassword).toHaveCount(0);
+}
+
 async function screenshot(page, name, stage) {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   await page.screenshot({ path: path.join(output, `phase-2-${name}-${stage}.png`), animations: 'disabled' });
@@ -316,11 +379,12 @@ async function screenshot(page, name, stage) {
 
 (async () => {
   const readBundle = entry => fs.readFile(path.join(extension, entry), 'utf8');
-  const [background, kdf, csv, otp] = await Promise.all(['background.js', 'kdf-worker.js', 'csv-worker.js', 'otp-worker.js'].map(readBundle));
-  const optionalExports = /wasm_parse_browser_csv|wasm_validate_totp|wasm_totp_at/;
+  const [background, kdf, csv, otp, ente] = await Promise.all(['background.js', 'kdf-worker.js', 'csv-worker.js', 'otp-worker.js', 'ente-worker.js'].map(readBundle));
+  const optionalExports = /wasm_parse_browser_csv|wasm_validate_totp|wasm_totp_at|wasm_parse_ente_auth/;
   assert.doesNotMatch(background, optionalExports);
   assert.doesNotMatch(kdf, optionalExports);
   assert.match(csv, /wasm_parse_browser_csv/);
   assert.match(otp, /wasm_validate_totp/);
+  assert.match(ente, /wasm_parse_ente_auth/);
   for (const name of process.argv.length > 2 ? process.argv.slice(2) : Object.keys(browsers)) await verify(name);
 })().catch(error => { console.error(error); process.exitCode = 1; });

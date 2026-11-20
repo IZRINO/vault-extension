@@ -2,6 +2,17 @@
 
 2026-11-20，本机 Windows。[T01](https://github.com/IZRINO/vault-extension/issues/1) 和 [T36](https://github.com/IZRINO/vault-extension/issues/36) 的补测，不替代[候选包的功能及准出记录](release-candidate-status.md)。
 
+## Ente 候选包同包复测
+
+同一生产 ZIP `5a759f049e22`，解压树 SHA-256 `be27de5e5c29ca0b7265b4ed14fdef64dc70df75fe1096c69d627cf094f6c021`。Edge `158.0.4370.33`、Helium `157.0.8103.78` 各 10 次，每库 1,000 条合成凭证，使用解锁会话、停 Worker 后触发原生工具栏，同一计时口径。
+
+| 浏览器 | 工具栏动作 → 列表 DOM（最短 / 中位数 / 最长） | WASM 恢复（最短 / 中位数 / 最长） |
+| --- | --- | --- |
+| Edge | 444.67 / 549.26 / 640.96 ms | 56.60 / 65.80 / 81.10 ms |
+| Helium | 460.66 / 546.95 / 632.82 ms | 55.30 / 60.95 / 72.50 ms |
+
+20 个样本均超过两项门槛；脚本保存 `test-results/wakeup-1000.rc-5a759f049e22.json` 后以性能断言退出。包内主 WASM 与 `8a016565deff` 逐字节相同，但这不是交错 A/B，不用不同批次的差值归因。未预热、绕过锁库或改门槛。
+
 ## WASM 恢复归因
 
 从原候选 `3a2fa7b7d66f` 各 10 个冷开样本拆段，中位数如下。后台入口、准备入口和 WASM 就绪均从 Worker 时间原点累计，不能把 `wasm-loaded` 的时刻当成单独的编译耗时。
