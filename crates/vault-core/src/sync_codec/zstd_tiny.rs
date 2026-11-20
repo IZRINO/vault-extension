@@ -135,11 +135,16 @@ impl<'a> ReverseBitReader<'a> {
         if lo >= 0 {
             let byte_idx = (lo as usize) >> 3;
             let bit_off = (lo as usize) & 7;
-            let mut buf = [0u8; 8];
-            let avail = (self.src.len() - byte_idx).min(8);
-            buf[..avail].copy_from_slice(&self.src[byte_idx..byte_idx + avail]);
-            let word = u64::from_le_bytes(buf);
-            let mask = if n == 32 { u32::MAX as u64 } else { (1u64 << n) - 1 };
+            let tail = &self.src[byte_idx..];
+            // Most reads have a full word available and need no padded copy.
+            let word = if let Some(bytes) = tail.first_chunk::<8>() {
+                u64::from_le_bytes(*bytes)
+            } else {
+                let mut buf = [0u8; 8];
+                buf[..tail.len()].copy_from_slice(tail);
+                u64::from_le_bytes(buf)
+            };
+            let mask = (1u64 << n) - 1;
             ((word >> bit_off) & mask) as u32
         } else {
             let avail_bits = hi as u8;

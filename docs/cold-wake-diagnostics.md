@@ -2,7 +2,42 @@
 
 2026-11-20，本机 Windows。[T01](https://github.com/IZRINO/vault-extension/issues/1) 和 [T36](https://github.com/IZRINO/vault-extension/issues/36) 的补测，不替代[候选包的功能及准出记录](release-candidate-status.md)。
 
-## Vault 0.1.0 当前候选包同包复测
+## WASM 恢复归因
+
+从原候选 `3a2fa7b7d66f` 各 10 个冷开样本拆段，中位数如下。后台入口、准备入口和 WASM 就绪均从 Worker 时间原点累计，不能把 `wasm-loaded` 的时刻当成单独的编译耗时。
+
+| 路径 | Edge | Helium |
+| --- | ---: | ---: |
+| 工具栏动作 → Popup 发出第一个 `open` | 377.45 ms | 363.70 ms |
+| 工具栏动作 → Worker 时间原点 | 380.00 ms | 366.00 ms |
+| Worker 时间原点 → 后台入口 | 17.15 ms | 17.00 ms |
+| Worker 时间原点 → 开始准备恢复 | 39.35 ms | 43.85 ms |
+| Worker 时间原点 → WASM 就绪 | 50.95 ms | 51.50 ms |
+| `restore_from_session` 前后时标差 | 18.30 ms | 16.80 ms |
+
+保留函数名的优化构建用于 CPU 采样，热点是 Zstd 解压，尤其是反向位读取；BLAKE3 和 XChaCha20 也占一部分。优化只改变满 8 字节时的读取方式，字不足仍补零。没有改压缩格式、解压上限、快照认证、锁库条件或 WASM 加载时机。回填读取窗口的试验没有额外收益，未保留。
+
+Node `v26.13.1` 对照先在父进程生成一份千条合成库，再用同一密钥、包装、头和密文在**独立进程**交错采样，每臂 20 次。独立进程避免原版复用夹具生成时的 V8 编译结果。计时后核对每次恢复的完整摘要指纹。
+
+| WASM | 初始化模块中位数 | 首次 `restore_from_session`（最短 / 中位数 / 最长） | 主核大小 |
+| --- | ---: | ---: | ---: |
+| 原候选同字节 | 1.215 ms | 16.707 / 17.098 / 17.491 ms | 255,677 B |
+| 满字直接读取 | 1.212 ms | 15.751 / 16.171 / 18.660 ms | 255,662 B |
+
+首次调用中位数缩短 **0.927 ms**，不表示每个样本都更快。另一轮禁用 V8 惰性编译，原版模块初始化中位数增加约 4.6 ms，首次调用变短，初始化加恢复仍约 17 ms；不能把编译前移当作恢复达标。以上都是独立诊断，不包含浏览器刚启动 Worker 时的调度、存储或原生 Popup，也不替代 `<5 ms` / `<50 ms` 门禁。原始 A/B 为 `test-results/restore-probe/paired-default.json`。
+
+### 最小 Worker 存储对照
+
+剥除 Vault 业务、WASM 与工具栏 Popup，在普通扩展页面发送消息，触发已停止的最小 MV3 Worker。等待 `TRUSTED_CONTEXTS` 设置完成，再并发读合成的 `storage.session`、`storage.local`、IndexedDB 与 `idle`。两浏览器各 10 次，从 Worker 时间原点计时：
+
+| 浏览器 | 首行脚本最短 / 中位数 | 读齐最短 / 中位数 |
+| --- | ---: | ---: |
+| Edge `158.0.4370.33` | 4.30 / 4.55 ms | 6.90 / 7.15 ms |
+| Helium `157.0.8103.78` | 4.10 / 4.45 ms | 6.50 / 6.95 ms |
+
+这批样本的系统状态均为 `locked`。此对照只说明本机即使不做认证与解码，安全存储路径仍有数毫秒开销；它不是其他机器或解锁桌面的性能下限。新 ZIP `8a016565deff` 的解锁库冷开在准备夹具时因系统锁库中止，没有产生新样本。另用同一 ZIP 在当前锁定状态验证：重启 Worker 后两端都加载 WASM、清除合成会话、拒绝返回列表，没有认证恢复时标。此验证未制造实体锁屏动作，不替代现场验收。本机证据：`test-results/restore-probe/worker-floor-1795148290787.json`、`test-results/release-checks-8a016565deff/locked-desktop.json`。
+
+## Vault 0.1.0 前一候选包冷开复测
 
 生产 ZIP `3a2fa7b7d66f`。52 个解压文件逐字节与 ZIP 内文件一致，冷开脚本按路径和内容计算的树 SHA-256 为 `02388a5bba6880b74749ab31a4064a50a94f4a3717aac1e45e75e01e93a1278f`。Edge `158.0.4370.33`、Helium `157.0.8103.78` 各完成 10 个样本，每库 1,000 条合成凭证。
 
@@ -42,4 +77,6 @@ Edge `157.0.4341.60`、Helium `157.0.8103.78`。
 
 在根目录，以 `VAULT_EXTENSION_PATH` 指向上述解压树，设置 `VAULT_WAKE_ITEMS=1000`、`VAULT_WAKE_SAMPLES=10`、`VAULT_WAKE_REPORT_LABEL=cold-followup`，运行 `node scripts/test-wakeup.cjs`；解压路径和解压树 SHA-256 会记录于 `test-results/wakeup-1000.cold-followup.json`。`node scripts/probe-popup-floor.cjs` 生成带时间戳的无后台对照报告；本次文件为 `test-results/wakeup-popup-floor-1795112072342.json`。Edge 独立 A/B 的本机脚本是 `test-results/probe-popup-debugger-ab.cjs`，报告是 `test-results/wakeup-popup-debugger-ab-1795113649479.json`。这些是本机记录，不把浏览器临时配置或样本库提交到仓库。
 
-如只定位渲染慢段，设置 `VAULT_WAKE_TRACE=1` 并给一个独立报告标签；首样本会录制 Chromium 轨迹，只写耗时摘要，不作为准出测量。需要新的设备或浏览器构建上的同口径证据，才能说明原生路径是否能满足门槛。
+在另一台电脑复测时，用最新 [候选包](release-candidate-status.md#当前候选包-010) 的解压目录替换 `VAULT_EXTENSION_PATH`，设 `VAULT_WAKE_ITEMS=1000`、`VAULT_WAKE_SAMPLES=10` 和一个新的 `VAULT_WAKE_REPORT_LABEL`，保持桌面解锁、不要切走浏览器窗口。如果浏览器安装路径与脚本默认值不同，设置 `VAULT_BROWSER_PATH` 为该浏览器可执行文件，分别运行 `node scripts/test-wakeup.cjs edge` 或 `node scripts/test-wakeup.cjs helium`，每次用不同的报告标签。脚本会先保存 JSON 再判定门槛，不会改用户现有库。
+
+如只定位渲染慢段，设置 `VAULT_WAKE_TRACE=1` 并给一个独立报告标签；首样本会录制 Chromium 轨迹，只写耗时摘要，不作为准出测量。

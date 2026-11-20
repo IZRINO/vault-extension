@@ -2,9 +2,17 @@
 
 2026-11-20。对应[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)与[工单 T01–T38](development-tickets.md)。生产 ZIP 不等于正式准出；不代签，也不把模拟证据当作系统设备、第三方服务或应用互通的证据。
 
-当前可安装包为 **Vault 0.1.0**。千条库冷开未达标，真实设备和第三方环境待验。
+当前可安装包为 **Vault 0.1.0**。前一包千条库冷开未达标；当前包未完成性能准出复测。需真实设备、第三方环境的验收由用户自行进行。
 
 ## 当前候选包 0.1.0
+
+- ZIP `test-results/Vault-2026-11-20-8a016565deff-chrome.zip`，6,164,200 B。SHA-256 `8a016565deff9f9bf69ac38b60e22285c4bd300ecfaa8b15c81cb4988859d0ab`。加载解压目录 `test-results/release-unpacked-8a016565deff`，52 个文件与 ZIP 逐字节一致；按冷开脚本口径的树摘要 `83593aef506066683068478c87b2a7aef74a089cf9b43da64936c0252d8597e0`。
+- 主核 **255,662 B**，上限 **256,000 B**。相对前一包仅核心 WASM 和 7 个引用它的按需 Worker 产物变化，MV3 清单、CSP、权限和前端完全相同。检查实际 ZIP 中的 10 份 WASM 载荷均与对应构建产物一致；导入 WASM **2,518,450 B**，仍只进入按需导入 Worker。包内没有 `chrome.identity` 或 `chrome.storage.sync` 引用。
+- Rust **57** 项、带独立夹具的 Vitest **110** 项、TypeScript 和七个 WASM 构建通过。另用旧版 WASM 实际导出的加密 `.vaultpack` 验证预览、错密拒绝、合入和二次验证；KDBX 3.1/4.0、KeePassXC 4.1 原公钥验签，以及 2FAS、Aegis、andOTP 和 Stratum 合成样本通过。
+- Edge `158.0.4370.33` 和 Helium `157.0.8103.78` 实际加载同一解压树。系统已锁定时，冷 Worker 两端都加载 WASM、清除有效合成会话且不返回任何条目。未改锁库条件或计时口径。新的解锁态原生冷开在置备阶段中止，没有产生样本；新包未重跑需要解锁桌面的完整双浏览器功能矩阵。**12/12** 功能回归属于前一包。
+- Zstd 首次恢复在同密文、独立 Node 进程的对照中位数为 **17.098 → 16.171 ms**，不能代替浏览器准出。无 Vault 业务的最小 Worker 对照中，仅受保护存储准备在这台锁定桌面也至少需要 **6.90 / 6.50 ms**（Edge / Helium）。[分段和换机复测命令](cold-wake-diagnostics.md#wasm-恢复归因)。本机包证据在 `test-results/release-checks-8a016565deff/`。
+
+## 前一候选包 0.1.0（全量浏览器功能回归）
 
 - ZIP `test-results/Vault-2026-11-20-3a2fa7b7d66f-chrome.zip`，6,163,321 B。SHA-256 `3a2fa7b7d66f7db44e7287044659b71da37ba1932434d27feb588daef1c1d8ff`。加载解压目录 `test-results/release-unpacked-3a2fa7b7d66f`，52 个文件逐个与 ZIP 内容一致；冷开脚本的树摘要为 `02388a5bba6880b74749ab31a4064a50a94f4a3717aac1e45e75e01e93a1278f`。
 - Rust **57** 项、Vitest **110** 项、TypeScript 检查、全部七个 WASM 模块和 MV3 生产 ZIP 构建通过。主核 `assets/background.wasm` **255,677 B**，上限 **256,000 B**。导入 WASM **2,518,466 B**，只进入 `csv-worker.js`、`ente-worker.js` 和 `migration-worker.js`。生产清单版本改为 `0.1.0`，权限和 CSP 与上一包一致。包内扫描无 `chrome.identity` 或 `chrome.storage.sync` 引用。[Chromium 清单版本规则](https://developer.chrome.com/docs/extensions/reference/manifest/version)
@@ -13,7 +21,7 @@
 - T26 使用独立 CXF 1.0 来源、Bitwarden 格式库 `0.4.0` 与原公钥验签。标准交换的私钥为 Base64URL PKCS#8，Vault 在加密库内保存原始标量或种子。带文件密码的 JWE 单独标识。T29 覆盖脱敏 1PUX 数据和兼容结构，对无私钥、附件和未支持类型报告限制。T30 支持 Proton 原生 ES256 / Ed25519 MessagePack 凭证，对未知版本及 PGP 外层给出提示。T35 按厂商布局处理 NordPass 附加网址 JSON 数组和 Dashlane 旧版 OTP。例程与样本版本见[迁移夹具](agents/portable-migration-fixtures.md)、[CSV 来源](agents/vendor-csv-sources.md)。
 - 同一 ZIP 在 Edge `157.0.4341.60` 和 Helium `157.0.8103.78` 跑亮码、暗码两轮迁移，均使用独立配置，1000×800 视口与 420 像素码。原生 Popup **首扫候选完成绘制**，Helium **122.2 / 129.0 ms**，Edge **214.7 / 217.4 ms**。热扫分别为 **106.0 / 109.3 ms** 和 **112.3 / 129.3 ms**。Helium 过 `<200 ms` 指标。Edge 同口径前包为 210–239 ms 量级，早期 Edge 161 ms 采用不同测量口径。两轮均实测公开 2FAS v4 加密样本，错密不写入，恢复 5 条，核对 HOTP 连续计数。
 - **同包功能回归 12/12 通过**，包括双端原生亮暗码迁移、安装、原生侧栏、二期、自动填充、数据安全、主密码轮换和设备认领、网盘备份合入、Proton 验签、Passkey 与历史恢复，以及旧 Bitwarden 凭证启用。Proton Pass WASM `2.3.4` 生成的两枚凭证在两个浏览器均验签通过。KeePassXC CLI `2.8.0` 的加密 4.1 夹具每端通过 3 次验签。回环 WebDAV 历史恢复确认 `412` 时不覆盖、保留当前密钥包装和已用计数。千条密文快照 **123,752 B**（上限 240,000 B），单变更 WAL **598 B**（上限 600 B）。
-- **同一候选包千条库冷开**：Edge `158.0.4370.33`、Helium `157.0.8103.78` 各完成 10 个样本。Popup DOM 中位数 **556.23 / 548.50 ms**，WASM 恢复中位数 **72.00 / 69.20 ms**，两端均未过 `<50 ms`、`<5 ms`。同机当前版本的最小 MV3 对照，最快首脚本 **265.62 / 255.84 ms**。[计时定义及诊断](cold-wake-diagnostics.md#vault-010-当前候选包同包复测)
+- **同一候选包千条库冷开**：Edge `158.0.4370.33`、Helium `157.0.8103.78` 各完成 10 个样本。Popup DOM 中位数 **556.23 / 548.50 ms**，WASM 恢复中位数 **72.00 / 69.20 ms**，两端均未过 `<50 ms`、`<5 ms`。同机当前版本的最小 MV3 对照，最快首脚本 **265.62 / 255.84 ms**。[计时定义及诊断](cold-wake-diagnostics.md#vault-010-前一候选包冷开复测)
 
 本机 `test-results/release-checks-3a2fa7b7d66f/` 保存 `package.json`、`browser-suites.json`、两轮原生扫码分段数据和 `cold-wake-fresh-tabs.log`。冷开原始报告为 `test-results/wakeup-1000.rc-3a2fa7b7d66f.json`。回归记录保留 Proton 漏传夹具参数及旧库测试页需要刷新的两次失败，以及更正命令后通过的证据。
 
@@ -115,7 +123,7 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 - 在同一解压包和新浏览器配置分别测原生 Popup 亮码／暗码首扫候选完成绘制：Helium **122.5 / 126.6 ms**，均低于 200 ms；Edge 亮码 **210.5 ms**，不是 Helium 门槛。两轮迁移回归亦通过公开 2FAS v4 加密样本。
 - **同包功能回归通过**：安装、备份防丢、网盘恢复码合入、原生侧栏、自动填充、二期、迁移（双端亮码及 Helium 暗码）、主密码轮换／设备认领、Passkey／历史恢复，十轮均退出 0。KeePassXC CLI 2.8.0 样本在两款浏览器均通过原公钥验签。阶段包曾在 Helium 内置过滤器启动检测处超时；最终夹具在原等待期限内重新查找后台目标，仍要求内置拦截器到达就绪状态，没有停用过滤器。
 
-千条原生 Popup 冷开与已认证 WASM 恢复仍未达标，见[当前候选包同包复测](cold-wake-diagnostics.md#vault-010-当前候选包同包复测)。实体设备、真实站点／网盘及仍缺独立来源的第三方互通按用户要求跳过人工验收。未上架、未推送、未改工单状态。
+千条原生 Popup 冷开与已认证 WASM 恢复仍无达标证据，见[冷开复测与诊断](cold-wake-diagnostics.md)。实体设备、真实站点／网盘及仍缺独立来源的第三方互通按用户要求跳过人工验收。未上架、未推送、未改工单开关状态。
 
 ### 网盘熔断恢复候选
 
