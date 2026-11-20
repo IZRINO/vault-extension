@@ -6,6 +6,13 @@
 
 ## 当前候选包 0.1.0
 
+- ZIP `test-results/Vault-2026-11-20-e44c78fb385a-chrome.zip`，6,207,232 B，SHA-256 `e44c78fb385a21d689d27a8bddd3fb22ae3fb9d474b1070ab4f6247559075e4c`。解压 `test-results/release-unpacked-e44c78fb385a`，54 个文件与生产构建逐字节一致，树摘要 `759fdde224124e3b90c9f3ec6eb5dcf72aa55879e04ccebe5e56bd65b5845489`。
+- T35 可直接从「设置 → 其他密码库与 CXF」选择 Dashlane 明文 CSV ZIP。固定公开样本恢复 8 条登录和 3 条安全备注，另外 4 条支付或身份记录计入暂不支持。回归覆盖无网址或密码的登录项、附加用户名、旧 OTP、多行内容、损坏 ZIP、预览不写、错密拒绝、二次验证和重新导入。原厂应用试用待验收。[CSV 来源与样本](agents/vendor-csv-sources.md#dashlane)
+- Rust **80** 项（含 vendored 3 项）、Vitest **144** 项、TypeScript、九个 WASM、生产 ZIP、KDBX 3.1/4.0、旧加密 `.vaultpack` 恢复通过。主核 **250,848 B**，导入模块 **3,575,440 B**，由两条按需迁移路径加载。已比对包内 11 份 WASM 与清单、CSP、权限。证据位于 `test-results/release-checks-e44c78fb385a/`。
+- 新包实际加载到 Edge 与 Helium 的独立配置。Windows 报告 `idle=locked`，二期脚本在进入设置前中止。后台授权与加密状态测试通过，完整解锁态回归待验收。可见工具打开了设置页布局夹具的外壳，随后会话关闭，交互快照待验收。上一包裁决与更早全量浏览器记录见下节。
+
+## 冲突裁决候选包 0.1.0
+
 - ZIP `test-results/Vault-2026-11-20-59c653f043bd-chrome.zip`，6,196,928 B，SHA-256 `59c653f043bd258bfa835c2823a463c6619c674f7bf6e5fc67c5fdd1d7529a04`。解压 `test-results/release-unpacked-59c653f043bd`，54 个文件与生产构建逐字节一致，树摘要 `35f71784797f9637b2c52c2e54c3be6d0a687487c19502461b98816cb983d79d`。
 - T14 在逐字段裁决后显示实际合并结果，可改名称、备注和单条登录密码。受保护的字段验证后显示。手动换密码按最终选择归档两端落选值及来源、修改时间，保留最近 20 条。预览、取消和旧裁决重复提交的双端数据一致性均通过。
 - Rust **80** 项（其中 vendored 3 项）、Vitest **139** 项、TypeScript、九个 WASM 和生产 ZIP 通过。主核 **250,848 B**，同步 Worker 的 WASM **1,720,639 B**，清单、权限与 CSP 同 `7e9e617da993`。同包 Edge 与 Helium 通过 Passkey、回环 WebDAV 冲突裁决和历史恢复，日志位于 `test-results/release-checks-59c653f043bd/`。可见布局夹具控制台及失败请求为空。桌面焦点限制使快照和截图未完成。
@@ -75,7 +82,7 @@
 | T13–T18、T20 | 三方字段合并、加密待裁决区、全页裁决、落选密码历史、主密码旋转、设备认领和加密来源记录、滚动五份历史、历史预览/恢复、异库合入。 | 一个离线登录命中多个远端候选时一同展示；更晚的重叠草稿加密留在本机，无关项仍可同步。双份继承二次验证，同一递增凭证只保留一份可用计数。自动覆盖并发 WAL、条件提交、两处压实中断、30 天回收站边界、历史重放拒绝、计数恢复、不同身份合入。找不到祖先或不能保留新字段时停止写回；两家真实 WebDAV 尚未验收。 |
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
 | T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey 与原生 SSH 对象、KeePass KDBX/XML/CSV、1Password 1PUX、Proton JSON/ZIP 与受支持的 PGP ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。厂商应用与真实网站互通待验收。 |
-| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。架构另要求的 Enpass、Dashlane 与 LastPass JSON 已接入已核对的入口。 | 有独立合成回归及 [2FAS、Aegis、andOTP、Stratum 公开夹具](agents/authenticator-backup-fixtures.md)。原生来源样本尚未齐备，见[厂商 JSON 边界](agents/vendor-json-sources.md)。 |
+| T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth；Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。原厂 Dashlane 明文 CSV ZIP、Enpass 桌面 JSON、Dashlane 及 LastPass CLI JSON 已接入。 | 有独立合成回归与公开夹具。原厂应用日常试用待验收。[验证器样本](agents/authenticator-backup-fixtures.md) · [厂商 JSON 边界](agents/vendor-json-sources.md) |
 | T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 冷开 `<50 ms` 未达，正式发布准出和真实站点/设备验收不能签收。 |
 
 ### 格式限制

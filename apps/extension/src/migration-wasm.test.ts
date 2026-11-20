@@ -2,12 +2,12 @@ import { execFileSync } from 'node:child_process';
 import { createCipheriv, createHash, createHmac, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, scryptSync, sign, verify, type KeyObject } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { crc32 } from 'node:zlib';
 import { beforeAll, describe, expect, it } from 'vitest';
 import initCore, { WasmVaultEngine, wasm_create_new_vault, wasm_unlock_head_with_password } from '../../../crates/vault-core/pkg/vault_core.js';
 import initImport, { wasm_csv_headers, wasm_parse_authenticator_backup, wasm_parse_bitwarden, wasm_parse_mapped_csv, wasm_portable_export, wasm_portable_import } from '../../../crates/vault-importers/pkg/vault_importers.js';
 import initOtp, { wasm_otp_at } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import initKeys, { wasm_passkey_candidates, wasm_passkey_perform } from '../../../crates/vault-passkeys/pkg/vault_passkeys.js';
+import { zip } from './test-fixtures/zip';
 
 const str = (value: unknown) => JSON.stringify(value);
 const bin = (value: unknown) => Buffer.from(str(value));
@@ -62,25 +62,6 @@ function googleUri(index: number, kind: 1 | 2, batchId = 24) {
   return 'otpauth-migration://offline?data=' + encodeURIComponent(b64(Buffer.concat([
     field(1, otp), Buffer.from([0x10, 1, 0x18, 2, 0x20, index, 0x28, batchId]),
   ])));
-}
-function zip(files: Record<string, Buffer> | [string, Buffer][]) {
-  const local: Buffer[] = [], directory: Buffer[] = [];
-  let offset = 0;
-  for (const [file, body] of Array.isArray(files) ? files : Object.entries(files)) {
-    const name = Buffer.from(file);
-    const entry = Buffer.alloc(30), header = Buffer.alloc(46), crc = crc32(body);
-    entry.writeUInt32LE(0x04034b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt32LE(crc, 14);
-    entry.writeUInt32LE(body.length, 18); entry.writeUInt32LE(body.length, 22); entry.writeUInt16LE(name.length, 26);
-    header.writeUInt32LE(0x02014b50, 0); header.writeUInt16LE(20, 4); header.writeUInt16LE(20, 6);
-    header.writeUInt32LE(crc, 16); header.writeUInt32LE(body.length, 20); header.writeUInt32LE(body.length, 24);
-    header.writeUInt16LE(name.length, 28); header.writeUInt32LE(offset, 42);
-    local.push(entry, name, body); directory.push(header, name);
-    offset += entry.length + name.length + body.length;
-  }
-  const central = Buffer.concat(directory), end = Buffer.alloc(22);
-  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(local.length / 3, 8); end.writeUInt16LE(local.length / 3, 10);
-  end.writeUInt32LE(central.length, 12); end.writeUInt32LE(offset, 16);
-  return Buffer.concat([...local, central, end]);
 }
 const parseAuth = (format: string, bytes: Uint8Array, password = '') => JSON.parse(wasm_parse_authenticator_backup(format, bytes, password));
 const codeAt = (row: { data: { totpUri: string } }) => JSON.parse(wasm_otp_at(row.data.totpUri, now, 0)).value;
@@ -427,6 +408,90 @@ function restoredItems(v: ReturnType<typeof fresh>) {
 function restoredItem(v: ReturnType<typeof fresh>) {
   return restoredItems(v)[0];
 }
+
+describe('Dashlane native CSV ZIP migration', () => {
+  const header = 'username,username2,username3,title,password,note,url,category,otpUrl\r\n';
+  const credentials = Buffer.from('\ufeff' + header +
+    'fixture-login,fixture-alias,,Login fixture," spaced, ""quoted"" ","Line 1\r\nLine 2",https://example.test,Work,' +
+    'otpauth://totp/?secret=JBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30&lock=false');
+  const notes = Buffer.from('title,note,category\r\nNote fixture," note body ",Work');
+  const payments = Buffer.from('type,account_name\r\ncredit_card,Unsupported fixture');
+
+  it('restores logins and notes without creating CSV files and reports other types', () => {
+    const vault = fresh();
+    const bytes = zip({ 'credentials.csv': credentials, 'securenotes.csv': notes, 'payments.csv': payments });
+    const preview = imported(vault, 'dashlane-zip', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 2, invalid: 0, unsupported: 1, ignoredOtp: 0 });
+    expect(preview.head).toHaveLength(0);
+    expect(preview.snap).toHaveLength(0);
+    expect(JSON.stringify(preview.report)).not.toMatch(/quoted|note body|fixture-alias|JBSWY/);
+    const state = { ...vault, ...imported(vault, 'dashlane-zip', bytes) };
+    const records = restoredItems(state);
+    expect(records.find(item => item.title === 'Login fixture')).toMatchObject({
+      note: 'Line 1\r\nLine 2', tags: ['Work'],
+      data: { username: 'fixture-login', password: ' spaced, "quoted" ', uris: [{ uri: 'https://example.test' }] },
+      customFields: expect.arrayContaining([expect.objectContaining({ name: 'CSV 源自定义字段', value: expect.stringContaining('fixture-alias'), hidden: true })]),
+    });
+    expect(records.find(item => item.title === 'Note fixture')).toMatchObject({
+      note: ' note body ', tags: ['Work'], requireReprompt: true, data: { kind: 'developer', subtype: 'secure_note' },
+    });
+    expect(imported(state, 'dashlane-zip', bytes, '', false).report).toMatchObject({ ready: 0, skipped: 2 });
+    const engine = new WasmVaultEngine();
+    try {
+      engine.restore_from_session(state.key, state.wrap, state.head, state.snap);
+      const trashed = engine.set_trashed(records.find(item => item.title === 'Login fixture').id, true, now * 1000 + 1);
+      try {
+        const changed = { ...state, head: trashed.head_bytes, snap: trashed.snap_bytes };
+        expect(imported(changed, 'dashlane-zip', bytes, '', false).report).toMatchObject({ ready: 0, skipped: 2 });
+        expect(restoredItems(changed).find(item => item.title === 'Login fixture').trashed).toBe(true);
+      } finally { trashed.free(); }
+    } finally { engine.lock_and_zeroize(); engine.free(); }
+  });
+
+  it('keeps untitled notes and treats an unsafe URL as hidden source data', () => {
+    const sourceRows = Buffer.from(header + 'fixture,,,,"  ",,https://fixture-user:fixture-token@example.test,,');
+    const bytes = zip({ 'credentials.csv': sourceRows, 'securenotes.csv': Buffer.from('title,note\n,"Preserve me"\n'),
+      'personalInfo.csv': Buffer.alloc(0), 'ids.csv': Buffer.from('type,number\n,\nmalformed\n') });
+    const vault = fresh();
+    const state = { ...vault, ...imported(vault, 'dashlane-zip', bytes) };
+    expect(state.report).toMatchObject({ ready: 2, invalid: 1, unsupported: 1 });
+    expect(JSON.stringify(state.report)).not.toContain('fixture-token');
+    const records = restoredItems(state);
+    expect(records.find(item => item.data.kind === 'login')).toMatchObject({
+      data: { password: '  ', uris: [] },
+      customFields: expect.arrayContaining([expect.objectContaining({ name: 'CSV 源自定义字段',
+        value: expect.stringContaining('fixture-token'), hidden: true })]),
+    });
+    expect(records.find(item => item.data.kind === 'developer')).toMatchObject({ note: 'Preserve me', requireReprompt: true });
+  });
+
+  it('rejects duplicate members, unknown paths, mislabeled CSV and truncated archives', () => {
+    const vault = fresh();
+    const bytes = zip({ 'credentials.csv': credentials });
+    const wrongSize = Buffer.from(bytes);
+    const centralOffset = wrongSize.readUInt32LE(wrongSize.length - 6);
+    wrongSize.writeUInt32LE(credentials.length + 1, centralOffset + 24);
+    for (const bad of [
+      zip([['credentials.csv', credentials], ['credentials.csv', credentials]]),
+      zip({ 'credentials.csv': credentials, '../securenotes.csv': notes }),
+      zip({ 'credentials.csv': notes }),
+      bytes.subarray(0, bytes.length - 9),
+      wrongSize,
+    ]) {
+      expect(() => imported(vault, 'dashlane-zip', bad, '', false)).toThrow();
+    }
+  });
+
+  const fixtureDir = process.env.VAULT_VENDOR_FIXTURE_DIR;
+  if (fixtureDir) it('replays the pinned public five-member Dashlane archive', async () => {
+    const bytes = await readFile(join(fixtureDir, 'dashlane.zip'));
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe('918826152068ee6520c7e429a270379b3e9a92e4ed4062b47f93189546d8e8c0');
+    const vault = fresh();
+    const state = { ...vault, ...imported(vault, 'dashlane-zip', bytes) };
+    expect(state.report).toMatchObject({ ready: 11, invalid: 0, unsupported: 4 });
+    expect(restoredItems(state).map(item => item.data.kind).filter(kind => kind === 'developer')).toHaveLength(3);
+  });
+});
 
 describe('Enpass desktop JSON migration', () => {
   const field = (type: string, value: string, extra = {}) => ({ type, value, label: type, sensitive: 0, deleted: 0, ...extra });

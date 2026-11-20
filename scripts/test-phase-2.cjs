@@ -154,14 +154,14 @@ async function verify(name) {
     await verifyEncryptedEnte(page, send, name);
     await verifyAuditReminders(page, send, name);
     await verifyPasswordFormats(page, send, name);
-    await verifyVendorJson(page, send);
+    await verifyVendorFiles(page, send);
     await page.getByRole('button', { name: '锁定密码库', exact: true }).click();
     await expect(page.getByRole('heading', { name: '解锁密码库' })).toBeVisible();
     await expect(code).toHaveCount(0);
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
       totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true,
-      offlineAuditAndDeveloperExpiry: true, protonPgpAndBitwardenCsv: true, vendorJsonPreviewAndImport: true, errors }));
+      offlineAuditAndDeveloperExpiry: true, protonPgpAndBitwardenCsv: true, vendorJsonPreviewAndImport: true, dashlaneCsvZipPreviewAndImport: true, errors }));
   } finally {
     try { await context?.close(); }
     finally {
@@ -246,7 +246,7 @@ async function verifyPasswordFormats(page, send, browser) {
   assert(saved.some(item => item.title === 'CSV secure note' && item.requireReprompt && item.devSubtype === 'secure_note'));
 }
 
-async function verifyVendorJson(page, send) {
+async function verifyVendorFiles(page, send) {
   const synthetic = ' Vendor-JSON-Synthetic#2026 ';
   const enpass = { uuid: 'fixture-enpass', title: 'Enpass JSON login', template_type: 'login.default', favorite: 1,
     archived: 0, trashed: 0, note: 'Original\nnote', fields: [
@@ -262,17 +262,22 @@ async function verifyVendorJson(page, send) {
     { format: 'enpass', source: { folders: [], items: [enpass] }, title: enpass.title, attributes: { pinned: true, hasTotp: true } },
     { format: 'dashlane-json', source: [dashlane], title: dashlane.title, attributes: { requireReprompt: true } },
     { format: 'lastpass-json', source: [lastpass], title: lastpass.name, attributes: { requireReprompt: true, devSubtype: 'secure_note' } },
+    { format: 'dashlane-zip', filename: 'dashlane-fixture.zip',
+      source: singleEntryZip('securenotes.csv', Buffer.from(`title,note,category\r\nDashlane ZIP note,"${synthetic}",Fixture`)),
+      title: 'Dashlane ZIP note', attributes: { requireReprompt: true, devSubtype: 'secure_note' } },
   ];
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await page.getByRole('button', { name: /^其他密码库与 CXF/ }).click();
   const list = () => send({ type: 'list' });
   const confirm = page.getByRole('button', { name: '确认导入', exact: true });
-  const pick = buffer => page.getByLabel('迁移文件').setInputFiles({ name: 'vendor-fixture.json', mimeType: 'application/json', buffer });
   const preview = page.getByRole('button', { name: '预览迁移内容', exact: true });
-  for (const { format, source, title, attributes } of cases) {
-    const bytes = Buffer.from(JSON.stringify(source)), before = (await list()).length;
+  for (const { format, source, title, attributes, filename = 'vendor-fixture.json' } of cases) {
+    const zipped = format === 'dashlane-zip';
+    const buffer = zipped ? source : Buffer.from(JSON.stringify(source));
+    const pick = () => page.getByLabel('迁移文件').setInputFiles({ name: filename, mimeType: zipped ? 'application/zip' : 'application/json', buffer });
+    const before = (await list()).length;
     await page.getByLabel('来源格式').selectOption(format);
-    await pick(bytes);
+    await pick();
     await preview.click();
     await expect(page.getByRole('heading', { name: '可导入 1 条凭证', exact: true })).toBeVisible();
     await expect(page.getByText(title, { exact: true })).toBeVisible();
@@ -286,7 +291,7 @@ async function verifyVendorJson(page, send) {
     await enterProof(page);
     await expect.poll(async () => (await list()).length).toBe(before + 1);
     const saved = (await list()).find(item => item.title === title);
-    assert(saved, 'Expected authorized vendor JSON import');
+    assert(saved, 'Expected authorized vendor import');
     for (const [key, value] of Object.entries(attributes)) assert.equal(saved[key], value);
     if (format === 'enpass') {
       const detail = await send({ type: 'get', id: saved.id });
@@ -294,7 +299,7 @@ async function verifyVendorJson(page, send) {
       assert.equal(detail.note, 'Original\nnote');
       assert(!('totpUri' in detail.data), 'Ordinary details must not expose the migrated seed');
     }
-    await pick(bytes);
+    await pick();
     await preview.click();
     await expect(page.getByRole('heading', { name: '可导入 0 条凭证', exact: true })).toBeVisible();
     await expect(confirm).toBeDisabled();

@@ -311,7 +311,7 @@
 
 Ente Auth 加密 JSON v1 已实现本机导入；离线体检已提示「高敏登录项未关联验证器」，开发者凭证列表与详情已提醒 30 天内到期及已到期。迁移新增 KeePass XML/CSV、FreeOTP+、WinAuth、Bitwarden CSV、Proton Pass CSV 与指定 PGP ZIP、RoboForm CSV、英文 Kaspersky 打印 TXT，以及限定表头的 1Password CSV；浏览器 CSV 可归一 `origin` 或 `url`。见[候选记录](release-candidate-status.md#当前候选包-010)和[格式边界与夹具](agents/remaining-password-formats.md)。T06 的 Ente Auth、Bitwarden 原生应用往返仍待验收，不以合成样本代签。
 
-架构 §4.2 的子域排除已覆盖内联图标、保存提示和 Passkey 接管。§4.5.1 接入 Enpass 桌面 JSON、Dashlane CLI 密码与安全备注 JSON、LastPass CLI `show --json`。T35 仍按四家原生 CSV 验收。Bitwarden SSH 新增原生 type 5 导入与导出，沿用合成及公开夹具核验，本机以外的来源应用互通待试用。[厂商格式与公开样本](agents/vendor-json-sources.md)
+架构 §4.2 的子域排除已覆盖内联图标、保存提示和 Passkey 接管。§4.5.1 接入 Enpass 桌面 JSON、Dashlane CLI 密码与安全备注 JSON、LastPass CLI `show --json`。T35 增加 Dashlane 原厂明文 CSV ZIP 入口，原厂应用试用待验收。Bitwarden SSH 支持原生 type 5 导入与导出，沿用合成及公开夹具核验。[厂商 JSON](agents/vendor-json-sources.md) · [Dashlane CSV ZIP](agents/vendor-csv-sources.md#dashlane)
 
 下表为尚未确认的兼容边界，不擅自升级成 T36 的发布门槛。
 
@@ -320,4 +320,6 @@ Ente Auth 加密 JSON v1 已实现本机导入；离线体检已提示「高敏�
 | 1Password CSV、其他原厂方言、Opera 实际导出 | T29、T35 | 合成回归不能证明当前各平台、语言和所有导出选项兼容；1Password CSV 目前只覆盖已列出的表头。 |
 | NordPass、RoboForm、Kaspersky 凭证 JSON | 架构 §4.5.1 | 已核对的可移植入口是 NordPass 和 RoboForm CSV、Kaspersky 英文打印 TXT。尚无这三家的独立凭证 JSON 结构证据。 |
 | Kaspersky 非英文打印稿与厂商加密备份 | 架构 §4.5.1 | 已验证的打印样本为英文。Dashlane `.dash` 和 Kaspersky `.edb` 有独立加密封装。 |
+| Chrome 支付卡原厂导出 | 架构 §4.1 | [Chrome 数据可移植结构](https://developers.google.com/data-portability/schema-reference/chrome)列出地址、联系人和通用表单数据，原厂[付款信息管理](https://support.google.com/chrome/answer/16580822)的操作是添加、查看、编辑和删除。未确认包含完整卡号的可移植卡片文件。 |
+| 验证器分组图标 | 架构 §4.5.1，T32、T33 | 映射受支持的分组名称。[2FAS `BackupGroup`](https://github.com/twofas/2fas-android/blob/4ad83b2b94967993db55dd36dcb2e258646eb7b6/data/services/src/main/java/com/twofasapp/data/services/domain/BackupGroup.kt)与[Aegis `VaultGroup`](https://github.com/beemdevelopment/Aegis/blob/d6f4e5925a97e4e91593f1542085eae03432a759/app/src/main/java/com/beemdevelopment/aegis/vault/VaultGroup.java)均无分组图标字段。账号图标和外部图标资源当前不迁移。 |
 | 可选 RS256 | 有实际只支持该算法的 RP 需求时，接 T22 | 独立服务端注册及验签通过；不阻塞计划指定的 ES256、EdDSA。 |

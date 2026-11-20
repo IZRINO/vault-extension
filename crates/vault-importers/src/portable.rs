@@ -266,9 +266,9 @@ fn hash_text(hash: &mut Sha256, text: &str) {
     hash.update(text.len().to_le_bytes());
     hash.update(text.as_bytes());
 }
-fn signature(row: &VaultItem, keepass: bool, vendor_json: bool) -> [u8; 32] {
+fn signature(row: &VaultItem, keepass: bool, strict_vendor: bool) -> [u8; 32] {
     let ssh = matches!(&row.data, CredentialData::Developer(data) if data.subtype == DeveloperCredentialSubtype::SshKey);
-    let include_protection = vendor_json || ssh;
+    let include_protection = strict_vendor || ssh;
     let json = row.to_json_value();
     let data = Zeroizing::new(json.get_field("data").map(|value| value.stringify()).unwrap_or_default());
     let mut hash = Sha256::new();
@@ -297,7 +297,7 @@ struct Sample { title: String, kind: &'static str, account: String }
 
 fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) -> Result<Preview> {
     let keepass = format == "keepass";
-    let vendor_json = matches!(format, "enpass" | "dashlane-json" | "lastpass-json");
+    let strict_vendor = matches!(format, "enpass" | "dashlane-json" | "lastpass-json" | "dashlane-zip");
     let mut report = Preview { invalid: batch.invalid, unsupported: batch.unsupported, ignored_otp: batch.ignored_otp,
         ignored_passkeys: batch.ignored_passkeys, unsupported_passkey_versions: batch.unsupported_passkey_versions, ..Default::default() };
     let mut sources = BTreeMap::new();
@@ -307,7 +307,7 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
     let mut hotp = BTreeSet::new();
     for (index, row) in vault.items.iter().enumerate() {
         if let Some(id) = source_key(row) { sources.insert(id, index); }
-        signatures.insert(signature(row, keepass, vendor_json), index);
+        signatures.insert(signature(row, keepass, strict_vendor), index);
         ids.insert(row.id.clone(), index);
         if let CredentialData::Login(login) = &row.data {
             for key in bundle::read(&login.passkey_data)? { known_keys.insert((key.rp_id.clone(), key.credential_id.clone())); }
@@ -317,7 +317,7 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
     }
     for mut row in batch.records.drain(..) {
         let index = ids.get(&row.id).copied().or_else(|| source_key(&row).and_then(|id| sources.get(&id).copied()))
-            .or_else(|| signatures.get(&signature(&row, keepass, vendor_json)).copied());
+            .or_else(|| signatures.get(&signature(&row, keepass, strict_vendor)).copied());
         let mut incoming = match &row.data {
             CredentialData::Login(login) => bundle::read(&login.passkey_data)?,
             _ => Vec::new(),
@@ -364,9 +364,9 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
         row.id = generate_uuid_v4().map_err(|_| INVALID)?;
         if row.created_at_ms == 0 { row.created_at_ms = now; }
         if row.updated_at_ms == 0 { row.updated_at_ms = now; }
-        if vendor_json && row.trashed && row.trashed_at_ms.is_none() { row.trashed_at_ms = Some(now); }
+        if strict_vendor && row.trashed && row.trashed_at_ms.is_none() { row.trashed_at_ms = Some(now); }
         if let Some(id) = source_key(&row) { sources.insert(id, vault.items.len()); }
-        signatures.insert(signature(&row, keepass, vendor_json), vault.items.len());
+        signatures.insert(signature(&row, keepass, strict_vendor), vault.items.len());
         record_sample(&mut report, &row);
         vault.items.push(row);
     }
@@ -433,6 +433,7 @@ pub fn wasm_portable_import(format: &str, key: Vec<u8>, wrap: Vec<u8>, head: &[u
         "kaspersky" => crate::kaspersky::read(&bytes),
         "enpass" => crate::enpass::read(&bytes, &password),
         "dashlane-json" => crate::vendor_cli::read(&bytes, &password, crate::vendor_cli::Vendor::Dashlane),
+        "dashlane-zip" => crate::vendor_archives::dashlane(&bytes, &password),
         "lastpass-json" => crate::vendor_cli::read(&bytes, &password, crate::vendor_cli::Vendor::LastPass),
         _ => Err(INVALID),
     }.map_err(JsValue::from_str)?;

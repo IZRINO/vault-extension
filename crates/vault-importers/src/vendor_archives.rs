@@ -17,10 +17,11 @@ fn archive(bytes: &[u8]) -> Result<zip::ZipArchive<Cursor<&[u8]>>> {
 }
 fn entry(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     let file = zip.by_name(name).map_err(|_| "压缩包缺少所需文件、已损坏或仍然加密。")?;
-    if !file.is_file() || file.enclosed_name().is_none() || file.size() > limit as u64 { return Err(INVALID); }
+    let declared = file.size();
+    if !file.is_file() || file.enclosed_name().is_none() || declared > limit as u64 { return Err(INVALID); }
     let mut out = Zeroizing::new(Vec::new());
     file.take(limit as u64 + 1).read_to_end(&mut out).map_err(|_| INVALID)?;
-    if out.len() > limit { return Err(INVALID); }
+    if out.len() as u64 != declared { return Err(INVALID); }
     Ok(out)
 }
 fn first<'a>(options: &[&'a str]) -> &'a str { options.iter().copied().find(|s| !s.is_empty()).unwrap_or("") }
@@ -175,18 +176,7 @@ pub(crate) fn onepassword(bytes: &[u8]) -> Result<Batch> {
 fn proton_archive(bytes: &[u8], password: &str) -> Result<(Zeroizing<Vec<u8>>, usize)> {
     const SOURCE: MappingError = "Proton Pass ZIP 必须只包含一份凭证数据（JSON 或 PGP）。";
     let mut zip = archive(bytes)?;
-    // ZipArchive indexes entries by name; count the physical central-directory records
-    // as well, so a duplicate name cannot silently choose one of two payloads.
-    let start = usize::try_from(zip.central_directory_start()).map_err(|_| INVALID)?;
-    let mut directory = bytes.get(start..).ok_or(INVALID)?;
-    for _ in 0..zip.len() {
-        if !directory.starts_with(b"PK\x01\x02") { return Err(SOURCE); }
-        let header = directory.get(..46).ok_or(INVALID)?;
-        let size = 46 + [28, 30, 32].into_iter().map(|i|
-            u16::from_le_bytes([header[i], header[i + 1]]) as usize).sum::<usize>();
-        directory = directory.get(size..).ok_or(INVALID)?;
-    }
-    if directory.starts_with(b"PK\x01\x02") { return Err(SOURCE); }
+    unique_directory(&zip, bytes, SOURCE)?;
     let files = zip.file_names().filter(|name| !name.ends_with('/')).collect::<Vec<_>>();
     let possible = files.iter().copied().filter(|name| !name.starts_with("Proton Pass/files/")).collect::<Vec<_>>();
     let encrypted = possible.iter().copied().filter(|name| matches!(*name, "data.pgp" | "Proton Pass/data.pgp")).collect::<Vec<_>>();
@@ -205,6 +195,119 @@ fn proton_archive(bytes: &[u8], password: &str) -> Result<(Zeroizing<Vec<u8>>, u
     let name = name.to_owned();
     let data = entry(&mut zip, &name, LIMIT)?;
     Ok((if pgp { crate::proton_pgp::decrypt(&data, password)? } else { data }, count))
+}
+
+fn unique_directory(zip: &zip::ZipArchive<Cursor<&[u8]>>, bytes: &[u8], error: MappingError) -> Result<()> {
+    // Compare the physical records with the name index, which coalesces repeats.
+    let start = usize::try_from(zip.central_directory_start()).map_err(|_| INVALID)?;
+    let directory = bytes.get(start..).ok_or(INVALID)?;
+    if central_records(directory, zip.len(), error)?.starts_with(b"PK\x01\x02") { return Err(error); }
+    Ok(())
+}
+
+fn central_records<'a>(mut directory: &'a [u8], count: usize, error: MappingError) -> Result<&'a [u8]> {
+    for _ in 0..count {
+        if !directory.starts_with(b"PK\x01\x02") { return Err(error); }
+        let header = directory.get(..46).ok_or(INVALID)?;
+        let size = 46 + [28, 30, 32].into_iter().map(|index|
+            u16::from_le_bytes([header[index], header[index + 1]]) as usize).sum::<usize>();
+        directory = directory.get(size..).ok_or(INVALID)?;
+    }
+    Ok(directory)
+}
+
+fn dashlane_directory(bytes: &[u8], max_files: usize, error: MappingError) -> Result<()> {
+    // Bound the member count before ZipArchive allocates its index. The native
+    // export uses a single ZIP32 directory, with no need for ZIP64 at these sizes.
+    let tail_start = bytes.len().saturating_sub(22 + usize::from(u16::MAX));
+    let (end, trailer) = bytes[tail_start..].windows(4).enumerate().rev().find_map(|(index, magic)| {
+        if magic != b"PK\x05\x06" { return None; }
+        let end = tail_start + index;
+        let trailer = bytes.get(end..end + 22)?;
+        let comment = u16::from_le_bytes([trailer[20], trailer[21]]);
+        (bytes.len() - end - 22 == usize::from(comment)).then_some((end, trailer))
+    }).ok_or(error)?;
+    let field = |index| u16::from_le_bytes([trailer[index], trailer[index + 1]]);
+    let number = usize::from(field(10));
+    if field(4) != 0 || field(6) != 0 || field(8) != field(10) || !(1..=max_files).contains(&number) {
+        return Err(error);
+    }
+    let dir_size = u32::from_le_bytes(trailer[12..16].try_into().unwrap()) as usize;
+    let dir_start = u32::from_le_bytes(trailer[16..20].try_into().unwrap()) as usize;
+    if dir_start.checked_add(dir_size) != Some(end) { return Err(error); }
+    let directory = bytes.get(dir_start..end).ok_or(error)?;
+    if !central_records(directory, number, error)?.is_empty() { return Err(error); }
+    Ok(())
+}
+
+fn add_dashlane_record(batch: &mut Batch, item: &Value) -> Result<()> {
+    // CSV has no source ID. The source record fingerprint makes repeat imports
+    // idempotent even after the local item is edited or moved to the trash.
+    let source_record = Zeroizing::new(item.to_string());
+    add_record(batch, item, vec![], "dashlane-zip", &source_record)
+}
+
+pub(crate) fn dashlane(bytes: &[u8], password: &str) -> Result<Batch> {
+    const SOURCE: MappingError = "请选择 Dashlane 导出的明文 CSV 压缩包。";
+    const NAMES: &[&str] = &["credentials.csv", "securenotes.csv", "payments.csv", "personalInfo.csv", "ids.csv"];
+    if !password.is_empty() || !bytes.starts_with(b"PK\x03\x04") { return Err(SOURCE); }
+    dashlane_directory(bytes, NAMES.len(), SOURCE)?;
+    let mut zip = archive(bytes)?;
+    unique_directory(&zip, bytes, SOURCE)?;
+    let names: Vec<_> = zip.file_names().collect();
+    if names.iter().any(|name| !NAMES.contains(name)) || !names.iter().any(|name|
+        matches!(*name, "credentials.csv" | "securenotes.csv")) { return Err(SOURCE); }
+    let names: Vec<_> = NAMES.iter().copied().filter(|name| names.contains(name)).collect();
+    let mut batch = Batch::default();
+    let mut count = 0;
+    for name in names {
+        let supported = matches!(name, "credentials.csv" | "securenotes.csv");
+        let bytes = entry(&mut zip, name, crate::MAX_BYTES)?;
+        if bytes.is_empty() && !supported { continue; }
+        let records = crate::migration_csv::records(&bytes)?;
+        let Some((head, rows)) = records.split_first() else {
+            if supported { return Err(SOURCE); }
+            continue;
+        };
+        count += rows.len();
+        if count > portable::MAX_ROWS { return Err(INVALID); }
+        match name {
+            "credentials.csv" => {
+                let value = crate::migration_csv::dashlane_credentials(&records)?;
+                batch.invalid += value.0["invalid"].as_u64().unwrap_or(0) as usize;
+                batch.unsupported += value.0["unsupported"].as_u64().unwrap_or(0) as usize;
+                batch.ignored_otp += value.0["ignoredOtp"].as_u64().unwrap_or(0) as usize;
+                for item in portable::rows(&value.0["rows"])? {
+                    add_dashlane_record(&mut batch, item)?;
+                }
+            }
+            "securenotes.csv" => {
+                let names: Vec<_> = head.iter().map(String::as_str).collect();
+                if !matches!(names.as_slice(), ["title", "note"] | ["title", "note", "category"]) {
+                    return Err("无法识别 Dashlane 安全备注文件表头。");
+                }
+                for row in rows {
+                    if row.len() != names.len() || (row[0].trim().is_empty() && row[1].is_empty()) {
+                        batch.invalid += 1;
+                        continue;
+                    }
+                    let tags: Vec<_> = row.get(2).filter(|value| !value.is_empty()).into_iter().collect();
+                    let title = if row[0].trim().is_empty() { "Dashlane 安全备注" } else { &row[0] };
+                    let item = SecretJson(json!({ "title":title, "note":row[1], "tags":tags,
+                        "requireReprompt":true, "data":{"kind":"developer","subtype":"secure_note"} }));
+                    add_dashlane_record(&mut batch, &item.0)?;
+                }
+            }
+            _ => {
+                for row in rows {
+                    if row.iter().all(String::is_empty) { continue; }
+                    if row.len() == head.len() { batch.unsupported += 1; }
+                    else { batch.invalid += 1; }
+                }
+            }
+        }
+    }
+    Ok(batch)
 }
 
 pub(crate) fn proton_card(content: &Value) -> Value {

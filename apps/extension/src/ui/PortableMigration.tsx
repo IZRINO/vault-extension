@@ -12,6 +12,7 @@ const descriptions = {
   proton: { label: 'Proton Pass', accept: '.json,.zip', password: true },
   kaspersky: { label: 'Kaspersky 打印导出（英文 TXT）', accept: '.txt', password: false },
   enpass: { label: 'Enpass 桌面版明文 JSON', accept: '.json', password: false },
+  'dashlane-zip': { label: 'Dashlane CSV ZIP（登录项和安全备注）', accept: '.zip', password: false },
   'dashlane-json': { label: 'Dashlane CLI 明文 JSON', accept: '.json', password: false },
   'lastpass-json': { label: 'LastPass CLI 明文 JSON', accept: '.json', password: false },
 };
@@ -56,7 +57,7 @@ export default function PortableMigration({ refresh }: { refresh(): Promise<void
       </form>
       {preview && <section className="section">
         <h2>可导入 {preview.ready} 条凭证</h2>
-        <p className="hint">可用通行密钥 {preview.passkeys ?? 0} 枚，重复 {preview.skipped} 条，无效 {preview.invalid} 条，不支持的字段或附件 {preview.unsupported} 项。</p>
+        <p className="hint">可用通行密钥 {preview.passkeys ?? 0} 枚，重复 {preview.skipped} 条，无效 {preview.invalid} 条，暂不支持 {preview.unsupported} 项。</p>
         {!!preview.suspendedPasskeys && <p className="banner banner-warn">{preview.suspendedPasskeys} 枚通行密钥的签名计数待核实，暂不能登录。</p>}
         {!!preview.ignoredOtp && <p className="banner banner-warn">{preview.ignoredOtp} 个验证码设置未导入。</p>}
         {!!preview.ignoredPasskeys && <p className="banner banner-warn">{preview.ignoredPasskeys} 枚通行密钥未导入，原因可能是条目已存在、私钥缺失、无效或格式不兼容。请保留原认证器。</p>}

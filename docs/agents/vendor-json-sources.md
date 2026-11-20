@@ -69,7 +69,7 @@ LastPass `test_show_json` 的 458–471 行是一个可直接解析的单条登�
 
 扩展中从「其他密码库与 CXF」选定这三种来源，按源字段组合校验，不把任意 `name` / `password` 数组当作厂商凭证。UTF-8 可带 BOM；文件最多 16 MiB、每个数组最多 5,000 项、每个对象最多 256 个字段，拒绝重复的 JSON 键，Enpass 也拒绝重复的来源条目 ID。使用按需内存 Worker，预览不写库，文件和库状态变化时必须重新预览；验证通过后原子写入，不覆盖已存在的来源 ID。相同内容去重也核对收藏、二次验证、回收站和保留字段。普通详情和网页填充不会得到内置保留字段或 OTP 种子。
 
-重放独立样本：在临时目录按上表原名准备四份 Enpass `.ts`，LastPass 的 `test/tests` 存为 `lastpass-tests`；设置 `VAULT_VENDOR_FIXTURE_DIR` 指向目录，运行 `node node_modules/vitest/vitest.mjs run apps/extension/src/migration-wasm.test.ts`。默认回归使用本项目合成样本，不访问网络。`.dash`、`.edb`、HTML、CSV 内部 JSON 和应用设置均不作为这三条 JSON 输入。
+重放独立样本时，在临时目录按上表原名准备四份 Enpass `.ts` 和 `dashlane.zip`，LastPass 的 `test/tests` 存为 `lastpass-tests`。设置 `VAULT_VENDOR_FIXTURE_DIR` 指向目录，运行 `node node_modules/vitest/vitest.mjs run apps/extension/src/migration-wasm.test.ts`。默认回归使用本项目合成样本，不访问网络。Dashlane CSV ZIP 另见[原厂 CSV 入口](vendor-csv-sources.md#dashlane)。`.dash`、`.edb`、HTML、CSV 内部 JSON 和应用设置均不作为这三条 JSON 输入。
 
 [dashlane-export]: https://support.dashlane.com/api/v2/help_center/en-us/articles/202625092.json
 [dashlane-csv]: https://support.dashlane.com/api/v2/help_center/en-us/articles/32905278138002.json

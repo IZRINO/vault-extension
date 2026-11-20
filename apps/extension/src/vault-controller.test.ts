@@ -15,7 +15,8 @@ import { endpointFingerprint } from './sync/bootstrap';
 import { webDavConfig } from './sync/webdav';
 import { VaultController } from './vault-controller';
 import { offscreen } from './bridge';
-import type { AuthBackupPreview, BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
+import { zip } from './test-fixtures/zip';
+import type { AuthBackupPreview, BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, MigrationPreview, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
 import type { JournalCommit, LocalSettings, RemoteAnchor, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
@@ -1092,6 +1093,27 @@ describe('phase two migration transactions and autofill reads', () => {
     await expect(controller.handle({ ...message, proof: { method: 'pin', secret: '734928' } })).rejects.toThrow('需要再次验证主密码。');
     expect(state.files).toEqual(before);
     expect(await controller.handle({ ...message, proof })).toBe(1);
+  });
+  it('requires proof to commit a Dashlane ZIP and keeps secure note contents out of preview', async () => {
+    const controller = await unlocked();
+    const title = 'Dashlane archive note', note = '  Synthetic secure note\nsecond line  ';
+    const bytes = Array.from(zip({ 'securenotes.csv': Buffer.from(`title,note\r\n${title},"${note}"\r\n`) }));
+    const previewMessage = { type: 'preview-migration', format: 'dashlane-zip', bytes } as const;
+    const before = structuredClone(state.files);
+    const preview = await controller.handle(previewMessage) as MigrationPreview;
+    expect(preview).toMatchObject({ ready: 1, invalid: 0, sample: [{ title }] });
+    expect(JSON.stringify(preview)).not.toContain('Synthetic secure note');
+    const commit = { ...previewMessage, type: 'import-migration', stamp: preview.stamp } as const;
+    await expect(controller.handle({ ...commit, proof: { method: 'master', secret: 'Wrong test password' } }))
+      .rejects.toThrow('主密码验证失败');
+    expect(state.files).toEqual(before);
+    expect(await controller.handle({ ...commit, proof })).toBe(1);
+    await expect(controller.handle({ ...commit, proof })).rejects.toThrow('重新预览');
+    expect(await controller.handle(previewMessage)).toMatchObject({ ready: 0, skipped: 1 });
+    const [item] = await controller.handle({ type: 'list' }) as ItemSummary[];
+    expect(item).toMatchObject({ title, requireReprompt: true, devSubtype: 'secure_note' });
+    await expect(controller.handle({ type: 'get', id: item!.id })).rejects.toThrow('再次验证');
+    expect(await controller.handle({ type: 'get', id: item!.id, proof })).toMatchObject({ note });
   });
   it('binds preview to source and snapshot and rolls back a failed batch without partial data', async () => {
     const controller = await unlocked();

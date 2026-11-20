@@ -75,9 +75,10 @@ impl Batch {
         self.rows.0.as_array_mut().unwrap().push(std::mem::take(&mut row.0));
     }
 
-    fn result(&self) -> String {
-        let result = SecretJson(json!({ "rows":self.rows.0, "invalid":self.invalid, "unsupported":self.unsupported, "ignoredOtp":self.ignored_otp }));
-        result.0.to_string()
+    fn result(mut self) -> SecretJson {
+        let mut result = SecretJson(json!({ "invalid":self.invalid, "unsupported":self.unsupported, "ignoredOtp":self.ignored_otp }));
+        result.0["rows"] = std::mem::take(&mut self.rows.0);
+        result
     }
 }
 
@@ -276,7 +277,7 @@ fn onepassword(batch: &mut Batch, head: &[String], rows: &[Vec<String>]) {
     }
 }
 
-pub(crate) fn import(vendor: Vendor, head: &[String], rows: &[Vec<String>]) -> String {
+pub(crate) fn import(vendor: Vendor, head: &[String], rows: &[Vec<String>]) -> SecretJson {
     let mut batch = Batch::new();
     match vendor {
         Vendor::Bitwarden => bitwarden(&mut batch, head, rows),

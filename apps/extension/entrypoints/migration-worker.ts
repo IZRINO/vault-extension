@@ -32,7 +32,7 @@ export default defineUnlistedScript(() => {
       // Clear parser scratch buffers (including freed pages) before replying to the parent.
       const format = data.args[0];
       if (memory && ((data.operation === 'portable-import'
-        && (format === 'bitwarden' || format === 'proton' || (VENDOR_JSON_FORMATS as readonly unknown[]).includes(format)))
+        && (format === 'bitwarden' || format === 'proton' || format === 'dashlane-zip' || (VENDOR_JSON_FORMATS as readonly unknown[]).includes(format)))
         || (data.operation === 'portable-export' && format === 'bitwarden'))) {
         new Uint8Array(memory.buffer).fill(0);
       }

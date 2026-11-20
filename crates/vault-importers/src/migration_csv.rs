@@ -4,7 +4,7 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 use crate::bitwarden::{SecretJson, text};
 
-fn records(bytes: &[u8]) -> Result<Zeroizing<Vec<Vec<String>>>, &'static str> {
+pub(crate) fn records(bytes: &[u8]) -> Result<Zeroizing<Vec<Vec<String>>>, &'static str> {
     if bytes.is_empty() || bytes.len() > crate::MAX_BYTES { return Err("CSV 需为不超过 2 MiB 的 UTF-8 文件。"); }
     let data = std::str::from_utf8(bytes).map_err(|_| "CSV 需使用 UTF-8 编码。")?;
     crate::read_csv(data.trim_start_matches('\u{feff}'))
@@ -69,7 +69,7 @@ struct Login<'a> {
 }
 fn login_row(login: Login<'_>, ignored_otp: &mut usize) -> Value {
     let mut fields = SecretJson(json!([]));
-    let uri = if login.otp.is_empty() { Value::Null } else {
+    let uri = SecretJson(if login.otp.is_empty() { Value::Null } else {
         let with_label = login.dashlane.then(|| login.otp.strip_prefix("otpauth://totp/?")).flatten()
             .map(|query| Zeroizing::new(format!("otpauth://totp/Account?{query}")));
         let input = with_label.as_ref().map_or(login.otp, |uri| uri.as_str());
@@ -81,15 +81,21 @@ fn login_row(login: Login<'_>, ignored_otp: &mut usize) -> Value {
                 Value::Null
             }
         }
-    };
+    });
     let title = if login.title.is_empty() { login.urls.first().copied().unwrap_or("") } else { login.title };
     json!({ "id": "", "title": title, "note": login.note, "tags": login.tags,
-        "data": { "kind": "login", "username": login.username, "password": login.password, "totpUri": uri,
+        "data": { "kind": "login", "username": login.username, "password": login.password, "totpUri": uri.0,
             "uris": login.urls.into_iter().map(|uri| json!({"uri": uri})).collect::<Vec<_>>() },
         "customFields": fields.0, "pinned": login.pinned, "requireReprompt": false, "trashed": login.trashed })
 }
 
-fn import_enpass(rows: &[Vec<String>]) -> String {
+fn csv_result(mut rows: SecretJson, invalid: usize, unsupported: usize, ignored_otp: usize) -> SecretJson {
+    let mut result = SecretJson(json!({ "invalid": invalid, "unsupported": unsupported, "ignoredOtp": ignored_otp }));
+    result.0["rows"] = std::mem::take(&mut rows.0);
+    result
+}
+
+fn import_enpass(rows: &[Vec<String>]) -> SecretJson {
     let (mut invalid, mut skipped, mut ignored_otp) = (0, 0, 0);
     let mut output = SecretJson(json!([]));
     for row in rows {
@@ -118,7 +124,7 @@ fn import_enpass(rows: &[Vec<String>]) -> String {
         if row.username.is_empty() { row.username = email; }
         output.0.as_array_mut().unwrap().push(login_row(row, &mut ignored_otp));
     }
-    json!({ "rows": output.0, "invalid": invalid, "unsupported": skipped, "ignoredOtp": ignored_otp }).to_string()
+    csv_result(output, invalid, skipped, ignored_otp)
 }
 
 pub(crate) fn valid_additional_url(raw: &str) -> bool {
@@ -141,6 +147,16 @@ fn add_additional_url<'a>(urls: &mut Vec<&'a str>, value: Option<&'a str>, unsup
 
 fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
     let records = records(bytes)?;
+    Ok(import_rows(&records, mapping, false)?.0.to_string())
+}
+
+pub(crate) fn dashlane_credentials(records: &[Vec<String>]) -> Result<SecretJson, &'static str> {
+    let header = records.first().ok_or("Dashlane 登录文件没有表头。")?;
+    let (_, mapping) = detect(header).filter(|(vendor, _)| *vendor == "Dashlane").ok_or("无法识别 Dashlane 登录文件表头。")?;
+    import_rows(records, &json!(mapping).to_string(), true)
+}
+
+fn import_rows(records: &[Vec<String>], mapping: &str, allow_incomplete_dashlane_rows: bool) -> Result<SecretJson, &'static str> {
     let (head, rows) = records.split_first().ok_or("CSV 没有表头。")?;
     let mapping: Value = serde_json::from_str(mapping).map_err(|_| "字段映射无效。")?;
     if !mapping.is_object() { return Err("字段映射无效。"); }
@@ -148,15 +164,17 @@ fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
         if mapping.as_object().is_some_and(|fields| !fields.is_empty()) { return Err("此导出格式不接受手工字段映射。"); }
         return Ok(crate::typed_csv::import(vendor, head, rows));
     }
-    if enpass(&records) {
+    if enpass(records) {
         if mapping.as_object().is_some_and(|fields| !fields.is_empty()) { return Err("Enpass 导出使用记录内的字段名，不接受表头映射。"); }
-        return Ok(import_enpass(&records));
+        return Ok(import_enpass(records));
     }
     let vendor = detect(head).filter(|(_, expected)| json!(expected) == mapping).map(|(vendor, _)| vendor);
     let column = |name: &str| head.iter().position(|column| column.trim().eq_ignore_ascii_case(name));
     let type_index = vendor.filter(|v| *v == "NordPass").and_then(|_| column("type"));
     let additional = vendor.filter(|v| *v == "NordPass").and_then(|_| column("additional_urls"));
     let favorite = vendor.filter(|v| *v == "LastPass").and_then(|_| column("fav"));
+    let dashlane = vendor == Some("Dashlane");
+    let aliases = ["username2", "username3"].into_iter().filter_map(|name| Some((name, column(name)?))).collect::<Vec<_>>();
     let mut used = Vec::new();
     for (key, index) in mapping.as_object().unwrap() {
         if !["title", "url", "username", "password", "note", "totp", "tags", "trashed"].contains(&key.as_str()) { return Err("字段映射无效。"); }
@@ -173,14 +191,22 @@ fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
             unsupported += 1;
             continue;
         }
-        if get("password").is_empty() || get("url").trim().is_empty() { invalid += 1; continue; }
+        let source_url = get("url");
+        let url = source_url.trim();
+        let blocked_url = dashlane && !url.is_empty() && !valid_additional_url(url);
+        if !(dashlane && allow_incomplete_dashlane_rows) && (get("password").is_empty() || url.is_empty()) { invalid += 1; continue; }
+        if dashlane && ["title", "username", "password", "note", "totp", "url"].iter().all(|key| get(key).is_empty())
+            && aliases.iter().all(|(_, index)| row[*index].is_empty()) {
+            invalid += 1;
+            continue;
+        }
         let tags = if get("tags").is_empty() { Vec::new() } else if vendor.is_some() { vec![get("tags").into()] } else {
             serde_json::from_str::<Vec<String>>(get("tags")).unwrap_or_else(|_| get("tags").split(';').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
         };
         let extra = additional.map_or("", |index| row[index].trim());
         let is_array = extra.starts_with('[');
         let array = SecretJson(if is_array { serde_json::from_str::<Value>(extra).unwrap_or(Value::Null) } else { Value::Null });
-        let mut urls = vec![get("url").trim()];
+        let mut urls: Vec<_> = (!url.is_empty() && !blocked_url).then_some(url).into_iter().collect();
         if is_array {
             match array.0.as_array() {
                 Some(entries) => {
@@ -192,12 +218,28 @@ fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
             // A bare URL may contain commas and nested URLs. Only the JSON form denotes a list.
             add_additional_url(&mut urls, Some(extra), &mut unsupported);
         }
-        output.0.as_array_mut().unwrap().push(login_row(Login { title: get("title").trim(), username: get("username"),
+        let title = get("title").trim();
+        let title = if dashlane && title.is_empty() { "Dashlane 登录项" } else { title };
+        let mut mapped = SecretJson(login_row(Login { title, username: get("username"),
             password: get("password"), note: get("note"), otp: get("totp"), urls, tags,
             pinned: favorite.is_some_and(|i| row[i] == "1"), trashed: ["true","1","yes"].contains(&get("trashed")),
-            dashlane: vendor == Some("Dashlane") }, &mut ignored_otp));
+            dashlane }, &mut ignored_otp));
+        if dashlane {
+            let mut source_fields: BTreeMap<_, _> = aliases.iter().filter_map(|&(name, index)| {
+                let value = row[index].as_str();
+                (!value.is_empty()).then_some((name, value))
+            }).collect();
+            if blocked_url || source_url != url { source_fields.insert("url", source_url); }
+            if blocked_url { unsupported += 1; }
+            if !source_fields.is_empty() {
+                let mut field = json!({"name":"CSV 源自定义字段", "hidden":true});
+                field["value"] = Value::String(serde_json::to_string(&source_fields).unwrap());
+                mapped.0["customFields"].as_array_mut().unwrap().push(field);
+            }
+        }
+        output.0.as_array_mut().unwrap().push(std::mem::take(&mut mapped.0));
     }
-    Ok(json!({ "rows": output.0, "invalid": invalid, "unsupported": unsupported, "ignoredOtp": ignored_otp }).to_string())
+    Ok(csv_result(output, invalid, unsupported, ignored_otp))
 }
 fn cell(value: &str) -> String { format!("\"{}\"", value.replace('"', "\"\"")) }
 fn export(items: &str) -> Result<String, &'static str> {
