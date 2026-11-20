@@ -53,7 +53,10 @@ export default function PortableMigration({ refresh }: { refresh(): Promise<void
         <p className="hint">可用通行密钥 {preview.passkeys ?? 0} 枚，重复 {preview.skipped} 条，无效 {preview.invalid} 条，不支持的字段或附件 {preview.unsupported} 项。</p>
         {!!preview.suspendedPasskeys && <p className="banner banner-warn">{preview.suspendedPasskeys} 枚通行密钥的签名计数待核实，暂不能登录。</p>}
         {!!preview.ignoredOtp && <p className="banner banner-warn">{preview.ignoredOtp} 个验证码设置未导入。</p>}
-        {!!preview.ignoredPasskeys && <p className="banner banner-warn">{preview.ignoredPasskeys} 枚通行密钥未导入：源文件没有有效或可导出的私钥，或使用了不支持的扩展。请保留原认证器。</p>}
+        {!!preview.ignoredPasskeys && <p className="banner banner-warn">{preview.ignoredPasskeys} 枚通行密钥未导入，原因可能是私钥缺失、无效或格式不兼容。请保留原认证器。</p>}
+        {!!preview.unsupportedPasskeyVersions && <p className="banner banner-warn">其中 {preview.unsupportedPasskeyVersions} 枚使用了暂不支持的 Proton Pass 通行密钥载荷版本。</p>}
+        {format === 'onepassword' && preview.ready > 0 && !preview.passkeys && !preview.suspendedPasskeys && !preview.ignoredPasskeys &&
+          <p className="hint">本次没有新增通行密钥。1Password 桌面版的常规 1PUX 导出会把通行密钥留在原库。</p>}
         <ul className="facts">{preview.sample.map((row, index) => <li key={index} className="fact"><div className="fact-text">
           <span className="fact-value">{row.title}</span><span className="fact-label">{row.account || kinds[row.kind] || row.kind}</span>
         </div></li>)}</ul>

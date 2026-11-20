@@ -1,0 +1,22 @@
+# 第三方登录 CSV 的格式依据
+
+2026-11-20 核对 #35 的四种登录 CSV。样本依据来自公开的厂商文档、导出器源码和 Bitwarden 测试，代码对照基于本地提交 `a6df58e`。 [工单 #35](https://github.com/IZRINO/vault-extension/issues/35) · [本项目 CSV 解析器](../../crates/vault-importers/src/migration_csv.rs)
+
+## Dashlane
+
+- 官方扩展源码把登录项写入 ZIP 中的 `credentials.csv`，表头是 `username,username2,username3,title,password,note,url,category,otpUrl`。转义会在逗号、双引号和换行处加引号并将内容里的双引号加倍。官方帮助还记载 `otpSecret` 列，值是登录项的 2FA 设置密钥，并确认登录备注保留全文，Passkey 无法通过 CSV 迁移。基线可识别这两种独立的 OTP 列。 [官方 Web 扩展生成器](https://github.com/Dashlane/dashlane-web-extension/blob/d8c341a3468da504c699a3cdf1c4d7d200cda9cd/packages/carbon/src/DataManagement/Export/Services/get-credentials-export.ts#L19-L43) · [CSV 转义源码](https://github.com/Dashlane/dashlane-web-extension/blob/d8c341a3468da504c699a3cdf1c4d7d200cda9cd/packages/carbon/src/DataManagement/Export/Services/handle-special-character.ts#L1-L12) · [ZIP 文件名源码](https://github.com/Dashlane/dashlane-web-extension/blob/d8c341a3468da504c699a3cdf1c4d7d200cda9cd/packages/carbon/src/DataManagement/Export/Services/get-csv-export.ts#L7-L13) · [官方导出帮助正文](https://support.dashlane.com/api/v2/help_center/en-us/articles/32905278138002.json)
+- 公开生成器会把旧密钥写成 `otpauth://totp/?secret=…&algorithm=SHA1&digits=6&period=30&lock=false`。基线的 OTP 解析器拒绝没有标签的 URI，因此这个值会被计入 `ignoredOtp`。基线样本在 `otpUrl` 列填的是裸密钥，没有覆盖公开生成器的这一分支。合成向量可按生成器构造空标签 URI，并按官方帮助覆盖裸密钥 `otpSecret`。 [官方生成器的回退逻辑](https://github.com/Dashlane/dashlane-web-extension/blob/d8c341a3468da504c699a3cdf1c4d7d200cda9cd/packages/carbon/src/DataManagement/Export/Services/get-credentials-export.ts#L39-L43) · [本项目 OTP 解析器](../../crates/vault-otp/src/lib.rs#L124-L143)
+
+## NordPass
+
+- 官方帮助确认桌面端和 Web Vault 导出 CSV，登录项能存多个网址。Bitwarden 的合成原生格式样本包含 `url`、`additional_urls` 及 `type=password`，其中 `additional_urls` 解开 CSV 转义后是 JSON 字符串数组，例如 `["https://example.net"]`。基线按逗号拆分该列，会把 JSON 的括号和双引号写入 URI，也会截断网址自身含有的逗号。基线样本使用单个未编码的附加网址，且没有断言导入后的附加网址。 [NordPass 官方导出步骤](https://support.nordpass.com/api/v2/help_center/en-us/articles/360007646477.json) · [NordPass 多网址说明](https://support.nordpass.com/api/v2/help_center/en-us/articles/17641836763281.json) · [Bitwarden 合成向量](https://github.com/bitwarden/clients/blob/a69127380b4b745f6a203fd6da18344dcc03d61a/libs/importer/src/importers/spec-data/nordpass-csv/nordpass.login-with-additinal-urls.csv.ts) · [Bitwarden 的 JSON 数组读取](https://github.com/bitwarden/clients/blob/a69127380b4b745f6a203fd6da18344dcc03d61a/libs/importer/src/importers/nordpass-csv-importer.ts#L79-L93)
+- 官方给出的表格导入模板含 `totp` 和 `shared_folder`。该模板说明 NordPass 接受的导入字段。附加网址的导出编码来自上面的独立实现，NordPass 原生导出提供哪些 OTP 列留待日常试用确认。 [NordPass 表格导入帮助](https://support.nordpass.com/api/v2/help_center/en-us/articles/360002377217.json) · [官方导入模板](https://support.nordpass.com/hc/article_attachments/45737738178193)
+
+## Enpass
+
+- Enpass 社区记录了原生 CSV 没有表头的反馈，官方管理员将增加表头转成了功能请求。官方帮助提供的预格式化 CSV 用于向 Enpass 导入。关于原生导出行的细节，Bitwarden 的样本和实现展示了标题、交替的字段名与值、可选的末尾备注。`*Password`、重复的 `Website` 和 `One-time code` 也有独立样本，基线覆盖这些字段。 [Enpass 论坛反馈及管理员答复](https://discussion.enpass.io/topic/31459-enpass-csv-export-column-titles/?do=findComment&comment=91011) · [Enpass 表格导入帮助](https://help.enpass.io/personal/latest/all/import-from-a-csv-file) · [Bitwarden Enpass 合成向量](https://github.com/bitwarden/clients/tree/a69127380b4b745f6a203fd6da18344dcc03d61a/libs/importer/src/importers/spec-data/enpass-csv) · [Bitwarden 行结构读取](https://github.com/bitwarden/clients/blob/a69127380b4b745f6a203fd6da18344dcc03d61a/libs/importer/src/importers/enpass/enpass-csv-importer.ts#L24-L38)
+- Bitwarden 也识别字段名 `totp`。基线只把 `One-time code` 映射为 OTP，`totp` 是否由 Enpass 正式导出留待日常试用确认。 [Bitwarden 的 OTP 字段别名](https://github.com/bitwarden/clients/blob/a69127380b4b745f6a203fd6da18344dcc03d61a/libs/importer/src/importers/enpass/enpass-csv-importer.ts#L89-L99)
+
+## LastPass
+
+- 官方 CLI 导出器及其合成测试确认默认表头为 `url,username,password,extra,name,grouping,fav`，`extra` 是条目备注。基线已识别七列。Bitwarden 另有插入 `totp` 的合成测试，基线也覆盖这一兼容布局。LastPass 浏览器导出的 `totp` 列及版本范围留待日常试用确认。 [LastPass CLI 导出字段](https://github.com/lastpass/lastpass-cli/blob/949bad64e9db1bed89606cba78f32f6708cef3f0/cmd-export.c#L110-L136) · [LastPass CLI 官方合成测试](https://github.com/lastpass/lastpass-cli/blob/949bad64e9db1bed89606cba78f32f6708cef3f0/test/tests#L521-L540) · [Bitwarden 的 LastPass OTP 测试](https://github.com/bitwarden/clients/blob/a69127380b4b745f6a203fd6da18344dcc03d61a/libs/importer/src/importers/lastpass/lastpass-csv-importer.spec.ts#L236-L253)

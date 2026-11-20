@@ -27,7 +27,8 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
   const dialogs = useDialogs();
   const csv = format === 'csv';
   const limit = csv ? MAX_BROWSER_CSV_BYTES : MAX_MIGRATION_BYTES;
-  const [mode, setMode] = useState<'import' | 'export'>('import');
+  const [mode, setMode] = useState<'import' | 'retained' | 'export'>('import');
+  const retained = mode === 'retained';
   const [file, setFile] = useState<File>();
   const [filePassword, setFilePassword] = useState('');
   const [headers, setHeaders] = useState<string[]>();
@@ -43,6 +44,12 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
   const [target, setTarget] = useState<keyof CsvMapping>();
   const stopDrag = () => { dragged.current = undefined; setTarget(undefined); };
   const clear = () => { stopDrag(); setFile(undefined); setPreview(undefined); setHeaders(undefined); setVendor(undefined); setMapping({}); setFilePassword(''); if (input.current) input.current.value = ''; };
+  const switchMode = (next: typeof mode) => {
+    if (next === mode) return;
+    clear();
+    setRisk(false);
+    setMode(next);
+  };
   const assign = (key: keyof CsvMapping, index?: number) => {
     setMapping(old => { const next = { ...old }; if (index == null) delete next[key]; else next[key] = index; return next; });
     setPreview(undefined);
@@ -54,10 +61,17 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
 
   return <>
     <div className="chips" role="group" aria-label="密码迁移操作">
-      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => { setMode('import'); setRisk(false); }}>导入凭证</button>
-      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => { clear(); setMode('export'); }}>导出凭证</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'import'} onClick={() => switchMode('import')}>导入凭证</button>
+      <button type="button" className="chip" disabled={busy} aria-pressed={mode === 'export'} onClick={() => switchMode('export')}>导出凭证</button>
+      {format === 'bitwarden' && <button type="button" className="chip" disabled={busy} aria-pressed={retained} onClick={() => switchMode('retained')}>启用已保留的通行密钥</button>}
     </div>
-    {mode === 'import' ? <>
+    {mode !== 'export' ? <>
+      {retained ? <div className="form">
+        <p className="lede">检查旧版 Vault 从 Bitwarden 导入时保留的通行密钥。确认后启用有可用私钥的凭证，无需原文件。</p>
+        {!preview && <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void work(async () => {
+          setPreview(await request<MigrationPreview>({ type: 'preview-migration', format: 'bitwarden-retained', bytes: [] }));
+        })}>检查已有凭证</button>}
+      </div> : <>
       <p className="lede">{csv ? '选择 UTF-8 CSV，为每个字段指定源列。预览后再导入，已有凭证不会被覆盖。' : '从 Bitwarden 或 Vaultwarden 导出的 JSON 导入登录项、验证码、支付卡、身份和安全备注。已有凭证不会被覆盖。'}</p>
       {!csv && <p className="hint">支持密码保护或未加密的 JSON。账号绑定导出需要重新导出；不含受支持私钥的通行密钥不会启用。</p>}
       <form className="form" onSubmit={event => {
@@ -122,10 +136,12 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
         </fieldset>}
         {!preview && <button className="btn btn-primary" disabled={busy || !file || !canPreview}>{csv && !headers ? '读取列名' : '预览迁移内容'}</button>}
       </form>
+      </>}
       {preview && <section className="section">
-        <h2>可导入 {preview.ready} 条凭证</h2>
+        <h2>可{retained ? '更新' : '导入'} {preview.ready} 条凭证</h2>
         <p className="hint">重复跳过 {preview.skipped} 条，无法读取 {preview.invalid} 条，不支持的类型 {preview.unsupported} 条。</p>
         {!csv && (preview.passkeys ?? 0) > 0 && <p className="hint">可启用 {preview.passkeys} 个通行密钥。</p>}
+        {!csv && !!preview.suspendedPasskeys && <p className="banner banner-warn">有 {preview.suspendedPasskeys} 枚通行密钥的签名计数待核实，暂不能登录。</p>}
         {!csv && (preview.ignoredPasskeys ?? 0) > 0 && <p className="banner banner-warn">有 {preview.ignoredPasskeys} 个通行密钥缺少可用私钥或使用了不支持的算法。</p>}
         {preview.ignoredOtp > 0 && <p className="banner banner-warn">有 {preview.ignoredOtp} 个验证码设置未启用，原值已保留为隐藏字段。请继续保留原验证器并检查这些记录。</p>}
         {preview.unsupported > 0 && <p className="banner banner-warn">请保留原密码库，检查未导入的条目。此向导暂不导入独立 SSH 类型或附件内容。</p>}
@@ -134,14 +150,16 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
         </div></li>)}</ul>
         <div className="actions">
           <button type="button" className="btn btn-primary" disabled={busy || !preview.ready || !canPreview} onClick={() => void work(async () => {
-            if (!file || !canPreview) return;
+            if ((!retained && !file) || !canPreview) return;
             const proof = await dialogs.proof();
             try {
-              const count = await withFile(file, limit, bytes => request<number>({ type: 'import-migration', format, bytes, password: filePassword, mapping, stamp: preview.stamp, proof }));
-              clear(); await refresh(); notify(`已导入 ${count} 条凭证。`);
+              const commit = (bytes: number[]) => request<number>({ type: 'import-migration',
+                format: retained ? 'bitwarden-retained' : format, bytes, password: filePassword, mapping, stamp: preview.stamp, proof });
+              const count = retained ? await commit([]) : await withFile(file!, limit, commit);
+              clear(); await refresh(); notify(`已${retained ? '更新' : '导入'} ${count} 条凭证。`);
             } catch (error) { if (error instanceof Error && error.message.includes('重新预览')) setPreview(undefined); throw error; }
             finally { proof.secret = ''; }
-          })}>确认导入 {preview.ready} 条</button>
+          })}>确认{retained ? '更新' : '导入'} {preview.ready} 条</button>
           <button type="button" className="btn" disabled={busy} onClick={() => setPreview(undefined)}>返回预览设置</button>
         </div>
       </section>}

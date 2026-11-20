@@ -13,7 +13,7 @@ import { endpointFingerprint } from './sync/bootstrap';
 import { webDavConfig } from './sync/webdav';
 import { VaultController } from './vault-controller';
 import { offscreen } from './bridge';
-import type { BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
+import type { AuthBackupPreview, BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
 import type { JournalCommit, LocalSettings, RemoteAnchor, SessionState, VaultFiles } from './vault-storage';
 
 const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, session: undefined as SessionState | undefined,
@@ -606,6 +606,8 @@ describe('real WASM + background session integration', () => {
       { type: 'export-migration', format: 'csv', confirmPlaintext: true },
       { type: 'export-migration', format: 'bitwarden', confirmPlaintext: true },
       { type: 'export-migration', format: 'bitwarden', encrypted: true, password: filePassword, confirmPlaintext: false },
+      { type: 'export-migration', format: 'cxf', confirmPlaintext: true },
+      { type: 'export-migration', format: 'cxf', encrypted: true, password: filePassword, confirmPlaintext: false },
       { type: 'export-ente', confirmPlaintext: true },
     ] as const;
     for (const message of requests) {
@@ -614,6 +616,7 @@ describe('real WASM + background session integration', () => {
       await expect(controller.handle({ ...message, proof: { method: 'master', secret: filePassword } })).rejects.toThrow('主密码验证失败');
       expect(await controller.handle({ ...message, proof })).toBeTruthy();
     }
+    await expect(controller.handle({ type: 'export-migration', format: 'cxf', proof, confirmPlaintext: false })).rejects.toThrow('风险');
     await expect(controller.handle({ type: 'get', id: saved!.id, proof: pin })).resolves.toMatchObject({ title: item.title });
     expect(state.files!.changesSinceBackup).toBe(1);
   });
@@ -983,6 +986,21 @@ describe('phase two migration transactions and autofill reads', () => {
     expect(JSON.stringify(custom)).not.toContain('sourceId');
     expect(await controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com', kind: 'username', fields, groups: [], proof }))
       .toEqual({ values: { username: 'fixture' } });
+  });
+  it('does not partially import a complete Google QR batch with a damaged record', async () => {
+    const controller = await unlocked();
+    const otp = Buffer.from([0x20, 1, 0x28, 1, 0x30, 2]);
+    const valid = Buffer.concat([Buffer.from([0x0a, 20]), Buffer.alloc(20, 0x31), otp]);
+    const part = Buffer.concat([Buffer.from([0x0a, valid.length]), valid,
+      Buffer.from([0x0a, otp.length]), otp, Buffer.from([0x10, 1, 0x18, 1])]);
+    const bytes = Array.from(Buffer.from('otpauth-migration://offline?data=' + encodeURIComponent(part.toString('base64'))));
+    const before = structuredClone(state.files);
+    const preview = await controller.handle({ type: 'preview-auth-backup', format: 'google', bytes }) as AuthBackupPreview;
+    expect(preview).toMatchObject({ ready: 1, invalid: 1, missingParts: 0 });
+    await expect(controller.handle({ type: 'import-auth-backup', format: 'google', bytes, stamp: preview.stamp, proof })).rejects.toThrow('有损坏的条目');
+    expect(state.files).toEqual(before);
+    expect(state.pendingWal).toHaveLength(0);
+    await expect(controller.handle({ type: 'list' })).resolves.toEqual([]);
   });
   it('requires a master proof and explicit plaintext consent for full-vault migration exports', async () => {
     const controller = await unlocked();

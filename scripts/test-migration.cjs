@@ -4,7 +4,7 @@ const fs = require('node:fs/promises'), http = require('node:http'), path = requ
 const { createHmac, createCipheriv, createDecipheriv, createHash, pbkdf2Sync, argon2Sync, randomBytes, timingSafeEqual } = require('node:crypto');
 const QR = require('qrcode');
 const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
-const root = path.resolve(__dirname, '..'), output = path.join(root, 'test-results');
+const root = path.resolve(__dirname, '..'), output = path.resolve(root, process.env.VAULT_MIGRATION_RESULTS || 'test-results');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const firstColor = process.env.VAULT_QR_FIRST || 'light';
 const nativeQr = process.env.VAULT_QR_NATIVE === '1';
@@ -59,8 +59,8 @@ async function proof(page) {
 async function verifyGoogleImages(page, send, reply) {
   const seed = Buffer.from('12345678901234567890');
   const field = (tag, body) => Buffer.concat([Buffer.from([tag << 3 | 2, body.length]), body]);
-  const part = (index, kind, batch = 24) => {
-    const payload = Buffer.concat([field(1, seed), field(2, Buffer.from(`Batch fixture:google-${index}`)),
+  const part = (index, kind, batch = 24, secret = seed) => {
+    const payload = Buffer.concat([field(1, secret), field(2, Buffer.from(`Batch fixture:google-${index}`)),
       field(3, Buffer.from('Batch fixture')), Buffer.from([0x20, 1, 0x28, 1, 0x30, kind, 0x38, 7])]);
     const encoded = Buffer.concat([field(1, payload), Buffer.from([0x10, 1, 0x18, 2, 0x20, index, 0x28, batch])]);
     return 'otpauth-migration://offline?data=' + encodeURIComponent(encoded.toString('base64'));
@@ -88,10 +88,30 @@ async function verifyGoogleImages(page, send, reply) {
   await page.reload();
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await page.getByRole('button', { name: /^导入其他验证器/ }).click();
-  await page.getByLabel('迁移二维码图片', { exact: true }).setInputFiles(images.map((data, index) => ({
+  const input = page.getByLabel('迁移二维码图片', { exact: true });
+  const previewButton = page.getByRole('button', { name: '预览迁移内容', exact: true });
+  const links = page.getByLabel('或粘贴迁移 URI（每行一个）', { exact: true });
+  await links.fill([part(0, 2), part(1, 1, 24, Buffer.alloc(0))].join('\n'));
+  await previewButton.click();
+  await expect(page.getByRole('heading', { name: '二维码批次损坏', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '确认导入', exact: true })).toBeDisabled();
+  assert.deepEqual(await ids(), original);
+  await input.setInputFiles(images.map((data, index) => ({
     name: `batch-synthetic-${index}.png`, mimeType: 'image/png', buffer: Buffer.from(data.split(',')[1], 'base64'),
   })));
-  await page.getByRole('button', { name: '预览迁移内容', exact: true }).click();
+  await expect(previewButton).toBeEnabled();
+  await input.setInputFiles([]);
+  await expect(previewButton).toBeDisabled();
+  await page.getByRole('group', { name: '拖入迁移二维码', exact: true }).evaluate((target, images) => {
+    const files = new DataTransfer();
+    images.forEach((encoded, index) => {
+      const bytes = Uint8Array.from(atob(encoded.split(',')[1]), char => char.charCodeAt(0));
+      files.items.add(new File([bytes], `dropped-synthetic-${index}.png`, { type: 'image/png' }));
+    });
+    target.dispatchEvent(new DragEvent('drop', { dataTransfer: files, bubbles: true, cancelable: true }));
+  }, images);
+  await expect(page.getByText('已选择 3 张图片。', { exact: true })).toBeVisible();
+  await previewButton.click();
   await expect(page.getByRole('heading', { name: '可导入 2 个验证码', exact: true })).toBeVisible();
   await expect(page.getByText('忽略重复图片 1 张。', { exact: false })).toBeVisible();
   const confirm = page.getByRole('button', { name: '确认导入', exact: true });
@@ -287,6 +307,13 @@ async function run(name, server) {
     const rows = JSON.parse(plain.text).items;
     assert.equal(rows.find(row => row.type === 1).login.fido2Credentials[0].credentialId, 'preserved-fixture');
     assert.equal(rows.find(row => row.type === 4).identity.address2, 'Two');
+    await page.getByRole('button', { name: '启用已保留的通行密钥', exact: true }).click();
+    await expect(page.getByLabel('Bitwarden JSON 文件', { exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: '检查已有凭证', exact: true }).click();
+    await expect(page.getByRole('heading', { name: '可更新 0 条凭证', exact: true })).toBeVisible();
+    await expect(page.getByText('有 1 个通行密钥缺少可用私钥或使用了不支持的算法。', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: '确认更新 0 条', exact: true })).toBeDisabled();
+    assert.deepEqual(await send({ type: 'list' }), summaries);
     await page.getByRole('button', { name: '返回设置', exact: true }).click();
     await page.getByRole('button', { name: /^CSV 字段映射与导出/ }).click();
     const csv = Buffer.from('称呼,站点,账号,口令,备注\r\nMapped fixture,https://mapped.example,alice," p,""q","two\r\nlines"\r\n');
@@ -401,6 +428,7 @@ async function run(name, server) {
     const encrypted2fasFixture = await verifyEncrypted2fas(send, reply);
     assert.deepEqual(errors, []);
     const result = { browser: name, version: context.browser().version(), portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,
+      retainedPasskeyPreview: true, googleMultiImageDrop: true,
       fourTypesAndPreservedFields: true, csvMappingAndExport: true, screenshotQr: true, invertedQr: true, qrFirstColor: firstColor,
       first, following, popup, switchedTabInvalidated: true, canceledScanAndChoice: true, noSaveUntilConfirmed: true,
       noActiveTabRejected: true, canvasOverrideIgnored: true, googleBatchImages: true, encrypted2fasFixture, errors };

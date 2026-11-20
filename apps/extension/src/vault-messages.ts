@@ -17,6 +17,7 @@ export interface MigrationPreview {
   passkeys?: number;
   suspendedPasskeys?: number;
   ignoredPasskeys?: number;
+  unsupportedPasskeyVersions?: number;
 }
 export type AuthBackupPreview = MigrationPreview & { missingParts: number; repeatedParts: number };
 export interface MigrationExport { text: string; count: number; skipped: number; skippedPasskeys?: number }

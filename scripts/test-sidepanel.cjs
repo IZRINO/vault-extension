@@ -254,6 +254,18 @@ async function run(name) {
     };
     console.log(JSON.stringify(result));
     return result;
+  } catch (error) {
+    if (panel) {
+      const state = await panel.evaluate(() => ({
+        focused: document.hasFocus(),
+        header: document.querySelector('.view h1')?.textContent,
+        dialog: document.querySelector('dialog[open] h2')?.textContent,
+        alert: document.querySelector('[role="alert"]')?.textContent,
+        titleFieldPresent: [...document.querySelectorAll('input')].some(input => input.labels?.[0]?.textContent?.trim() === '名称'),
+      })).catch(() => ({ unavailable: true }));
+      console.error(JSON.stringify({ browser: name, panelState: state, panelErrors: panel.errors }));
+    }
+    throw error;
   } finally {
     await panel?.detach();
     await context?.close();

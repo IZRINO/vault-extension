@@ -10,6 +10,7 @@ mod cxf;
 mod keepass_kdbx;
 mod portable;
 mod protected_jwe;
+mod proton_passkey;
 mod vendor_archives;
 
 const MAX_BYTES: usize = 2 * 1024 * 1024;

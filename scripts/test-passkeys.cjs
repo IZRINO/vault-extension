@@ -1,13 +1,15 @@
 const { chromium, expect } = require('@playwright/test');
 const assert = require('node:assert/strict');
-const { createHash, createPublicKey, randomBytes, verify } = require('node:crypto');
+const { createHash, createPublicKey, generateKeyPairSync, randomBytes, randomUUID, verify } = require('node:crypto');
 const { createServer } = require('node:http');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 const { webdavFixture } = require('./webdav-fixture.cjs');
 const { makeKeepassxcFixture } = require('./test-kdbx.cjs');
+const { makeProtonFixture } = require('./proton-pass-fixture.cjs');
 
 const extension = path.resolve(process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
 const browsers = {
@@ -611,6 +613,119 @@ async function runHistoryRecovery() {
   }
 }
 
+async function runProtonMigration(directory) {
+  const site = await fixture();
+  try {
+    const source = await makeProtonFixture(directory, site.origin);
+    for (const browser of ['edge', 'helium']) {
+      const target = await open(browser);
+      try {
+        const input = { format: 'proton', bytes: [...source.bytes], password: '' };
+        for (const [index, bytes] of source.archives.entries()) {
+          const preview = await target.send({ type: 'preview-migration', ...input, bytes: [...bytes] });
+          assert.deepEqual([preview.ready, preview.passkeys, preview.ignoredPasskeys], [index ? 9 : 4, 1, 0]);
+        }
+        const preview = await target.send({ type: 'preview-migration', ...input });
+        assert.deepEqual([preview.ready, preview.passkeys, preview.ignoredPasskeys], [2, 2, 0]);
+        assert.deepEqual(await target.send({ type: 'list' }), []);
+        const proof = { method: 'master', secret: target.password };
+        assert.equal(await target.send({ type: 'import-migration', ...input, proof, stamp: preview.stamp }), 2);
+        for (const credential of source.credentials) {
+          const page = await site.page(target, true);
+          try { await sign(target, page, credential, false, 0x0d, 0, site.consumeChallenge(page.url())); }
+          finally { await page.close(); }
+        }
+        const duplicate = await target.send({ type: 'preview-migration', ...input });
+        assert.deepEqual([duplicate.ready, duplicate.skipped], [0, 2]);
+        console.log(JSON.stringify({ browser, protonArchives: source.archives.length, rpAssertionsVerified: source.credentials.length,
+          nativeGenerator: 'Proton Pass WASM 2.3.4', duplicates: duplicate.skipped, flags: 'UP, UV, BE; no BS' }));
+      } finally { await target.close(); }
+    }
+  } finally { await site.done(); }
+}
+
+async function runRetainedBitwardenMigration() {
+  const site = await fixture();
+  const key = randomBytes(32);
+  let backup;
+  try {
+    const load = async name => {
+      const dir = path.resolve(__dirname, `../crates/${name}/pkg`);
+      const stem = name.replaceAll('-', '_');
+      const wasm = await import(pathToFileURL(path.join(dir, `${stem}.js`)).href);
+      await wasm.default({ module_or_path: await fs.readFile(path.join(dir, `${stem}_bg.wasm`)) });
+      return wasm;
+    };
+    const [core, parser] = await Promise.all([load('vault-core'), load('vault-importers')]);
+    const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const id = randomBytes(32).toString('base64url');
+    const password = 'Legacy-Login-Fixture#2026';
+    const source = { type: 1, id: randomUUID(), name: 'Retained Bitwarden fixture',
+      login: { username: 'old-account', password, uris: [{ uri: site.origin }],
+        totp: 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', fido2Credentials: [{
+          credentialId: id, rpId: 'localhost', userHandle: Buffer.from('old-account').toString('base64url'),
+          userName: 'old-account', keyType: 'public-key', keyAlgorithm: 'ECDSA', discoverable: 'true', counter: '0',
+          keyValue: privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64url'),
+        }] } };
+    const now = Date.now();
+    const { rows } = JSON.parse(parser.wasm_parse_bitwarden(Buffer.from(JSON.stringify({ encrypted: false, items: [source] })), ''));
+    const legacy = core.wasm_create_new_vault(sourceMaster, 32768, 2, 4, key, now);
+    const engine = new core.WasmVaultEngine();
+    try {
+      engine.restore_from_session(key, legacy.session_wrap_bytes, legacy.head_bytes, legacy.snap_bytes);
+      const stored = engine.import_records_json(JSON.stringify({ prepared: true, rows }), now, true);
+      try { backup = core.wasm_export_vaultpack(key, legacy.session_wrap_bytes, stored.head_bytes, stored.snap_bytes, filePassword, now); }
+      finally { stored.free(); }
+    } finally { engine.free(); legacy.free(); }
+
+    for (const browser of ['edge', 'helium']) {
+      const target = await open(browser);
+      try {
+        const proof = { method: 'master', secret: target.password };
+        const input = { bytes: [...backup], password: filePassword, proof };
+        const preview = await target.send({ type: 'preview-vaultpack', ...input });
+        assert.equal(await target.send({ type: 'import', ...input, stamp: preview.stamp }), 1);
+        const [item] = await target.send({ type: 'list' });
+        const detail = () => target.send({ type: 'get-edit', id: item.id });
+        const before = await detail();
+        assert.equal(before.data.password, password);
+        assert(before.data.totpUri);
+
+        const view = target.view;
+        // The fixture creates the vault through the background while this tab still shows setup.
+        await view.reload();
+        await view.bringToFront();
+        await view.getByRole('button', { name: '设置', exact: true }).click();
+        await view.getByRole('button', { name: /^Bitwarden 密码库迁移/ }).click();
+        await view.getByRole('button', { name: '启用已保留的通行密钥', exact: true }).click();
+        const check = view.getByRole('button', { name: '检查已有凭证', exact: true });
+        const confirm = view.getByRole('button', { name: '确认更新 1 条', exact: true });
+        const dialog = view.getByRole('dialog', { name: '再次验证身份' });
+        await check.click();
+        await expect(view.getByRole('heading', { name: '可更新 1 条凭证', exact: true })).toBeVisible();
+        await confirm.click();
+        await dialog.getByRole('button', { name: '取消', exact: true }).click();
+        assert.deepEqual(await detail(), before);
+        await confirm.click();
+        await dialog.getByLabel('主密码', { exact: true }).fill(target.password);
+        await dialog.getByRole('button', { name: '验证', exact: true }).click();
+        await expect(view.getByText('已更新 1 条凭证。', { exact: true })).toBeVisible();
+        const after = await detail();
+        assert.equal(after.id, before.id);
+        assert.equal(after.data.password, before.data.password);
+        assert.equal(after.data.totpUri, before.data.totpUri);
+        await check.click();
+        await expect(view.getByRole('heading', { name: '可更新 0 条凭证', exact: true })).toBeVisible();
+
+        const page = await site.page(target, true);
+        await sign(target, page, { alg: -7, id, publicKey }, false, 0x0d, 0, site.consumeChallenge(page.url()));
+        console.log(JSON.stringify({ browser, legacyPackRestored: true, activationFromSettings: true, cancelKeptLegacyItem: true,
+          originalLoginAndOtpPreserved: true, repeatedActivationZero: true, rpAssertionsVerified: 1 }));
+      } finally { await target.close(); }
+    }
+  } finally { backup?.fill(0); key.fill(0); await site.done(); }
+}
+
 async function run() {
   const site = await fixture();
   const dav = await webdavFixture();
@@ -714,6 +829,9 @@ async function run() {
   }
 }
 const regress = async () => {
+  const proton = process.argv.indexOf('--proton-only');
+  if (proton >= 0) return runProtonMigration(process.argv[proton + 1]);
+  if (process.argv.includes('--retained-bitwarden-only')) return runRetainedBitwardenMigration();
   if (!process.argv.includes('--history-only')) await run();
   await runHistoryRecovery();
 };

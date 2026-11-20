@@ -1,9 +1,11 @@
-import { createCipheriv, createHash, createHmac, generateKeyPairSync, pbkdf2Sync, scryptSync, verify } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { createCipheriv, createHash, createHmac, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, scryptSync, sign, verify, type KeyObject } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { crc32 } from 'node:zlib';
 import { beforeAll, describe, expect, it } from 'vitest';
-import initCore, { wasm_create_new_vault, wasm_unlock_head_with_password } from '../../../crates/vault-core/pkg/vault_core.js';
-import initImport, { wasm_parse_authenticator_backup, wasm_portable_export, wasm_portable_import } from '../../../crates/vault-importers/pkg/vault_importers.js';
+import initCore, { WasmVaultEngine, wasm_create_new_vault, wasm_unlock_head_with_password } from '../../../crates/vault-core/pkg/vault_core.js';
+import initImport, { wasm_csv_headers, wasm_parse_authenticator_backup, wasm_parse_bitwarden, wasm_parse_mapped_csv, wasm_portable_export, wasm_portable_import } from '../../../crates/vault-importers/pkg/vault_importers.js';
 import initOtp, { wasm_otp_at } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import initKeys, { wasm_passkey_candidates, wasm_passkey_perform } from '../../../crates/vault-passkeys/pkg/vault_passkeys.js';
 
@@ -26,10 +28,10 @@ beforeAll(async () => {
   ]);
 });
 
-function independentCode(hash: string, moving: number, digits: number) {
+function independentCode(hash: string, moving: number, digits: number, secret = seed) {
   const counter = Buffer.alloc(8);
   counter.writeBigUInt64BE(BigInt(moving));
-  const mac = createHmac(hash, seed).update(counter).digest();
+  const mac = createHmac(hash, secret).update(counter).digest();
   return String((mac.readUInt32BE(mac.at(-1)! & 15) & 0x7fffffff) % 10 ** digits).padStart(digits, '0');
 }
 function aesSeal(key: Buffer, nonce: Buffer, body: Buffer) {
@@ -82,6 +84,49 @@ function zip(files: Record<string, Buffer>) {
 }
 const parseAuth = (format: string, bytes: Uint8Array, password = '') => JSON.parse(wasm_parse_authenticator_backup(format, bytes, password));
 const codeAt = (row: { data: { totpUri: string } }) => JSON.parse(wasm_otp_at(row.data.totpUri, now, 0)).value;
+
+it('preserves NordPass additional URLs encoded as a JSON array inside a CSV cell', () => {
+  const header = 'name,url,additional_urls,username,password,note,folder,cardholdername,cardnumber,type';
+  const sites = ['https://example.com/', 'HTTPS://login.example.com/a,b', 'https://example.org/?q=x,y'];
+  const cell = (value: string) => `"${value.replaceAll('"', '""')}"`;
+  const row = (title: string, extra: string) => [title, sites[0]!, extra, 'fixture-user', ' p,"w', 'Line 1\r\nLine 2', 'Fixture', '', '', 'password'].map(cell).join(',');
+  const ambiguousList = 'https://one.example.net/, https://two.example.net/';
+  const redirect = 'https://login.example.net/continue?next=https://one.example.net/,https://two.example.net/';
+  const source = Buffer.from('\uFEFF' + [
+    header,
+    row('Mixed array', str([...sites.slice(1), 'https://example.net:bad/', 'https://user:pass@example.net/'])),
+    row('Malformed array', '["https://example.net"'),
+    row('Ambiguous list', ambiguousList),
+    row('Redirect with comma and embedded URLs', redirect),
+    row('Single URL with comma', sites[2]!),
+  ].join('\r\n'));
+  const report = JSON.parse(wasm_csv_headers(source));
+  expect(report.vendor).toBe('NordPass');
+  const parsed = JSON.parse(wasm_parse_mapped_csv(source, str(report.mapping)));
+  expect(parsed).toMatchObject({ unsupported: 4, invalid: 0, rows: [
+    { note: 'Line 1\r\nLine 2', data: { password: ' p,"w', uris: sites.map(uri => ({ uri })) } },
+    { data: { uris: [{ uri: sites[0] }] } },
+    { data: { uris: [{ uri: sites[0] }] } },
+    { data: { uris: [sites[0], redirect].map(uri => ({ uri })) } },
+    { data: { uris: [sites[0], sites[2]].map(uri => ({ uri })) } },
+  ] });
+  expect(parsed.rows.map((item: { data: { uris: unknown[] } }) => item.data.uris.length)).toEqual([3, 1, 1, 2, 2]);
+});
+
+it('restores the legacy Dashlane TOTP URL emitted without a label', () => {
+  const invalid = 'otpauth://totp/?secret=BAD&algorithm=SHA1&digits=6&period=30&lock=false';
+  const bytes = Buffer.from('username,username2,username3,title,password,note,url,category,otpUrl\r\n' +
+    `fixture-user,,,Fixture,example-password,"first\r\nsecond",https://example.com,Work,otpauth://totp/?secret=${base32.toLowerCase()}&algorithm=SHA1&digits=6&period=30&lock=false\r\n` +
+    `bad-fixture,,,Bad OTP,example-password,,https://example.net,Work,${invalid}`);
+  const report = JSON.parse(wasm_csv_headers(bytes));
+  expect(report.vendor).toBe('Dashlane');
+  const parsed = JSON.parse(wasm_parse_mapped_csv(bytes, str(report.mapping)));
+  expect(parsed).toMatchObject({ ignoredOtp: 1, invalid: 0, rows: [
+    { note: 'first\r\nsecond' },
+    { data: { totpUri: null }, customFields: [{ hidden: true, value: invalid }] },
+  ] });
+  expect(codeAt(parsed.rows[0])).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+});
 
 describe('authenticator migration with independently generated fixtures', () => {
   it('reassembles Google exports before activation and validates HOTP and TOTP', () => {
@@ -210,6 +255,55 @@ const proton = zip({ 'data.json': bin({ version: '1.21.2', encrypted: false, use
       passkeys: [{ ...ck.fields, privateKey: ck.pair.privateKey.export({ type: 'pkcs8', format: 'pem' }) }] },
   },
 }] } } }) });
+function protonExport(version: string, item: Record<string, unknown>) {
+  return { version, vaults: { 'fixture-vault': { name: 'Fixture Vault', items: [item] } } };
+}
+function protonLogin(content: Record<string, unknown>, contentFormatVersion?: number) {
+  return { itemId: 'fixture-item', contentFormatVersion, state: 1, createTime: now, modifyTime: now,
+    data: { type: 'login', metadata: { name: 'Proton format fixture', note: 'Synthetic note' }, content } };
+}
+type PackingValue = string | number | null | PackingValue[] | { [name: string]: PackingValue };
+// Only the MessagePack types needed to reproduce Proton's named fields and Vec<u8> arrays.
+function packFixture(value: PackingValue): Buffer {
+  if (value === null) return Buffer.of(0xc0);
+  if (typeof value === 'number') {
+    if (value >= -32 && value < 128) return Buffer.of(value & 255);
+    if (value >= 128 && value <= 255) return Buffer.of(0xcc, value);
+    throw new Error('Unexpected numeric fixture field');
+  }
+  if (typeof value === 'string') {
+    const text = Buffer.from(value);
+    return Buffer.concat([text.length < 32 ? Buffer.of(0xa0 | text.length) : Buffer.of(0xd9, text.length), text]);
+  }
+  if (Array.isArray(value)) {
+    const header = value.length < 16 ? Buffer.of(0x90 | value.length) : Buffer.of(0xdc, value.length >>> 8, value.length & 255);
+    return Buffer.concat([header, ...value.map(packFixture)]);
+  }
+  const fields = Object.entries(value);
+  return Buffer.concat([Buffer.of(0x80 | fields.length), ...fields.flatMap(([name, field]) => [packFixture(name), packFixture(field)])]);
+}
+function protonNativeKey(fixture: typeof ck, options: { envelopeVersion?: number; counter?: number; badPublic?: boolean } = {}) {
+  const jwk = fixture.pair.privateKey.export({ format: 'jwk' });
+  const assigns = (v: string) => ({ t: 'assign', c: v });
+  const pair = (label: number, value: PackingValue) => [{ t: 'int', c: label }, value];
+  const bytes = (v: Uint8Array) => ({ t: 'bytes', c: [...v] });
+  const curve = Buffer.alloc(16);
+  curve[0] = jwk.kty === 'EC' ? 1 : 6;
+  const x = dec(jwk.x!);
+  if (options.badPublic) x[0] = x[0]! ^ 1;
+  const inner = packFixture({
+    key: { kty: assigns(jwk.kty === 'EC' ? 'EC2' : 'OKP'), kid: [], alg: assigns(jwk.kty === 'EC' ? 'ES256' : 'EdDSA'),
+      kops: [assigns('Sign')], biv: [], par: [
+        pair(-1, { t: 'int', c: { inner: [...curve] } }), pair(-2, bytes(x)),
+        ...(jwk.y ? [pair(-3, bytes(dec(jwk.y)))] : []), pair(-4, bytes(dec(jwk.d!))),
+      ] },
+    cid: [...dec(fixture.fields.credentialId)], rid: rpId, uhd: [...dec(fixture.fields.userHandle)],
+    cnt: options.counter ?? null, ext: { hmac_secret: null }, un: fixture.fields.username, udn: 'Synthetic fixture',
+  });
+  return { ...fixture.fields, userName: fixture.fields.username,
+    credentialId: b64(dec(fixture.fields.credentialId)), userHandle: b64(dec(fixture.fields.userHandle)),
+    content: b64(packFixture({ c: [...inner], v: options.envelopeVersion ?? 1 })) };
+}
 
 function fresh() {
   const key = crypto.getRandomValues(new Uint8Array(32));
@@ -224,7 +318,60 @@ function imported(v: ReturnType<typeof fresh>, format: string, bytes: Uint8Array
   try { return { report: JSON.parse(result.report), count: result.count, head: result.head, snap: result.snap }; }
   finally { result.free(); }
 }
-function checkSignature(v: ReturnType<typeof fresh>, key: typeof ck, discoverable: boolean) {
+function restoredItems(v: ReturnType<typeof fresh>) {
+  const engine = new WasmVaultEngine();
+  try {
+    engine.restore_from_session(v.key, v.wrap, v.head, v.snap);
+    const summaries: { id: string }[] = JSON.parse(engine.list_summaries_json());
+    return summaries.map(summary => JSON.parse(engine.get_item_json(summary.id, true)));
+  } finally { engine.lock_and_zeroize(); engine.free(); }
+}
+function restoredItem(v: ReturnType<typeof fresh>) {
+  return restoredItems(v)[0];
+}
+
+type OnePuxField = { id: string; value: Record<string, unknown> };
+type OnePuxSourceItem = {
+  categoryUuid: string;
+  overview: { title: string; url?: string };
+  details: { notesPlain: string; loginFields?: { designation: string; value: string }[]; sections?: { fields?: OnePuxField[] }[] };
+};
+
+async function readPublishedFixture(file: string, gitBlob: string) {
+  const bytes = await readFile(file);
+  const blob = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+  expect(blob).toBe(gitBlob);
+  return bytes;
+}
+
+async function sanitizedOnePux(file: string) {
+  const ts = (await import('typescript')).default;
+  const bytes = await readPublishedFixture(file, 'bf1e87c9c1d8e61223873c83e5dd9a997f603ffb');
+  const source = ts.createSourceFile('sanitized-export.ts', bytes.toString('utf8'), ts.ScriptTarget.Latest, true);
+  function literal(node: import('typescript').Node): unknown {
+    if (ts.isObjectLiteralExpression(node)) return Object.fromEntries(node.properties.map(prop => {
+      if (!ts.isPropertyAssignment(prop) || !(ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) || ts.isNumericLiteral(prop.name))) {
+        throw new Error('Expected a literal fixture property');
+      }
+      return [prop.name.text, literal(prop.initializer)];
+    }));
+    if (ts.isArrayLiteralExpression(node)) return node.elements.map(literal);
+    if (ts.isStringLiteralLike(node)) return node.text;
+    if (ts.isNumericLiteral(node)) return Number(node.text);
+    if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(node.operand)) {
+      return -Number(node.operand.text);
+    }
+    if (node.kind === ts.SyntaxKind.NullKeyword) return null;
+    if (node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword) return node.kind === ts.SyntaxKind.TrueKeyword;
+    throw new Error('Expected a literal fixture value');
+  }
+  const value = source.statements.flatMap(node => ts.isVariableStatement(node) ? [...node.declarationList.declarations] : [])
+    .find(node => node.name.getText() === 'SanitizedExport')?.initializer;
+  if (!value) throw new Error('Expected the public SanitizedExport fixture');
+  return literal(value) as { accounts: { vaults: { items: OnePuxSourceItem[] }[] }[] };
+}
+type VerifyingKey = { fields: { credentialId: string; userHandle: string }; pair: { publicKey: KeyObject }; verifyAlgorithm: string | null };
+function checkSignature(v: ReturnType<typeof fresh>, key: VerifyingKey, discoverable: boolean) {
   const challenge = url64(Buffer.alloc(32, 77));
   const request = str({ kind: 'assert', origin, rpId, challenge, credentialIds: discoverable ? [] : [key.fields.credentialId], uv: 'required' });
   const candidates: { id: string; itemId: string }[] = JSON.parse(wasm_passkey_candidates(v.key, v.wrap, v.head, v.snap, request));
@@ -244,6 +391,226 @@ function checkSignature(v: ReturnType<typeof fresh>, key: typeof ck, discoverabl
 }
 
 describe('portable import writes sealed credentials that can sign', () => {
+  it('preserves the 1PUX software registration code in the license field', () => {
+    const bytes = zip({ 'export.attributes': bin({ version: 3 }), 'export.data': bin({ accounts: [{
+      attrs: { uuid: 'fixture-account' }, vaults: [{ attrs: { uuid: 'fixture-vault', name: 'Fixture' }, items: [{
+        uuid: 'fixture-license', categoryUuid: '100', overview: { title: 'Fixture software' },
+        details: { notesPlain: 'Synthetic note', sections: [{ fields: [
+          { id: 'reg_code', title: 'license key', value: { string: 'SYNTHETIC-LICENSE' } },
+        ] }] },
+      }] }],
+    }] }) });
+    const vault = fresh(), saved = imported(vault, 'onepassword', bytes);
+    expect(saved.count).toBe(1);
+    expect(restoredItem({ ...vault, ...saved })).toMatchObject({ note: 'Synthetic note',
+      data: { kind: 'developer', subtype: 'license_key', serviceOrProduct: 'Fixture software', tokenOrLicense: 'SYNTHETIC-LICENSE' },
+    });
+  });
+
+  it('preserves 1PUX API credential expiry and exports its standalone note without API details', () => {
+    const bytes = zip({ 'export.attributes': bin({ version: 3 }), 'export.data': bin({ accounts: [{
+      vaults: [{ items: [{
+        uuid: 'fixture-api', categoryUuid: '112', overview: { title: 'Fixture API' },
+        details: { notesPlain: 'API notes', sections: [{ fields: [
+          { id: 'credential', title: 'credential', value: { concealed: 'SYNTHETIC-TOKEN' } },
+          { id: 'expires', title: 'expiry date', value: { date: now } },
+        ] }] },
+      }, {
+        uuid: 'fixture-note', categoryUuid: '003', overview: { title: 'Fixture note' },
+        details: { notesPlain: 'Synthetic standalone 1PUX note' },
+      }] }],
+    }] }) });
+    const vault = fresh(), saved = imported(vault, 'onepassword', bytes);
+    expect(saved.count).toBe(2);
+    expect(restoredItems({ ...vault, ...saved }).find(item => item.title === 'Fixture API')).toMatchObject({
+      data: { subtype: 'api_token', tokenOrLicense: 'SYNTHETIC-TOKEN', expiresAtMs: now * 1000 },
+    });
+    const cxf = JSON.parse(wasm_portable_export('cxf', vault.key, vault.wrap, saved.head, saved.snap, '', now * 1000));
+    expect(cxf).toMatchObject({ count: 1, skipped: 1 });
+    expect(JSON.parse(cxf.text).accounts[0].items).toMatchObject([{ title: 'Fixture note',
+      credentials: [{ type: 'note', content: { value: 'Synthetic standalone 1PUX note' } }] }]);
+    expect(cxf.text).not.toContain('SYNTHETIC-TOKEN');
+  });
+
+  const onePuxFixture = process.env.VAULT_ONEPUX_FIXTURE;
+  if (onePuxFixture) it('replays an unmodified public 1PUX export payload with the supported types and no invented Passkeys', async () => {
+    const source = await sanitizedOnePux(onePuxFixture);
+    const items = source.accounts.flatMap(account => account.vaults.flatMap(vault => vault.items));
+    const fields = (item: OnePuxSourceItem) => (item.details.sections ?? []).flatMap(section => section.fields ?? []);
+    const get = (item: OnePuxSourceItem, id: string, type: string) => fields(item).find(field => field.id === id)?.value[type];
+    const bytes = zip({ 'export.attributes': bin({ version: 3 }), 'export.data': bin(source),
+      'files/synthetic-attachment.txt': Buffer.from('Synthetic unsupported attachment') });
+    const vault = fresh(), preview = imported(vault, 'onepassword', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 17, unsupported: 12, invalid: 0, passkeys: 0, ignoredPasskeys: 0, ignoredOtp: 1 });
+    expect(preview.head).toHaveLength(0);
+    expect(preview.snap).toHaveLength(0);
+    expect(() => imported(vault, 'onepassword', bytes.subarray(0, -50))).toThrow();
+    const saved = imported(vault, 'onepassword', bytes);
+    const restored = { ...vault, ...saved };
+    const byTitle = new Map(restoredItems(restored).map(row => [row.title, row]));
+    expect(saved.count).toBe(preview.report.ready);
+    const check = (category: string, kind: string, data: (item: OnePuxSourceItem) => unknown) => {
+      const item = items.find(item => item.categoryUuid === category)!;
+      expect(byTitle.get(item.overview.title)).toMatchObject({ note: item.details.notesPlain, data: { kind, ...data(item) as object } });
+    };
+    const login = items.find(item => item.categoryUuid === '001' && fields(item).some(field => field.value.totp))!;
+    const row = byTitle.get(login.overview.title);
+    expect(row).toMatchObject({ note: login.details.notesPlain, data: {
+      username: login.details.loginFields!.find(field => field.designation === 'username')!.value,
+      password: login.details.loginFields!.find(field => field.designation === 'password')!.value,
+      // The upstream sanitized payload replaces its only seed with a 10-character placeholder.
+      totpUri: null,
+    } });
+    check('002', 'payment_card', item => ({ cardNumber: get(item, 'ccnum', 'creditCardNumber'), cvv: get(item, 'cvv', 'concealed') }));
+    check('004', 'identity', item => ({ company: get(item, 'company', 'string'),
+      addressLine: (get(item, 'address', 'address') as { street: string }).street }));
+    check('112', 'developer', item => ({ subtype: 'api_token', tokenOrLicense: get(item, 'credential', 'concealed'),
+      expiresAtMs: Number(get(item, 'expires', 'date')) * 1000 }));
+    check('100', 'developer', item => ({ subtype: 'license_key', tokenOrLicense: get(item, 'reg_code', 'string') }));
+    expect(imported(restored, 'onepassword', bytes).count).toBe(0);
+  });
+
+  it('reads official Proton ZIP and JSON exports without treating the application version as a schema version', () => {
+    const common = { password: 'synthetic-password', urls: [origin], totpUri: base32 };
+    const current = protonExport('5.0.0.99', protonLogin({ ...common, itemUsername: 'modern-account' }, 8));
+    const legacy = protonExport('1.17.4-rc3', protonLogin({ ...common, username: 'legacy-account' }));
+    const vault = fresh();
+    for (const [bytes, username] of [
+      [zip({ 'Proton Pass/data.json': bin(current) }), 'modern-account'],
+      [bin(legacy), 'legacy-account'],
+    ] as const) {
+      const preview = imported(vault, 'proton', bytes, '', false);
+      expect(preview.snap).toHaveLength(0);
+      expect(preview.report.sample[0].account).toBe(username);
+      const saved = imported(vault, 'proton', bytes);
+      const row = restoredItem({ ...vault, ...saved });
+      expect(row).toMatchObject({ note: 'Synthetic note', data: { username, password: common.password } });
+      expect(codeAt(row)).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+      expect(imported({ ...vault, ...saved }, 'proton', bytes).count).toBe(0);
+    }
+    expect(() => imported(vault, 'proton', zip({ 'Proton Pass/data.pgp': Buffer.from('Synthetic unsupported wrapper') }))).toThrow(/PGP/);
+    expect(() => imported(vault, 'proton', bin({ ...current, version: 'unknown' }))).toThrow(/版本/);
+  });
+
+  it('rejects unknown Proton item content versions and malformed items without committing a partial import', () => {
+    const vault = fresh();
+    const good = protonLogin({ password: 'synthetic-password', itemUsername: 'fixture-account' }, 8);
+    for (const entry of [
+      { item: { ...good, contentFormatVersion: 255 }, reason: /版本/ },
+      { item: { ...good, data: { ...good.data, content: null } }, reason: /无效/ },
+      { item: protonLogin({ password: 'synthetic-password', passkeys: { content: 'invalid' } }, 8), reason: /通行密钥列表/ },
+    ]) {
+      const exportData = protonExport('5.0.0.99', good);
+      exportData.vaults['fixture-vault'].items.push(entry.item);
+      expect(() => imported(vault, 'proton', bin(exportData))).toThrow(entry.reason);
+      expect(restoredItems(vault)).toHaveLength(0);
+    }
+  });
+
+  it('imports native Proton signing keys and validates ES256 and Ed25519 against independent public keys', () => {
+    const input = (passkeys: unknown[]) => bin(protonExport('1.44.0', protonLogin({ itemUsername: 'fixture-account',
+      password: 'synthetic-password', urls: [origin], passkeys }, 8)));
+    const vault = fresh(), bytes = input([protonNativeKey(ck), protonNativeKey(ek)]);
+    const preview = imported(vault, 'proton', bytes, '', false);
+    expect(preview.report).toMatchObject({ passkeys: 2, ignoredPasskeys: 0 });
+    expect(preview.snap).toHaveLength(0);
+    const result = imported(vault, 'proton', zip({ 'Proton Pass/data.json': bytes }));
+    expect(result.count).toBe(1);
+    const restored = { ...vault, ...result };
+    for (const fixture of [ck, ek]) checkSignature(restored, fixture, true);
+    expect(imported(restored, 'proton', bytes).count).toBe(0);
+    const bad = input([
+      { ...protonNativeKey(ck), rpId: 'different.example.org' },
+      protonNativeKey(ck, { badPublic: true }),
+      protonNativeKey(ek, { envelopeVersion: 2 }),
+      { ...protonNativeKey(ek), content: b64(Buffer.concat([Buffer.from(protonNativeKey(ek).content, 'base64'), Buffer.of(0)])) },
+      protonNativeKey(ek, { counter: 7 }),
+    ]);
+    expect(imported(vault, 'proton', bad, '', false).report)
+      .toMatchObject({ passkeys: 0, ignoredPasskeys: 4, suspendedPasskeys: 1, unsupportedPasskeyVersions: 1 });
+  });
+
+  const protonFixture = process.env.VAULT_PROTON_FIXTURE;
+  if (protonFixture) it.each([
+    ['protonpass_1.17.zip', '8a0a84ca4d44bfa9bd8a06012def901dd2a3a79599d1c74785fbc324fe1f8db3', 4],
+    ['protonpass.zip', 'f2efd4718384790c6851f9c80671b9c79b6d2156d8e14b700bb4f76e4919f21d', 9],
+  ] as const)('restores passwords and notes from the unmodified Proton archive %s', async (name, digest, count) => {
+    const path = join(protonFixture, name), bytes = await readFile(path);
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe(digest);
+    const source = JSON.parse(execFileSync('tar', ['-xOf', path, 'Proton Pass/data.json'], { encoding: 'utf8', windowsHide: true }));
+    const vault = fresh(), preview = imported(vault, 'proton', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: count, passkeys: 1, ignoredPasskeys: 0, ignoredOtp: 1 });
+    expect(preview.snap).toHaveLength(0);
+    const saved = imported(vault, 'proton', bytes);
+    const rows = restoredItems({ ...vault, ...saved });
+    expect(saved.count).toBe(count);
+    for (const value of Object.values(source.vaults) as { items: { data: {
+      type: string; content: Record<string, string>; metadata: { name: string; note: string };
+    } }[] }[]) {
+      for (const { data } of value.items) {
+        if (data.type !== 'login') continue;
+        const { content } = data;
+        const row = rows.find(row => row.title === data.metadata.name);
+        expect(row).toMatchObject({ note: data.metadata.note, data: {
+          username: content.itemUsername || content.itemEmail || content.username || '', password: content.password, totpUri: null,
+        } });
+      }
+    }
+    expect(imported({ ...vault, ...saved }, 'proton', bytes).count).toBe(0);
+  });
+
+  const cxfSource = process.env.VAULT_CXF_FIXTURE;
+  const cxfReceiver = process.env.VAULT_CXF_RECEIVER;
+  if (cxfSource && cxfReceiver) it.each([
+    ['login_passkey_totp_scope.json', 'a0f9812f7b3efa76fcd56ec626475664a7221af5', 1, 0],
+    ['full_library_baseline.json', 'aa2966742368ae6b2ba4cb5a838a4611f515ac74', 2, 11],
+  ] as const)('imports independent CXF %s and verifies what the Bitwarden CXF reader receives', async (name, digest, passkeys, unsupported) => {
+    const bytes = await readPublishedFixture(join(cxfSource, name), digest);
+    type Credential = { type: string } & Record<string, any>;
+    type Item = { title: string; credentials: Credential[] };
+    const allItems = (document: { accounts: { items: Item[] }[] }) => document.accounts.flatMap(account => account.items);
+    const input = allItems(JSON.parse(bytes.toString('utf8')));
+    const inputCredentials = input.flatMap(item => item.credentials);
+    const original = inputCredentials.filter(cred => cred.type === 'passkey');
+    const { secret, algorithm, period, digits } = inputCredentials.find(cred => cred.type === 'totp')!;
+    const bits = Array.from(secret as string, char => {
+      const index = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(char.toUpperCase());
+      expect(index).toBeGreaterThanOrEqual(0);
+      return index.toString(2).padStart(5, '0');
+    }).join('');
+    const otpSeed = Buffer.from((bits.match(/.{8}/g) ?? []).map(byte => Number.parseInt(byte, 2)));
+    const originalVerifier = (cred: Credential) => createPublicKey(createPrivateKey({ key: dec(cred.key), format: 'der', type: 'pkcs8' }));
+    const vault = fresh();
+    const preview = imported(vault, 'cxf', bytes, '', false);
+    expect(preview.report).toMatchObject({ passkeys, unsupported, ignoredOtp: 0, ignoredPasskeys: 0 });
+    expect(preview.snap).toHaveLength(0);
+    const saved = imported(vault, 'cxf', bytes), restored = { ...vault, ...saved };
+    for (const cred of original) {
+      expect(cred.rpId).toBe(rpId);
+      checkSignature(restored, { fields: { credentialId: cred.credentialId, userHandle: cred.userHandle },
+        pair: { publicKey: originalVerifier(cred) }, verifyAlgorithm: 'sha256' }, true);
+    }
+    const login = restoredItems(restored).find(row => row.data.kind === 'login');
+    const password = inputCredentials.find(cred => cred.type === 'basic-auth')!;
+    expect(login.data).toMatchObject({ username: password.username.value, password: password.password.value });
+    expect(codeAt(login)).toBe(independentCode(algorithm, Math.floor(now / period), digits, otpSeed));
+    const exported = JSON.parse(wasm_portable_export('cxf', vault.key, vault.wrap, saved.head, saved.snap, '', now * 1000));
+    const received = JSON.parse(execFileSync(cxfReceiver, [], { input: exported.text, encoding: 'utf8', windowsHide: true }));
+    const delivered = allItems(received).flatMap(item => item.credentials);
+    expect(delivered.find(cred => cred.type === 'basic-auth')).toMatchObject({ username: password.username, password: password.password });
+    expect(delivered.find(cred => cred.type === 'totp')).toMatchObject({ secret, algorithm, period, digits });
+    expect(delivered.filter(cred => cred.type === 'note')).toMatchObject(inputCredentials.filter(cred => cred.type === 'note'));
+    const clientHash = createHash('sha256').update('synthetic receiving party challenge').digest();
+    for (const cred of original) {
+      const key = delivered.find(value => value.type === 'passkey' && value.credentialId === cred.credentialId)!;
+      expect(key).toMatchObject({ rpId: cred.rpId, userHandle: cred.userHandle });
+      const material = createPrivateKey({ key: dec(key.key), format: 'der', type: 'pkcs8' });
+      const authenticatorData = Buffer.concat([createHash('sha256').update(cred.rpId).digest(), Buffer.of(9, 0, 0, 0, 0)]);
+      const signed = Buffer.concat([authenticatorData, clientHash]);
+      expect(verify('sha256', signed, originalVerifier(cred), sign('sha256', signed, material))).toBe(true);
+    }
+  });
+
   it.each([
     ['cxf', cxf, [ck, ek]], ['bitwarden', bitwarden, [ck]], ['onepassword', onepassword, [ek]], ['proton', proton, [ck]],
   ] as const)('validates %s using the fixture public key', (format, bytes, keys) => {
@@ -255,10 +622,42 @@ describe('portable import writes sealed credentials that can sign', () => {
     const result = imported(v, format, bytes);
     expect(result.count).toBe(1);
     expect(imported({ ...v, ...result }, format, bytes).count).toBe(0);
+    if (format === 'onepassword') expect(codeAt(restoredItem({ ...v, ...result }))).toBe(independentCode('sha1', Math.floor(now / 30), 6));
     for (const key of keys) {
       checkSignature({ ...v, ...result }, key, false);
       checkSignature({ ...v, ...result }, key, true);
     }
+  });
+  it('activates a retained Bitwarden key in place without replacing the old passwords or card', () => {
+    const vault = fresh();
+    const legacy = JSON.parse(bitwarden.toString('utf8'));
+    legacy.items[0].login.totp = base32;
+    legacy.items.push({ type: 3, id: '94be8abf-924a-44e6-b834-d8e830a45979', name: 'Synthetic card',
+      card: { cardholderName: 'Fixture', number: '4111111111111111', expMonth: '12', expYear: '2040' } });
+    const engine = new WasmVaultEngine();
+    engine.restore_from_session(vault.key, vault.wrap, vault.head, vault.snap);
+    const { rows } = JSON.parse(wasm_parse_bitwarden(bin(legacy), ''));
+    const stored = engine.import_records_json(str({ prepared: true, rows }), now * 1000, true);
+    const oldVault = { ...vault, head: stored.head_bytes, snap: stored.snap_bytes };
+    stored.free();
+    engine.free();
+    const before = restoredItems(oldVault);
+    expect(before).toHaveLength(2);
+    expect(() => checkSignature(oldVault, ck, true)).toThrow('Missing discoverable fixture credential');
+
+    const preview = imported(oldVault, 'bitwarden-retained', Buffer.alloc(0), '', false);
+    expect(preview.report).toMatchObject({ ready: 1, passkeys: 1, ignoredPasskeys: 0 });
+    expect(preview.snap).toHaveLength(0);
+    const updated = imported(oldVault, 'bitwarden-retained', Buffer.alloc(0));
+    const restored = { ...vault, ...updated };
+    const after = restoredItems(restored);
+    expect(after.map(item => item.id)).toEqual(before.map(item => item.id));
+    const loginBefore = before.find(item => item.data.kind === 'login');
+    const loginAfter = after.find(item => item.data.kind === 'login');
+    expect(loginAfter.data).toMatchObject({ username: loginBefore.data.username, password: loginBefore.data.password, totpUri: loginBefore.data.totpUri });
+    expect(after.find(item => item.data.kind === 'payment_card')).toEqual(before.find(item => item.data.kind === 'payment_card'));
+    checkSignature(restored, ck, true);
+    expect(imported(restored, 'bitwarden-retained', Buffer.alloc(0)).count).toBe(0);
   });
   it('recovers CXF from authenticated JWE, refuses the wrong password and verifies both keys again', () => {
     const v = fresh(), loaded = imported(v, 'cxf', cxf);
@@ -269,5 +668,41 @@ describe('portable import writes sealed credentials that can sign', () => {
     expect(() => imported(dest, 'cxf', Buffer.from(text), 'incorrect')).toThrow();
     const recovered = imported(dest, 'cxf', Buffer.from(text), filePassword);
     for (const key of [ck, ek]) checkSignature({ ...dest, ...recovered }, key, true);
+  });
+  it('restores a CXF TOTP when the exporter omits the optional username', () => {
+    const vault = fresh();
+    const bytes = bin({ version: { major: 1, minor: 0 }, exporterRpId: 'example.org', accounts: [{
+      id: 'YQ', items: [{ id: 'Yg', title: 'Steam: Synthetic title', credentials: [{
+        type: 'totp', secret: base32, period: 30, digits: 6, algorithm: 'sha1',
+      }] }],
+    }] });
+    const preview = imported(vault, 'cxf', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 1, ignoredOtp: 0 });
+    const saved = imported(vault, 'cxf', bytes);
+    expect(codeAt(restoredItem({ ...vault, ...saved }))).toBe(independentCode('sha1', Math.floor(now / 30), 6));
+    const { text } = JSON.parse(wasm_portable_export('cxf', vault.key, vault.wrap, saved.head, saved.snap, '', now * 1000));
+    expect(JSON.parse(text).accounts[0].items[0]).toMatchObject({
+      title: 'Steam: Synthetic title',
+      credentials: [{ type: 'totp', secret: base32, period: 30, digits: 6, algorithm: 'sha1' }],
+    });
+  });
+  it('round-trips a standalone CXF note as a note without exporting developer credential fields', () => {
+    const note = { type: 'note', content: { fieldType: 'string', value: 'Synthetic standalone note' } };
+    const v = fresh();
+    const loaded = imported(v, 'cxf', bin({ version: { major: 1, minor: 0 }, exporterRpId: 'example.org',
+      accounts: [{ id: 'YQ', items: [{ id: 'Yg', title: 'Standalone note', credentials: [note] }] }],
+    }));
+    const developer = imported({ ...v, ...loaded }, 'onepassword', zip({ 'export.attributes': bin({ version: 3 }),
+      'export.data': bin({ accounts: [{ vaults: [{ items: [{ uuid: 'api', categoryUuid: '112', overview: { title: 'Internal API' },
+        details: { notesPlain: 'Do not export this separate developer item', sections: [{ fields: [
+          { id: 'credential', title: 'credential', value: { concealed: 'SYNTHETIC-API-SECRET' } },
+        ] }] } }] }] }] }),
+    }));
+    const result = JSON.parse(wasm_portable_export('cxf', v.key, v.wrap, developer.head, developer.snap, '', now * 1000));
+    expect(result).toMatchObject({ count: 1, skipped: 1 });
+    expect(result.text).not.toContain('SYNTHETIC-API-SECRET');
+    expect(JSON.parse(result.text).accounts[0].items).toMatchObject([{ title: 'Standalone note', credentials: [note] }]);
+    const destination = fresh(), recovered = imported(destination, 'cxf', Buffer.from(result.text));
+    expect(restoredItem({ ...destination, ...recovered })).toMatchObject({ title: 'Standalone note', note: note.content.value });
   });
 });

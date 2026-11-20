@@ -62,12 +62,15 @@ fn headers(bytes: &[u8]) -> Result<String, &'static str> {
 #[derive(Default)]
 struct Login<'a> {
     title: &'a str, username: &'a str, password: &'a str, note: &'a str, otp: &'a str,
-    urls: Vec<&'a str>, tags: Vec<String>, pinned: bool, trashed: bool,
+    urls: Vec<&'a str>, tags: Vec<String>, pinned: bool, trashed: bool, dashlane: bool,
 }
 fn login_row(login: Login<'_>, ignored_otp: &mut usize) -> Value {
     let mut fields = SecretJson(json!([]));
     let uri = if login.otp.is_empty() { Value::Null } else {
-        match vault_otp::parse(login.otp) {
+        let with_label = login.dashlane.then(|| login.otp.strip_prefix("otpauth://totp/?")).flatten()
+            .map(|query| Zeroizing::new(format!("otpauth://totp/Account?{query}")));
+        let input = with_label.as_ref().map_or(login.otp, |uri| uri.as_str());
+        match vault_otp::parse(input) {
             Ok(code) => json!(&*code.canonical_uri()),
             Err(_) => {
                 *ignored_otp += 1;
@@ -115,6 +118,24 @@ fn import_enpass(rows: &[Vec<String>]) -> String {
     json!({ "rows": output.0, "invalid": invalid, "unsupported": skipped, "ignoredOtp": ignored_otp }).to_string()
 }
 
+fn valid_additional_url(raw: &str) -> bool {
+    let Some((scheme, _)) = raw.split_once("://") else { return false; };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") { return false; }
+    if raw.len() > 8192 || raw.bytes().any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control()) { return false; }
+    let Ok(url) = url::Url::parse(raw) else { return false; };
+    let valid = url.has_host() && url.username().is_empty() && url.password().is_none();
+    let _serialized = Zeroizing::new(String::from(url));
+    valid
+}
+
+fn add_additional_url<'a>(urls: &mut Vec<&'a str>, value: Option<&'a str>, unsupported: &mut usize) {
+    if let Some(url) = value.filter(|url| urls.len() < 64 && valid_additional_url(url)) {
+        urls.push(url);
+    } else {
+        *unsupported += 1;
+    }
+}
+
 fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
     let records = records(bytes)?;
     let (head, rows) = records.split_first().ok_or("CSV 没有表头。")?;
@@ -149,11 +170,25 @@ fn import(bytes: &[u8], mapping: &str) -> Result<String, &'static str> {
         let tags = if get("tags").is_empty() { Vec::new() } else if vendor.is_some() { vec![get("tags").into()] } else {
             serde_json::from_str::<Vec<String>>(get("tags")).unwrap_or_else(|_| get("tags").split(';').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
         };
-        let urls = std::iter::once(get("url").trim()).chain(additional.into_iter()
-            .flat_map(|index| row[index].split(',').map(str::trim).filter(|url| !url.is_empty()))).collect();
+        let extra = additional.map_or("", |index| row[index].trim());
+        let is_array = extra.starts_with('[');
+        let array = SecretJson(if is_array { serde_json::from_str::<Value>(extra).unwrap_or(Value::Null) } else { Value::Null });
+        let mut urls = vec![get("url").trim()];
+        if is_array {
+            match array.0.as_array() {
+                Some(entries) => {
+                    for entry in entries { add_additional_url(&mut urls, entry.as_str(), &mut unsupported); }
+                }
+                None => unsupported += 1,
+            }
+        } else if !extra.is_empty() {
+            // A bare URL may contain commas and nested URLs. Only the JSON form denotes a list.
+            add_additional_url(&mut urls, Some(extra), &mut unsupported);
+        }
         output.0.as_array_mut().unwrap().push(login_row(Login { title: get("title").trim(), username: get("username"),
             password: get("password"), note: get("note"), otp: get("totp"), urls, tags,
-            pinned: favorite.is_some_and(|i| row[i] == "1"), trashed: ["true","1","yes"].contains(&get("trashed")) }, &mut ignored_otp));
+            pinned: favorite.is_some_and(|i| row[i] == "1"), trashed: ["true","1","yes"].contains(&get("trashed")),
+            dashlane: vendor == Some("Dashlane") }, &mut ignored_otp));
     }
     Ok(json!({ "rows": output.0, "invalid": invalid, "unsupported": unsupported, "ignoredOtp": ignored_otp }).to_string())
 }

@@ -1,10 +1,10 @@
 use crate::{
     bitwarden::{SecretJson, text},
-    portable::{self, Batch, INVALID, LIMIT, MappingError, add_record, id_bytes, json_from_bytes, secret_bytes, valid_web_url},
+    portable::{self, Batch, INVALID, KeyImportError, LIMIT, MappingError, add_record, id_bytes, json_from_bytes, secret_bytes, valid_web_url},
 };
 use serde_json::{Value, json};
 use std::io::{Cursor, Read};
-use vault_passkeys::Passkey;
+use vault_passkeys::{Passkey, bundle::MAX_KEYS};
 use zeroize::Zeroizing;
 
 type Result<T> = std::result::Result<T, MappingError>;
@@ -45,14 +45,22 @@ fn key(value: &Value, default_account: &str) -> Result<Passkey> {
         .map(u32::try_from).transpose().map_err(|_| INVALID)?;
     Passkey::from_pkcs8(id, rp.into(), handle, account.into(), &material, value["discoverable"].as_bool().unwrap_or(true), backed, counter)
 }
-fn collect_keys<'a>(values: impl IntoIterator<Item = &'a Value>, username: &str, batch: &mut Batch) -> Vec<Passkey> {
+fn collect_keys<'a>(values: impl IntoIterator<Item = &'a Value>, username: &str, batch: &mut Batch,
+    parse_key: impl Fn(&Value, &str) -> std::result::Result<Passkey, KeyImportError>) -> Vec<Passkey> {
     let mut keys = Vec::new();
-    for value in values {
-        match key(value, username) {
-            Ok(key) if keys.len() < 64 => {
+    for (index, value) in values.into_iter().enumerate() {
+        if index >= MAX_KEYS {
+            batch.ignored_passkeys += 1;
+            continue;
+        }
+        match parse_key(value, username) {
+            Ok(key) => {
                 if !keys.iter().any(|old: &Passkey| old.credential_id == key.credential_id && old.rp_id == key.rp_id) { keys.push(key); }
             }
-            _ => batch.ignored_passkeys += 1,
+            Err(error) => {
+                batch.ignored_passkeys += 1;
+                if matches!(error, KeyImportError::UnsupportedVersion) { batch.unsupported_passkey_versions += 1; }
+            }
         }
     }
     keys
@@ -107,7 +115,7 @@ pub(crate) fn onepassword(bytes: &[u8]) -> Result<Batch> {
                     if !candidate.is_null() { passkey_list.push(candidate); }
                 }
                 // Public 1PUX versions need not include Passkey material; never fabricate a credential.
-                let keys = collect_keys(passkey_list, username, &mut batch);
+                let keys = collect_keys(passkey_list, username, &mut batch, |value, account| key(value, account).map_err(KeyImportError::from));
                 let options = fields.iter().find_map(|field| field["value"]["totp"].as_str()).unwrap_or("");
                 let mut custom = SecretJson(json!([]));
                 for field in fields.iter().take(64) {
@@ -140,12 +148,16 @@ pub(crate) fn onepassword(bytes: &[u8]) -> Result<Batch> {
                             "company":get(&["company"]),"addressLine":text(address,"street"),"city":text(address,"city"),
                             "province":text(address,"state"),"country":text(address,"country"),"postalCode":text(address,"zip")})
                     }
-                    "003" | "100" | "102" | "110" | "112" | "114" => {
+                    "003" => json!({"kind":"developer","subtype":"api_token"}),
+                    "100" | "102" | "110" | "112" | "114" => {
                         let ssh = fields.iter().find(|field| field["value"]["sshKey"].is_object()).map(|field| &field["value"]["sshKey"]).unwrap_or(&Value::Null);
-                        let subtype = match category { "003" => "secure_note", "100" => "software_license", "114" => "ssh_key", _ => "api_key" };
+                        let subtype = match category { "100" => "license_key", "114" => "ssh_key", _ => "api_token" };
+                        let expiry = fields.iter().find(|field| text(field, "id") == "expires")
+                            .map(|field| seconds(&field["value"]["date"])).filter(|time| *time > 0);
                         json!({"kind":"developer","subtype":subtype,"serviceOrProduct":text(overview,"title"),
-                            "tokenOrLicense":get(&["credential","licensekey","regcode","token","password"]),
-                            "privateKey":first(&[text(ssh,"privateKey"),text(&ssh["metadata"],"privateKey")]),"publicKey":text(&ssh["metadata"],"publicKey")})
+                            "tokenOrLicense":get(&["credential","licensekey","reg_code","regcode","token","password"]),
+                            "privateKey":first(&[text(ssh,"privateKey"),text(&ssh["metadata"],"privateKey")]),"publicKey":text(&ssh["metadata"],"publicKey"),
+                            "expiresAtMs":expiry})
                     }
                     _ => { batch.unsupported += 1; continue; }
                 });
@@ -161,10 +173,12 @@ pub(crate) fn onepassword(bytes: &[u8]) -> Result<Batch> {
 }
 
 pub(crate) fn proton(bytes: &[u8]) -> Result<Batch> {
+    const ENCRYPTED: MappingError = "不支持 Proton Pass 的 PGP 加密外层。请从原应用导出未加密的迁移文件。";
     let unpacked;
     let (json, attachments) = if bytes.starts_with(b"PK\x03\x04") {
         let mut zip = archive(bytes)?;
         let files = zip.file_names().filter(|name| !name.ends_with('/')).collect::<Vec<_>>();
+        if files.iter().any(|name| matches!(*name, "data.pgp" | "Proton Pass/data.pgp")) { return Err(ENCRYPTED); }
         let known = files.iter().filter(|name| name.rsplit('/').next() == Some("data.json") ||
             name.rsplit('/').next().is_some_and(|name| name.starts_with("proton-pass") && name.ends_with(".json"))).copied().collect::<Vec<_>>();
         let options = files.iter().filter(|name| name.ends_with(".json")).copied().collect::<Vec<_>>();
@@ -176,18 +190,38 @@ pub(crate) fn proton(bytes: &[u8]) -> Result<Batch> {
         (&unpacked[..], count)
     } else { (bytes, 0) };
     let root = json_from_bytes(json).map_err(|_| "请选择 Proton Pass 的未加密 JSON 或包含该 JSON 的 ZIP。")?;
-    if root.0["encrypted"] == true { return Err("不支持 Proton Pass 的加密外层。请从原应用导出未加密的迁移文件。"); }
+    if root.0["encrypted"] == true { return Err(ENCRYPTED); }
+    if !root.0["encrypted"].is_null() && root.0["encrypted"] != false { return Err(INVALID); }
+    // Proton stores the exporting application's version here, not a JSON schema version.
     let version = text(&root.0,"version");
-    if version.split('.').next() != Some("1") { return Err("不支持该 Proton Pass 导出版本。"); }
+    let (core, suffix) = version.split_once(['-', '+']).unwrap_or((version, ""));
+    let parts = core.split('.');
+    if !(2..=4).contains(&parts.clone().count()) ||
+        !parts.clone().all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && part.parse::<u32>().is_ok()) ||
+        version.len() > 48 || (core != version && (suffix.is_empty() ||
+            !suffix.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')))) {
+        return Err("无法识别该 Proton Pass 导出版本。");
+    }
     let vaults = root.0["vaults"].as_object().ok_or(INVALID)?;
     let mut batch = Batch::default();
     batch.unsupported = attachments;
     for (vault_id, vault) in vaults {
         for item in portable::rows(&vault["items"])? {
+            if item.get("contentFormatVersion").is_some_and(|version| !matches!(version.as_u64(), Some(1..=8))) {
+                return Err("不支持该 Proton Pass 条目内容版本。");
+            }
             let data = &item["data"];
             let content = &data["content"];
-            let username = first(&[text(content,"itemUsername"),text(content,"itemEmail"),text(item,"aliasEmail")]);
-            let keys = collect_keys(array(&content["passkeys"]), username, &mut batch);
+            if !content.is_object() || text(data, "type").is_empty() { return Err(INVALID); }
+            let username = first(&[text(content,"itemUsername"),text(content,"itemEmail"),text(content,"username"),text(item,"aliasEmail")]);
+            let passkeys = match &content["passkeys"] {
+                Value::Null => &[],
+                value => portable::rows(value).map_err(|_| "Proton Pass 的通行密钥列表无效或超出处理限制。")?,
+            };
+            let keys = collect_keys(passkeys, username, &mut batch, |value, account| {
+                if value.get("content").is_some() { crate::proton_passkey::read_key(value, account) }
+                else { key(value, account).map_err(KeyImportError::from) }
+            });
             batch.unsupported += array(&item["files"]).len();
             let fields = SecretJson(Value::Array(array(&data["extraFields"]).iter().take(64).filter_map(|field| {
                 let kind = text(field,"type");

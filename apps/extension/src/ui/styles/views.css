@@ -518,6 +518,7 @@ details.fold[open] > summary > .icon {
 .csv-column .icon { flex: none; color: var(--ink-3); }
 .csv-target { min-width: 0; }
 .csv-target[data-drag-over] .select { outline: 2px dashed var(--line-strong); outline-offset: 1px; }
+.auth-image-drop[data-drag-over] .input { outline: 2px dashed var(--line-strong); outline-offset: 1px; }
 
 .uri-row,
 .custom-row {

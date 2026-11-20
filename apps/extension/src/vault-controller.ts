@@ -959,6 +959,7 @@ export class VaultController {
             return { ...plan.preview, stamp, missingParts: batch.missingParts, repeatedParts: batch.repeatedParts } satisfies AuthBackupPreview;
           }
           if (batch.missingParts) throw new Error(`这批二维码缺少 ${batch.missingParts} 张；未导入任何条目。`);
+          if (format === 'google' && batch.invalid) throw new Error('这批二维码有损坏的条目，未导入任何条目。请从原验证器重新导出。');
           return this.saveMutation(() => engine.import_records_json(JSON.stringify({ prepared: true, rows: plan.items }), Date.now(), true), check);
         } finally { source.fill(0); bytes.fill(0); }
       }

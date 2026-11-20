@@ -16,6 +16,15 @@ pub(crate) const LIMIT: usize = 16 * 1024 * 1024;
 const MAX_ROWS: usize = 5000;
 const SOURCE: &str = "Vault 迁移来源";
 
+pub(crate) enum KeyImportError {
+    Invalid,
+    UnsupportedVersion,
+}
+
+impl From<MappingError> for KeyImportError {
+    fn from(_: MappingError) -> Self { Self::Invalid }
+}
+
 #[derive(Default)]
 pub(crate) struct Batch {
     records: Vec<VaultItem>,
@@ -23,6 +32,7 @@ pub(crate) struct Batch {
     pub(crate) unsupported: usize,
     pub(crate) ignored_otp: usize,
     pub(crate) ignored_passkeys: usize,
+    pub(crate) unsupported_passkey_versions: usize,
 }
 
 pub(crate) fn json_from_bytes(bytes: &[u8]) -> Result<SecretJson> {
@@ -161,12 +171,13 @@ fn signature(row: &VaultItem) -> [u8; 32] {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Preview { ready: usize, skipped: usize, invalid: usize, unsupported: usize, ignored_otp: usize, passkeys: usize,
-    suspended_passkeys: usize, ignored_passkeys: usize, sample: Vec<Sample> }
+    suspended_passkeys: usize, ignored_passkeys: usize, unsupported_passkey_versions: usize, sample: Vec<Sample> }
 #[derive(Serialize)]
 struct Sample { title: String, kind: &'static str, account: String }
 
 fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64) -> Result<Preview> {
-    let mut report = Preview { invalid: batch.invalid, unsupported: batch.unsupported, ignored_otp: batch.ignored_otp, ignored_passkeys: batch.ignored_passkeys, ..Default::default() };
+    let mut report = Preview { invalid: batch.invalid, unsupported: batch.unsupported, ignored_otp: batch.ignored_otp,
+        ignored_passkeys: batch.ignored_passkeys, unsupported_passkey_versions: batch.unsupported_passkey_versions, ..Default::default() };
     let mut sources = BTreeMap::new();
     let mut signatures = BTreeMap::new();
     let mut ids = BTreeMap::new();

@@ -1,7 +1,7 @@
 use crate::{bitwarden::{SecretJson, text}, portable::{Batch, MappingError, add_record, json_from_bytes, rows}};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
-use vault_core::model::{CredentialData, VaultSnapshot};
+use vault_core::model::{CredentialData, DeveloperCredentialSubtype, VaultSnapshot};
 use vault_passkeys::{Passkey, bundle};
 use zeroize::Zeroizing;
 
@@ -35,11 +35,15 @@ pub(crate) fn read(bytes: &[u8], password: &str) -> Result<Batch, MappingError> 
                     }
                     "passkey" => match read_key(cred) { Ok(key) => keys.push(key), Err(_) => batch.ignored_passkeys += 1 },
                     "totp" if login.0["totpUri"].is_null() => {
-                        let otp = &cred;
+                        let otp = cred;
+                        let username = text(otp, "username");
+                        let label = if username.is_empty() { "Account" } else { username };
                         let setup = Zeroizing::new(format!("otpauth://totp/{}?secret={}&issuer={}&digits={}&algorithm={}&period={}",
-                            vault_otp::uri_encode(text(otp, "username")), vault_otp::uri_encode(text(otp, "secret")), vault_otp::uri_encode(text(otp, "issuer")),
+                            vault_otp::uri_encode(label), vault_otp::uri_encode(text(otp, "secret")), vault_otp::uri_encode(text(otp, "issuer")),
                             otp["digits"].as_u64().unwrap_or(6), vault_otp::uri_encode(text(otp, "algorithm")), otp["period"].as_u64().unwrap_or(30)));
-                        if let Ok(token) = vault_otp::parse(&setup) { login.0["totpUri"] = json!(&*token.canonical_uri()); }
+                        if let Ok(token) = vault_otp::parse(&setup) && token.kind == vault_otp::Kind::Totp {
+                            login.0["totpUri"] = json!(&*token.canonical_uri());
+                        }
                         else { batch.ignored_otp += 1; }
                     }
                     "note" => notes.push(text(&cred["content"], "value").to_owned()),
@@ -55,7 +59,7 @@ pub(crate) fn read(bytes: &[u8], password: &str) -> Result<Batch, MappingError> 
             let login_meaningful = !text(&login.0, "username").is_empty() || !text(&login.0, "password").is_empty() ||
                 login.0["totpUri"].is_string() || !keys.is_empty();
             if !login_meaningful && notes.is_empty() { batch.invalid += 1; continue; }
-            if !login_meaningful { login.0 = json!({ "kind": "developer", "subtype": "secure_note" }); }
+            if !login_meaningful { login.0 = json!({ "kind": "developer", "subtype": "api_token" }); }
             let data = SecretJson(json!({ "title": text(item, "title"), "note": notes.join("\n\n"), "data": login.0,
                 "pinned": item["favorite"] == true, "tags": item["tags"], "createdAtMs": as_millis(&item["creationAt"]),
                 "updatedAtMs": as_millis(&item["modifiedAt"]) }));
@@ -77,6 +81,16 @@ fn read_key(value: &Value) -> Result<Passkey, MappingError> {
 }
 
 fn field(name: &str, value: &str) -> Value { json!({ "fieldType": name, "value": value }) }
+
+fn has_standalone_note(item: &vault_core::model::VaultItem) -> bool {
+    let CredentialData::Developer(data) = &item.data else { return false; };
+    data.subtype == DeveloperCredentialSubtype::ApiToken
+        && matches!(data.service_or_product.as_str(), "" | "安全备注")
+        && data.token_or_license.is_empty()
+        && data.private_key.is_empty()
+        && data.public_key.is_empty()
+        && data.expires_at_ms.is_none()
+}
 
 pub(crate) fn write(vault: &VaultSnapshot, now_ms: u64) -> Result<(Zeroizing<String>, usize, usize, usize), MappingError> {
     let mut items = SecretJson(json!([]));
@@ -106,7 +120,7 @@ pub(crate) fn write(vault: &VaultSnapshot, now_ms: u64) -> Result<(Zeroizing<Str
                     "userHandle":B64.encode(&key.user_handle), "username":key.account, "userDisplayName":key.account, "key":B64.encode(&*material) }));
             }
             Some(json!({ "urls": login.uris.iter().filter(|uri| crate::portable::valid_web_url(&uri.uri)).map(|uri| &uri.uri).collect::<Vec<_>>(), "androidApps": [] }))
-        } else if matches!(item.data, CredentialData::Developer(ref data) if data.subtype.as_str() == "secure_note") { None }
+        } else if has_standalone_note(item) { None }
         else { skipped_items += 1; continue; };
         if !item.note.is_empty() { values.push(json!({ "type": "note", "content": field("string", &item.note) })); }
         if values.is_empty() { skipped_items += 1; continue; }
