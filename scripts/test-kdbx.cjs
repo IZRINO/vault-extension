@@ -24,7 +24,7 @@ async function wasm(crate) {
   return mod;
 }
 
-async function makeKeepassxcFixture(cli, origin = 'https://example.com') {
+async function makeKeepassxcFixture(cli, origin = 'https://example.com', textExports) {
   await fs.access(cli);
   const filePassword = 'Synthetic-KeePassXC-Test#2026';
   const loginPassword = 'Synthetic login <&>';
@@ -75,7 +75,30 @@ async function makeKeepassxcFixture(cli, origin = 'https://example.com') {
     const bytes = await fs.readFile(database);
     assert.equal(bytes.readUInt32LE(8), 0x00040001, 'The KeePassXC CLI must write KDBX 4.1');
     assert(!bytes.includes(Buffer.from(loginPassword)) && !bytes.includes(Buffer.from('BEGIN PRIVATE KEY')));
+    const plaintext = [];
+    if (textExports) {
+      for (const format of ['xml', 'csv']) {
+        const result = spawnSync(path.resolve(cli), ['export', '--quiet', '--format', format, database], {
+          input: `${filePassword}\n`, windowsHide: true, timeout: 30000, maxBuffer: 2 * 1024 * 1024,
+        });
+        if (result.error) throw result.error;
+        assert.equal(result.status, 0, 'KeePassXC native text export failed');
+        plaintext.push({ name: `KeePassXC ${format.toUpperCase()}`, bytes: result.stdout, rich: format === 'xml', groups: true, otp: true });
+      }
+      if (textExports.kpscript) {
+        for (const [format, ext] of [['KeePass XML (2.x)', 'xml'], ['KeePass CSV (1.x)', 'csv']]) {
+          const output = path.join(folder, `keepass-export.${ext}`);
+          const result = spawnSync(path.resolve(textExports.kpscript), [
+            '-c:Export', database, `-pw:${filePassword}`, `-Format:${format}`, `-OutFile:${output}`,
+          ], { windowsHide: true, timeout: 30000 });
+          if (result.error) throw result.error;
+          assert.equal(result.status, 0, 'KeePass/KPScript native text export failed');
+          plaintext.push({ name: format, bytes: await fs.readFile(output), rich: ext === 'xml', groups: ext === 'xml', otp: ext === 'xml' });
+        }
+      }
+    }
     return { bytes, filePassword, loginPassword, oldPassword, otpSeed, host, origin, userHandle,
+      plaintext,
       examples: examples.map(({ title, id, algorithm, publicKey, alias }) => ({ title, id, algorithm, publicKey, alias })) };
   } finally {
     assert(path.dirname(folder) === temp && path.basename(folder).startsWith(prefix));
@@ -83,34 +106,53 @@ async function makeKeepassxcFixture(cli, origin = 'https://example.com') {
   }
 }
 
-async function verifyKeepassxc(cli) {
+async function verifyKeepassxc(cli, kpscript) {
   const [core, migration, otp, passkeys] = await Promise.all(['vault-core', 'vault-importers', 'vault-otp', 'vault-passkeys'].map(wasm));
-  const { bytes, filePassword, loginPassword, oldPassword, otpSeed, host, origin, userHandle, examples } = await makeKeepassxcFixture(cli);
+  const { bytes, filePassword, loginPassword, oldPassword, otpSeed, host, origin, userHandle, examples, plaintext } =
+    await makeKeepassxcFixture(cli, undefined, { kpscript });
   const key = crypto.getRandomValues(new Uint8Array(32));
-  let target, wrap, committed, engine;
+  let target, wrap;
   try {
     target = core.wasm_create_new_vault('Synthetic target', 32768, 2, 1, key, 1000);
     wrap = target.session_wrap_bytes;
     const read = (input, password, write, base = target) => migration.wasm_portable_import('keepass', key, wrap,
       base.head_bytes ?? base.head, base.snap_bytes ?? base.snap, input, password, 2000, write);
-    const preview = read(bytes, filePassword, false);
-    try {
-      const report = JSON.parse(preview.report);
-      assert.equal(report.ready, examples.length);
-      assert.equal(report.passkeys, examples.length, 'Each original KeePassXC PEM form must produce a usable Passkey');
-      assert.equal(report.ignoredPasskeys, 0);
-      assert.equal(preview.snap.length, 0);
-      assert(!preview.report.includes(otpSeed) && !preview.report.includes(loginPassword));
-    } finally { preview.free(); }
-    assert.throws(() => read(bytes, 'wrong fixture password', true));
-    assert.throws(() => read(bytes.subarray(0, bytes.length - 32), filePassword, true));
-    committed = read(bytes, filePassword, true);
-    assert.equal(committed.count, examples.length);
-    const duplicate = read(bytes, filePassword, true, committed);
-    try { assert.equal(duplicate.count, 0); assert.equal(duplicate.snap.length, 0); }
-    finally { duplicate.free(); }
-    engine = new core.WasmVaultEngine();
-    engine.restore_from_session(key, wrap, committed.head, committed.snap);
+    for (const source of [{ name: 'KeePassXC KDBX 4.1', bytes, password: filePassword, rich: true, groups: true, otp: true }, ...plaintext]) {
+      verifySource(source);
+    }
+
+    function verifySource(source) {
+      const password = source.password ?? '';
+      const preview = read(source.bytes, password, false);
+      let committed, engine;
+      try {
+        const report = JSON.parse(preview.report);
+        assert.equal(report.ready, examples.length);
+        assert.equal(report.passkeys, source.rich ? examples.length : 0);
+        assert.equal(report.ignoredPasskeys, 0);
+        assert.equal(preview.snap.length, 0);
+        assert(!preview.report.includes(otpSeed) && !preview.report.includes(loginPassword));
+        assert.throws(() => read(source.bytes, 'wrong fixture password', true));
+        if (source.rich) assert.throws(() => read(source.bytes.subarray(0, source.bytes.length - 32), password, true));
+        committed = read(source.bytes, password, true);
+        assert.equal(committed.count, examples.length);
+        const duplicate = read(source.bytes, password, true, committed);
+        try { assert.equal(duplicate.count, 0); assert.equal(duplicate.snap.length, 0); }
+        finally { duplicate.free(); }
+        if (source.rich) {
+          const sameSource = read(bytes, filePassword, true, committed);
+          try { assert.equal(sameSource.count, 0); assert.equal(sameSource.snap.length, 0); }
+          finally { sameSource.free(); }
+        }
+        engine = new core.WasmVaultEngine();
+        engine.restore_from_session(key, wrap, committed.head, committed.snap);
+        validateEntries(source, committed, engine);
+        console.log(JSON.stringify({ generator: source.name, signed: source.rich ? examples.length : 0,
+          history: source.rich, otp: source.otp, previewAndDuplicateNoWrite: true, imported: committed.count }));
+      } finally { preview.free(); engine?.free(); committed?.free(); }
+    }
+
+    function validateEntries(source, committed, engine) {
     const rows = JSON.parse(engine.list_summaries_json()).map(row => JSON.parse(engine.get_item_json(row.id, true)));
     assert.equal(rows.length, examples.length);
     const moving = Buffer.alloc(8);
@@ -124,10 +166,12 @@ async function verifyKeepassxc(cli) {
       assert.equal(row.data.password, loginPassword);
       assert(row.data.uris.some(uri => uri.uri === origin));
       assert.equal(row.note, 'Synthetic migration note');
-      assert(row.tags.includes('Native Group'));
-      assert(row.data.passwordHistory.some(old => old.password === oldPassword));
-      assert.equal(JSON.parse(otp.wasm_otp_at(row.data.totpUri, 59, 0)).value, expectedOtp);
+      assert.equal(row.tags.includes('Native Group'), source.groups);
+      assert.equal((row.data.passwordHistory ?? []).some(old => old.password === oldPassword), source.rich);
+      if (source.otp) assert.equal(JSON.parse(otp.wasm_otp_at(row.data.totpUri, 59, 0)).value, expectedOtp);
+      else assert(!row.data.totpUri);
       assert(!row.customFields.some(field => field.name.startsWith('KPEX_PASSKEY_') || field.name === 'KPXC_PASSKEY_USERNAME'));
+      if (!source.rich) continue;
       const challenge = crypto.getRandomValues(new Uint8Array(32));
       const challengeText = Buffer.from(challenge).toString('base64url');
       const request = JSON.stringify({ kind: 'assert', origin, rpId: host, challenge: challengeText, credentialIds: [], uv: 'required' });
@@ -151,11 +195,9 @@ async function verifyKeepassxc(cli) {
           Buffer.from(reply.signature, 'base64url')));
       } finally { signed.free(); }
     }
-    console.log(JSON.stringify({ generator: 'KeePassXC CLI', version: '4.1', signed: examples.length, history: true,
-      otp: true, wrongAndTruncatedRejected: true, previewAndDuplicateNoWrite: true, sourceBackupFlagNotTrusted: true }));
+    }
   } finally {
-    engine?.free();
-    committed?.free();
+    for (const entry of plaintext) entry.bytes.fill(0);
     target?.free();
     key.fill(0);
     wrap?.fill(0);
@@ -164,8 +206,8 @@ async function verifyKeepassxc(cli) {
 
 async function run() {
   if (process.argv[2] === '--keepassxc-cli') {
-    assert(process.argv.length === 4, 'Usage: node scripts/test-kdbx.cjs --keepassxc-cli <path>');
-    return verifyKeepassxc(process.argv[3]);
+    assert(process.argv.length === 4 || process.argv.length === 5, 'Usage: node scripts/test-kdbx.cjs --keepassxc-cli <path> [<KPScript.exe>]');
+    return verifyKeepassxc(process.argv[3], process.argv[4]);
   }
   const dir = process.argv[2];
   assert(dir, 'Usage: node scripts/test-kdbx.cjs <folder with fixtures from https://github.com/sseemayer/keepass-rs/tree/' + upstream + '/tests/resources and Stratum.Test/data>');

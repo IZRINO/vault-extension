@@ -11,6 +11,8 @@ const formats: Record<AuthBackupFormat, { label: string; accept: string; passwor
   raivo: { label: 'Raivo OTP', accept: '.zip,.json', password: true },
   andotp: { label: 'andOTP', accept: '.json', hint: '支持明文 JSON。' },
   stratum: { label: 'Stratum / Authenticator Pro', accept: '.stratum,.authpro,.json', hint: '支持未加密的备份。' },
+  'freeotp-plus': { label: 'FreeOTP+', accept: '.json,.txt', hint: '在 FreeOTP+ 中选择导出 JSON 或密钥 URI。' },
+  winauth: { label: 'WinAuth', accept: '.txt,.zip', password: true, hint: '请选择 WinAuth 导出的 TXT 或 ZIP。仅导入验证码设置，不导入 Steam 会话或应用配置。' },
 };
 
 function imageUrl(file: File): Promise<string> {

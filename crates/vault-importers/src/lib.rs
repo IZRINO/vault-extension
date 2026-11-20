@@ -7,6 +7,7 @@ mod migration_csv;
 mod authenticators;
 mod cxf;
 mod keepass_kdbx;
+mod keepass_text;
 mod portable;
 mod protected_jwe;
 mod proton_passkey;
@@ -21,6 +22,10 @@ const QUOTING: &str = "CSV 的引号格式有误，请从浏览器重新导出�
 enum State { Start, Plain, Quoted, Closed }
 
 fn read_csv(data: &str) -> Result<Zeroizing<Vec<Vec<String>>>, &'static str> {
+    read_csv_mode(data, false)
+}
+
+fn read_csv_mode(data: &str, keepass_escapes: bool) -> Result<Zeroizing<Vec<Vec<String>>>, &'static str> {
     let mut records = Zeroizing::new(Vec::new());
     let mut row = Zeroizing::new(Vec::new());
     let mut field = Zeroizing::new(String::new());
@@ -28,8 +33,10 @@ fn read_csv(data: &str) -> Result<Zeroizing<Vec<Vec<String>>>, &'static str> {
     let mut state = State::Start;
     while let Some(ch) = input.next() {
         if state == State::Quoted {
-            if ch == '"' {
-                if input.peek() == Some(&'"') {
+            if keepass_escapes && ch == '\\' {
+                field.push(input.next().filter(|ch| matches!(ch, '\\' | '"')).ok_or(QUOTING)?);
+            } else if ch == '"' {
+                if !keepass_escapes && input.peek() == Some(&'"') {
                     input.next();
                     field.push('"');
                 } else {

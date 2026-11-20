@@ -124,6 +124,50 @@ async function raivoArchive() {
   }
 }
 
+async function winAuthArchive() {
+  const [imports, otp] = await Promise.all(['vault-importers', 'vault-otp'].map(wasm));
+  const temp = path.resolve(os.tmpdir());
+  const dir = await fs.mkdtemp(path.join(temp, 'vault-winauth-fixture-'));
+  const filePassword = 'WinAuth-Synthetic-ZIP-Only#27';
+  const seed = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+  const text = Buffer.from(`otpauth://hotp/Example:fixture+with%2Bplus?secret=${seed}&issuer=Example&digits=6&counter=7\r\n`
+    + `otpauth://totp/Steam:fixture?secret=${seed}&issuer=Steam&digits=5&deviceid=not-migrated\r\n`);
+  const z = (args) => execFileSync(process.env.VAULT_7ZIP_PATH || '7z', args, { cwd: dir, windowsHide: true, encoding: 'utf8' });
+  try {
+    await fs.writeFile(path.join(dir, 'winauth.txt'), text);
+    z(['a', '-tzip', 'plain.zip', 'winauth.txt']);
+    z(['a', '-tzip', '-mem=ZipCrypto', `-p${filePassword}`, 'protected.zip', 'winauth.txt']);
+    assert.match(z(['l', '-slt', 'protected.zip']), /^Method = ZipCrypto\b/m);
+    const parse = (input, password) => JSON.parse(imports.wasm_parse_authenticator_backup('winauth', input, password));
+    const plain = await fs.readFile(path.join(dir, 'plain.zip'));
+    const encrypted = await fs.readFile(path.join(dir, 'protected.zip'));
+    const expected = parse(text, '');
+    assert.deepEqual(parse(plain, ''), expected);
+    assert.deepEqual(parse(encrypted, filePassword), expected);
+    assert.equal(expected.rows.length, 2);
+    assert.equal(expected.invalid + expected.unsupported, 0);
+    assert.equal(expected.rows[0].data.username, 'fixture with+plus');
+    assert(!JSON.stringify(expected).includes('not-migrated'));
+    for (const [row, step, digits] of [[expected.rows[0], 8, 6], [expected.rows[1], Math.floor(now / 30), 5]]) {
+      assert.equal(JSON.parse(otp.wasm_otp_at(row.data.totpUri, now, 0)).value, independentCode(seed, 'sha1', step, digits, digits === 5));
+    }
+    assert.throws(() => parse(encrypted, ''), /请输入/);
+    assert.throws(() => parse(encrypted, 'Wrong test password'), /密码错误或文件损坏/);
+    assert.throws(() => parse(plain, filePassword), /请留空/);
+    assert.throws(() => parse(encrypted.subarray(0, -32), filePassword));
+    await fs.writeFile(path.join(dir, 'extra.txt'), text);
+    z(['a', '-tzip', 'multiple.zip', 'winauth.txt', 'extra.txt']);
+    const multiple = await fs.readFile(path.join(dir, 'multiple.zip'));
+    assert.throws(() => parse(multiple, ''));
+    console.log(JSON.stringify({ fixture: 'WinAuth TXT format and 7-Zip ZipCrypto/unencrypted wrappers', restored: 2,
+      exactNextHotpAndSteam: true, wrongOrMissingPasswordRejected: true, damagedAndMultipleMembersRejected: true }));
+  } finally {
+    assert.equal(path.dirname(path.resolve(dir)), temp);
+    assert(path.basename(dir).startsWith('vault-winauth-fixture-'));
+    await fs.rm(dir, { recursive: true, maxRetries: 3, retryDelay: 200 });
+  }
+}
+
 async function enteBackup(variant) {
   const sha256 = enteFixtures.get(variant);
   assert(sha256, 'Unknown Ente Auth fixture');
@@ -178,8 +222,9 @@ async function enteBackup(variant) {
 async function run() {
   const dir = process.argv[2];
   if (dir === '--ente' && process.argv.length === 4) return enteBackup(process.argv[3]);
-  assert(dir && process.argv.length === 3, 'Usage: node scripts/test-authenticator-fixtures.cjs <public fixture directory>|--raivo|--ente');
+  assert(dir && process.argv.length === 3, 'Usage: node scripts/test-authenticator-fixtures.cjs <public fixture directory>|--raivo|--winauth|--ente');
   if (dir === '--raivo') return raivoArchive();
+  if (dir === '--winauth') return winAuthArchive();
   if (dir === '--ente') {
     // Match the disposable extension worker: grown linear memory is not reused.
     for (const variant of enteFixtures.keys()) {

@@ -7,7 +7,7 @@ import { useOps } from './Main';
 
 const descriptions = {
   cxf: { label: 'FIDO CXF 1.0', accept: '.cxf,.json,.jwe', password: true },
-  keepass: { label: 'KeePass KDBX 3.1 / 4.x', accept: '.kdbx', password: true },
+  keepass: { label: 'KeePass KDBX / XML / CSV', accept: '.kdbx,.xml,.csv', password: true },
   onepassword: { label: '1Password 1PUX', accept: '.1pux', password: false },
   proton: { label: 'Proton Pass', accept: '.json,.zip', password: false },
 };
@@ -45,6 +45,7 @@ export default function PortableMigration({ refresh }: { refresh(): Promise<void
         <label className="field">迁移文件<input ref={input} className="input" type="file" accept={descriptions[format].accept} disabled={busy} required
           onChange={event => { setSource(event.target.files?.[0]); setPreview(undefined); setPassword(''); }} /></label>
         {descriptions[format].password && <SecretField label={format === 'keepass' ? 'KeePass 文件密码' : 'CXF JWE 文件密码（明文留空）'} value={password}
+          hint={format === 'keepass' ? '加密 KDBX 需要文件密码；明文 XML 或 CSV 请留空。' : undefined}
           maxLength={4096} autoComplete="off" onChange={value => { setPassword(value); setPreview(undefined); }} />}
         {!preview && <button className="btn btn-primary" disabled={busy || !source}>预览迁移内容</button>}
       </form>
@@ -53,7 +54,7 @@ export default function PortableMigration({ refresh }: { refresh(): Promise<void
         <p className="hint">可用通行密钥 {preview.passkeys ?? 0} 枚，重复 {preview.skipped} 条，无效 {preview.invalid} 条，不支持的字段或附件 {preview.unsupported} 项。</p>
         {!!preview.suspendedPasskeys && <p className="banner banner-warn">{preview.suspendedPasskeys} 枚通行密钥的签名计数待核实，暂不能登录。</p>}
         {!!preview.ignoredOtp && <p className="banner banner-warn">{preview.ignoredOtp} 个验证码设置未导入。</p>}
-        {!!preview.ignoredPasskeys && <p className="banner banner-warn">{preview.ignoredPasskeys} 枚通行密钥未导入，原因可能是私钥缺失、无效或格式不兼容。请保留原认证器。</p>}
+        {!!preview.ignoredPasskeys && <p className="banner banner-warn">{preview.ignoredPasskeys} 枚通行密钥未导入，原因可能是条目已存在、私钥缺失、无效或格式不兼容。请保留原认证器。</p>}
         {!!preview.unsupportedPasskeyVersions && <p className="banner banner-warn">其中 {preview.unsupportedPasskeyVersions} 枚使用了暂不支持的 Proton Pass 通行密钥载荷版本。</p>}
         {format === 'onepassword' && preview.ready > 0 && !preview.passkeys && !preview.suspendedPasskeys && !preview.ignoredPasskeys &&
           <p className="hint">本次没有新增通行密钥。1Password 桌面版的常规 1PUX 导出会把通行密钥留在原库。</p>}
@@ -61,7 +62,7 @@ export default function PortableMigration({ refresh }: { refresh(): Promise<void
           <span className="fact-value">{row.title}</span><span className="fact-label">{row.account || kinds[row.kind] || row.kind}</span>
         </div></li>)}</ul>
         <button type="button" className="btn btn-primary" disabled={busy || !preview.ready} onClick={() => void work(async () => {
-          const proof = await dialogs.proof();
+          const proof = await dialogs.proof({ masterOnly: format === 'keepass' });
           try {
             const count = await withFile(bytes => request<number>({ type: 'import-migration', format, bytes, password, stamp: preview.stamp, proof }));
             reset(); await refresh(); notify(`已导入 ${count} 条凭证。`);

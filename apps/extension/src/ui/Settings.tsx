@@ -31,7 +31,7 @@ export default function Settings({ status, page, setPage, refresh }: {
           ['backup', HardDrive, '备份与恢复', '保存加密备份，或从备份恢复凭证'],
           ['csv', FileUp, '导入浏览器密码', '预览浏览器导出的 CSV，不覆盖已有凭证'],
           ['ente', ArrowRightLeft, 'Ente Auth 验证器迁移', '导入或导出验证码，可合并到已有登录项'],
-          ['auth-migration', ArrowRightLeft, '导入其他验证器', 'Google Authenticator、2FAS、Aegis、Raivo、andOTP、Stratum'],
+          ['auth-migration', ArrowRightLeft, '导入其他验证器', 'Google Authenticator、2FAS、Aegis、FreeOTP+、WinAuth 等'],
           ['bitwarden', ArrowRightLeft, 'Bitwarden 密码库迁移', '支持明文或密码保护的 JSON 导入与导出'],
           ['portable-migration', ArrowRightLeft, '其他密码库与 CXF', 'FIDO CXF、KeePass、1Password、Proton Pass'],
           ['mapped-csv', FileUp, 'CSV 字段映射与导出', '选择对应列导入，或导出登录凭证'],

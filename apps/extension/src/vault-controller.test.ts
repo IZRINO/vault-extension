@@ -1058,6 +1058,17 @@ describe('phase two migration transactions and autofill reads', () => {
       uris: [{ uri: 'https://example.com/login' }], totp: 'JBSWY3DPEHPK3PXP' } },
     { id: 'source-card', type: 3, name: 'Card fixture', card: { number: '4111111111111111', code: '123' } },
   ] })));
+  it('requires the target master password before committing a KeePass migration', async () => {
+    const controller = await unlocked();
+    const bytes = Array.from(new TextEncoder().encode('"Account","Login Name","Password","Web Site","Comments"\n"Fixture","me","synthetic","https://example.com",""\n'));
+    const preview = await controller.handle({ type: 'preview-migration', format: 'keepass', bytes }) as { stamp: string; ready: number };
+    expect(preview.ready).toBe(1);
+    const message = { type: 'import-migration' as const, format: 'keepass' as const, bytes, stamp: preview.stamp };
+    const before = structuredClone(state.files);
+    await expect(controller.handle({ ...message, proof: { method: 'pin', secret: '734928' } })).rejects.toThrow('需要再次验证主密码。');
+    expect(state.files).toEqual(before);
+    expect(await controller.handle({ ...message, proof })).toBe(1);
+  });
   it('binds preview to source and snapshot and rolls back a failed batch without partial data', async () => {
     const controller = await unlocked();
     const before = structuredClone(state.files);

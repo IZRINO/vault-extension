@@ -16,6 +16,111 @@ pub(crate) const LIMIT: usize = 16 * 1024 * 1024;
 const MAX_ROWS: usize = 5000;
 const SOURCE: &str = "Vault 迁移来源";
 
+#[cfg(test)]
+mod keepass_text_tests {
+    use super::*;
+
+    #[test]
+    fn reads_keepass_native_text_dialects_without_changing_passwords() {
+        let cases = [
+            (r#""Account","Login Name","Password","Web Site","Comments"
+"Fixture","user"," a\\b\"c ","https://account.example","line
+two"
+"#, None),
+            (r#""Group","Title","Username","Password","URL","Notes","TOTP","Icon","Last Modified","Created"
+"Root/Work","Fixture","user"," a\b""c ","https://account.example","line
+two","otpauth://totp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ","0","2026-01-03T00:00:00Z","2026-01-02T00:00:00Z"
+"#, Some("Root/Work")),
+        ];
+        for (csv, group) in cases {
+            let batch = crate::keepass_kdbx::read(csv.as_bytes(), "").expect("read KeePass CSV");
+            assert_eq!(batch.records.len(), 1);
+            let item = &batch.records[0];
+            let CredentialData::Login(login) = &item.data else { panic!("expected login") };
+            assert_eq!(item.title, "Fixture");
+            assert_eq!(item.note, "line\ntwo");
+            assert_eq!(login.password, " a\\b\"c ");
+            assert_eq!(login.username, "user");
+            assert_eq!(login.uris[0].uri, "https://account.example");
+            assert_eq!(item.tags.first().map(String::as_str), group);
+            assert_eq!(login.totp_uri.is_some(), group.is_some());
+            assert!(crate::keepass_kdbx::read(csv.as_bytes(), "unneeded-password").is_err());
+        }
+    }
+
+    #[test]
+    fn never_attaches_a_new_keepass_passkey_to_a_previously_imported_row() {
+        let mut vault = VaultSnapshot::new_empty("test-vault".into(), "test-snapshot".into(), 1);
+        let row = json!({"title":"Fixture","data":{"kind":"login","username":"tester","password":"synthetic"}});
+        let mut initial = Batch::default();
+        add_record(&mut initial, &row, vec![], "keepass", "same-source-id").unwrap();
+        assert_eq!(apply(&mut vault, initial, 2, "keepass").unwrap().ready, 1);
+        let existing = vault.items[0].clone();
+        let mut der = hex::decode("302e020100300506032b657004220420").unwrap();
+        der.extend_from_slice(&[2; 32]);
+        let key = Passkey::from_pkcs8(vec![3; 32], "example.com".into(), vec![4; 16], "tester".into(), &der, true, true, None).unwrap();
+        let mut later = Batch::default();
+        add_record(&mut later, &row, vec![key], "keepass", "same-source-id").unwrap();
+        let preview = apply(&mut vault, later, 3, "keepass").unwrap();
+        assert_eq!((preview.ready, preview.skipped, preview.ignored_passkeys), (0, 1, 1));
+        assert_eq!(vault.items[0].to_json_value().stringify(), existing.to_json_value().stringify());
+    }
+
+    #[test]
+    fn keeps_distinct_keepass_csv_groups_and_skips_a_repeated_file() {
+        let csv = b"Group,Title,Username,Password,URL,Notes,TOTP,Icon,Last Modified,Created\n\
+            Root/Personal,Fixture,me,synthetic,https://example.com,,,,,\n\
+            Root/Work,Fixture,me,synthetic,https://example.com,,,,,\n";
+        let batch = || crate::keepass_kdbx::read(csv, "").unwrap();
+        let mut vault = VaultSnapshot::new_empty("test-vault".into(), "test-snapshot".into(), 1);
+        assert_eq!(apply(&mut vault, batch(), 2, "keepass").unwrap().ready, 2);
+        assert_eq!(apply(&mut vault, batch(), 3, "keepass").unwrap().ready, 0);
+        assert_eq!(vault.items[0].tags, ["Root/Personal"]);
+        assert_eq!(vault.items[1].tags, ["Root/Work"]);
+    }
+
+    const KP_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<KeePassFile><Meta><RecycleBinUUID>AgICAgICAgICAgICAgICAg==</RecycleBinUUID></Meta><Root>
+<Group><UUID>AQEBAQEBAQEBAQEBAQEBAQ==</UUID><Name>Root</Name>
+<Group><UUID>AgICAgICAgICAgICAgICAg==</UUID><Name>Discarded &amp; work</Name>
+<Entry><UUID>AwMDAwMDAwMDAwMDAwMDAw==</UUID><Tags>work;test</Tags>
+<Times><CreationTime>2026-01-02T00:00:00Z</CreationTime><LastModificationTime>2026-01-03T00:00:00Z</LastModificationTime></Times>
+<String><Key>Title</Key><Value>Fixture</Value></String>
+<String><Key>UserName</Key><Value>user</Value></String>
+<String><Key>Password</Key><Value ProtectInMemory="True"> a&amp;b </Value></String>
+<String><Key>otp</Key><Value>otpauth://totp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ</Value></String>
+<String><Key>Metadata</Key><Value ProtectInMemory="True">hidden</Value></String>
+<String><Key>Vault 迁移来源</Key><Value>spoofed</Value></String>
+<History><Entry><UUID>AwMDAwMDAwMDAwMDAwMDAw==</UUID>
+<Times><LastModificationTime>2026-01-01T00:00:00Z</LastModificationTime></Times>
+<String><Key>Password</Key><Value>previous</Value></String>
+</Entry></History></Entry></Group></Group><DeletedObjects /></Root></KeePassFile>"#;
+
+    #[test]
+    fn reads_keepass_xml_paths_history_and_otp_without_accepting_encrypted_or_ambiguous_xml() {
+        let batch = crate::keepass_kdbx::read(KP_XML.as_bytes(), "").expect("read KeePass XML");
+        assert_eq!(batch.records.len(), 1);
+        let item = &batch.records[0];
+        let CredentialData::Login(login) = &item.data else { panic!("expected login") };
+        assert!(item.trashed);
+        assert_eq!(item.tags, ["work", "test", "Root/Discarded & work"]);
+        assert_eq!(login.password, " a&b ");
+        assert_eq!(login.password_history[0].password, "previous");
+        assert_eq!(login.password_history[0].changed_at_ms, 1767225600000);
+        assert_eq!(vault_otp::parse(login.totp_uri.as_deref().unwrap()).unwrap().code_for_counter(1), "287082");
+        assert!(item.custom_fields.iter().any(|field| field.name == "Metadata" && field.hidden));
+        assert!(!item.custom_fields.iter().any(|field| field.value == "spoofed"));
+        for invalid in [
+            KP_XML.replace("ProtectInMemory=\"True\"", "Protected=\"True\""),
+            KP_XML.replace("<Key>UserName</Key>", "<Key>Password</Key>"),
+            KP_XML.replace("<KeePassFile>", "<!DOCTYPE KeePassFile><KeePassFile>"),
+            KP_XML.replace("</KeePassFile>", ""),
+        ] {
+            assert!(crate::keepass_kdbx::read(invalid.as_bytes(), "").is_err());
+        }
+    }
+}
+
 pub(crate) enum KeyImportError {
     Invalid,
     UnsupportedVersion,
@@ -157,13 +262,19 @@ fn source_key(row: &VaultItem) -> Option<String> {
     let id = text(&meta.0, "sourceId");
     (!id.is_empty()).then(|| format!("bitwarden:{id}"))
 }
-fn signature(row: &VaultItem) -> [u8; 32] {
+fn signature(row: &VaultItem, distinguish_groups: bool) -> [u8; 32] {
     let json = row.to_json_value();
     let data = Zeroizing::new(json.get_field("data").map(|value| value.stringify()).unwrap_or_default());
     let mut hash = Sha256::new();
     for value in [&*data, &row.title, &row.note] {
         hash.update(value.len().to_le_bytes());
         hash.update(value.as_bytes());
+    }
+    if distinguish_groups {
+        for tag in &row.tags {
+            hash.update(tag.len().to_le_bytes());
+            hash.update(tag.as_bytes());
+        }
     }
     hash.finalize().into()
 }
@@ -175,7 +286,8 @@ struct Preview { ready: usize, skipped: usize, invalid: usize, unsupported: usiz
 #[derive(Serialize)]
 struct Sample { title: String, kind: &'static str, account: String }
 
-fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64) -> Result<Preview> {
+fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) -> Result<Preview> {
+    let keepass = format == "keepass";
     let mut report = Preview { invalid: batch.invalid, unsupported: batch.unsupported, ignored_otp: batch.ignored_otp,
         ignored_passkeys: batch.ignored_passkeys, unsupported_passkey_versions: batch.unsupported_passkey_versions, ..Default::default() };
     let mut sources = BTreeMap::new();
@@ -185,7 +297,7 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64) -> Result<Previe
     let mut hotp = BTreeSet::new();
     for (index, row) in vault.items.iter().enumerate() {
         if let Some(id) = source_key(row) { sources.insert(id, index); }
-        signatures.insert(signature(row), index);
+        signatures.insert(signature(row, keepass), index);
         ids.insert(row.id.clone(), index);
         if let CredentialData::Login(login) = &row.data {
             for key in bundle::read(&login.passkey_data)? { known_keys.insert((key.rp_id.clone(), key.credential_id.clone())); }
@@ -195,14 +307,20 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64) -> Result<Previe
     }
     for mut row in batch.records.drain(..) {
         let index = ids.get(&row.id).copied().or_else(|| source_key(&row).and_then(|id| sources.get(&id).copied()))
-            .or_else(|| signatures.get(&signature(&row)).copied());
+            .or_else(|| signatures.get(&signature(&row, keepass)).copied());
         let mut incoming = match &row.data {
             CredentialData::Login(login) => bundle::read(&login.passkey_data)?,
             _ => Vec::new(),
         };
         incoming.retain(|key| !known_keys.contains(&(key.rp_id.clone(), key.credential_id.clone())));
         if let Some(index) = index {
-            if incoming.is_empty() { report.skipped += 1; continue; }
+            if keepass || incoming.is_empty() {
+                // A source UUID (especially in plaintext XML) detects duplicates; it never
+                // authorizes attaching a different private key to the existing credential.
+                report.ignored_passkeys += incoming.len();
+                report.skipped += 1;
+                continue;
+            }
             let existing = &mut vault.items[index];
             let CredentialData::Login(login) = &mut existing.data else { report.ignored_passkeys += incoming.len(); continue; };
             let mut keys = bundle::read(&login.passkey_data)?;
@@ -237,7 +355,7 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64) -> Result<Previe
         if row.created_at_ms == 0 { row.created_at_ms = now; }
         if row.updated_at_ms == 0 { row.updated_at_ms = now; }
         if let Some(id) = source_key(&row) { sources.insert(id, vault.items.len()); }
-        signatures.insert(signature(&row), vault.items.len());
+        signatures.insert(signature(&row, keepass), vault.items.len());
         record_sample(&mut report, &row);
         vault.items.push(row);
     }
@@ -281,7 +399,7 @@ pub fn wasm_portable_import(format: &str, key: Vec<u8>, wrap: Vec<u8>, head: &[u
         "proton" => crate::vendor_archives::proton(&bytes),
         _ => Err(INVALID),
     }.map_err(JsValue::from_str)?;
-    let preview = apply(&mut vault, batch, now as u64).map_err(JsValue::from_str)?;
+    let preview = apply(&mut vault, batch, now as u64, format).map_err(JsValue::from_str)?;
     let report = serde_json::to_string(&preview).map_err(|_| JsValue::from_str(INVALID))?;
     let count = preview.ready as u32;
     let (head, snap) = if commit && count != 0 { seal_vault(&keys, head, vault, now as u64)? }

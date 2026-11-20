@@ -8,6 +8,8 @@ use vault_otp::{encode_base32, parse, uri_decode, uri_encode};
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+mod legacy;
+
 type Result<T> = std::result::Result<T, &'static str>;
 const MAX_FILE: usize = 4 * 1024 * 1024;
 const MAX_ROWS: usize = 5000;
@@ -330,14 +332,107 @@ fn stratum(bytes: &[u8]) -> Result<Batch> {
 #[wasm_bindgen]
 pub fn wasm_parse_authenticator_backup(format: &str, bytes: Vec<u8>, password: String) -> std::result::Result<String, JsValue> {
     let (bytes, password) = (Zeroizing::new(bytes), Zeroizing::new(password));
-    let parse = || -> Result<String> {
-        if bytes.is_empty() || bytes.len() > MAX_FILE || password.len() > 4096 { return Err(INVALID); }
-        let batch = match format {
-            "google" => google(&bytes), "aegis" => aegis(&bytes, &password), "2fas" => twofas(&bytes, &password),
-            "raivo" => raivo_or_andotp(&bytes, &password, true), "andotp" => raivo_or_andotp(&bytes, &password, false),
-            "stratum" => stratum(&bytes), _ => Err(INVALID),
-        }?;
-        serde_json::to_string(&batch).map_err(|_| INVALID)
-    };
-    parse().map_err(JsValue::from_str)
+    let batch = read_backup(format, &bytes, &password).map_err(JsValue::from_str)?;
+    serde_json::to_string(&batch).map_err(|_| JsValue::from_str(INVALID))
+}
+
+fn read_backup(format: &str, bytes: &[u8], password: &str) -> Result<Batch> {
+    if bytes.is_empty() || bytes.len() > MAX_FILE || password.len() > 4096 { return Err(INVALID); }
+    match format {
+        "google" => google(bytes), "aegis" => aegis(bytes, password), "2fas" => twofas(bytes, password),
+        "raivo" => raivo_or_andotp(bytes, password, true), "andotp" => raivo_or_andotp(bytes, password, false),
+        "stratum" => stratum(bytes), "freeotp-plus" => legacy::freeotp_plus(bytes, password),
+        "winauth" => legacy::winauth(bytes, password), _ => Err(INVALID),
+    }
+}
+
+#[cfg(test)]
+mod native_text_tests {
+    use super::*;
+    use serde_json::json;
+
+    const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    #[test]
+    fn freeotp_plus_orders_java_bytes_and_does_not_reuse_an_entry_for_duplicate_ids() {
+        let raw = serde_json::to_vec(&json!({
+            "tokenOrder": ["Bank:a:b", "Bank:a:b", "missing"],
+            "tokens": [
+                {"type":"HOTP","algo":"SHA1","digits":6,"period":30,"counter":7,
+                 "issuerInt":"Bank","issuerExt":"Bank","label":"a:b","category":"Work",
+                 "secret":b"12345678901234567890".to_vec()},
+                {"type":"TOTP","algo":"SHA256","digits":8,"period":60,"counter":-1,
+                 "issuerInt":"Bank","issuerAlt":"Display","label":"a:b","labelAlt":"x+y:team",
+                 "secret":[-128,-127,0,1,2,3,4,5,6,-1]},
+                {"type":"HOTP","algo":"SHA1","digits":6,"period":30,"counter":8,
+                 "label":"not in order","secret":b"12345678901234567890".to_vec()}
+            ]
+        })).unwrap();
+        let batch = read_backup("freeotp-plus", &raw, "").unwrap();
+        assert_eq!((batch.rows.len(), batch.invalid), (2, 2));
+        assert_eq!(batch.rows[0].tags, ["Work"]);
+        let hotp = parse(&batch.rows[0].data.totp_uri).unwrap();
+        assert_eq!(hotp.account(), "a:b");
+        assert_eq!(hotp.code_for_counter(hotp.counter), "162583");
+        let totp = parse(&batch.rows[1].data.totp_uri).unwrap();
+        assert_eq!(totp.account(), "x+y:team");
+        assert_eq!(totp.issuer, "Display");
+        let canonical = totp.canonical_uri();
+        assert!(canonical.contains("&period=60&"));
+        let base32 = encode_base32(&[128, 129, 0, 1, 2, 3, 4, 5, 6, 255]);
+        assert!(canonical.contains(base32.as_str()));
+    }
+
+    #[test]
+    fn native_uri_next_counters_and_label_encoding_are_source_specific() {
+        let free = format!("otpauth://hotp/%3Aa+b%3Ateam?secret={SEED}&algorithm=SHA1&digits=6&period=30&counter=8");
+        let win = format!("otpauth://hotp/Bank:a+b%2Bteam?secret={SEED}&digits=6&issuer=Bank&counter=7");
+        for (format, line, expected_account, counter, code) in [
+            ("freeotp-plus", free, "a+b:team", 7, "162583"),
+            ("winauth", win, "a b+team", 8, "399871"),
+        ] {
+            let backup = read_backup(format, line.as_bytes(), "").unwrap();
+            assert_eq!(backup.rows.len(), 1);
+            let row = &backup.rows[0];
+            assert_eq!(row.data.username, expected_account);
+            let otp = parse(&row.data.totp_uri).unwrap();
+            assert_eq!(otp.account(), expected_account);
+            assert_eq!(otp.counter, counter);
+            assert_eq!(otp.code_for_counter(otp.counter), code);
+        }
+    }
+
+    #[test]
+    fn reports_unknown_counters_and_rejects_ambiguous_or_nonstandard_rows() {
+        let free = format!("otpauth://hotp/Example?secret={SEED}&algorithm=SHA1&digits=6&period=30&counter=0");
+        let win = format!("otpauth://hotp/Example?secret={SEED}&digits=6&counter=9223372036854775807");
+        let duplicate = format!("otpauth://hotp/Example?secret={SEED}&digits=6&counter=0&counter=1");
+        let mismatch = format!("otpauth://totp/A:user?secret={SEED}&digits=6&issuer=B");
+        let bad_steam = format!("otpauth://totp/Steam:user?secret={SEED}&digits=5&issuer=Steam&algorithm=SHA512&period=30");
+        for (format, line) in [
+            ("freeotp-plus", free), ("winauth", win), ("winauth", duplicate),
+            ("winauth", mismatch), ("freeotp-plus", bad_steam),
+        ] {
+            let batch = read_backup(format, line.as_bytes(), "").unwrap();
+            assert!(batch.rows.is_empty());
+            assert_eq!(batch.invalid + batch.unsupported, 1);
+        }
+        let steam = format!("otpauth://totp/Steam:user?secret={SEED}&digits=5&issuer=Steam&deviceid=private&data=not-a-session");
+        let batch = read_backup("winauth", steam.as_bytes(), "").unwrap();
+        assert_eq!(batch.rows.len(), 1);
+        let output = serde_json::to_string(&batch).unwrap();
+        assert!(output.contains("otpauth://steam/"));
+        assert!(!output.contains("private") && !output.contains("not-a-session"));
+    }
+
+    #[test]
+    fn freeotp_plus_rejects_repeated_structural_and_secret_fields() {
+        let seed = "[49,50,51,52,53,54,55,56,57,48]";
+        let token = format!(r#"{{"label":"tester","type":"TOTP","secret":{seed}}}"#);
+        let repeated = format!(r#"{{"tokens":[{token}],"tokens":[{token}],"tokenOrder":["tester"]}}"#);
+        let repeated_seed = format!(r#"{{"tokens":[{{"label":"tester","type":"TOTP","secret":{seed},"secret":{seed}}}],"tokenOrder":["tester"]}}"#);
+        for raw in [repeated, repeated_seed] {
+            assert!(read_backup("freeotp-plus", raw.as_bytes(), "").is_err());
+        }
+    }
 }

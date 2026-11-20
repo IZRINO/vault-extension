@@ -1000,7 +1000,8 @@ export class VaultController {
           check();
           if (message.type === 'import-migration') {
             if (message.stamp !== stamp) throw new Error('文件、字段映射或密码库已变更，请重新预览。');
-            await this.verify(message.proof, check);
+            if (message.format === 'keepass') await this.verifyMaster(message.proof, check);
+            else await this.verify(message.proof, check);
           }
           if (!isCsv) {
             const output = await derive<{ report: string; head: number[]; snap: number[]; count: number }>('portable-import', [
