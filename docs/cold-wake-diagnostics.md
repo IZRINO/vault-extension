@@ -1,8 +1,24 @@
 # 千条库原生 Popup 冷开补测
 
-2026-11-20，本机 Windows，Edge `157.0.4341.60`、Helium `157.0.8103.78`。这是 [T01](https://github.com/IZRINO/vault-extension/issues/1) 和 [T36](https://github.com/IZRINO/vault-extension/issues/36) 的补测，不替代[原候选包的功能及准出记录](release-candidate-status.md)。
+2026-11-20，本机 Windows。[T01](https://github.com/IZRINO/vault-extension/issues/1) 和 [T36](https://github.com/IZRINO/vault-extension/issues/36) 的补测，不替代[候选包的功能及准出记录](release-candidate-status.md)。
 
-## 生产包复测
+## Vault 0.1.0 当前候选包同包复测
+
+生产 ZIP `3a2fa7b7d66f`。52 个解压文件逐字节与 ZIP 内文件一致，冷开脚本按路径和内容计算的树 SHA-256 为 `02388a5bba6880b74749ab31a4064a50a94f4a3717aac1e45e75e01e93a1278f`。Edge `158.0.4370.33`、Helium `157.0.8103.78` 各完成 10 个样本，每库 1,000 条合成凭证。
+
+| 浏览器 | 从工具栏到列表 DOM（最短 / 中位数 / 最长） | WASM 恢复（最短 / 中位数 / 最长） |
+| --- | --- | --- |
+| Edge | 424.59 / 556.23 / 670.82 ms | 49.50 / 72.00 / 119.40 ms |
+| Helium | 417.19 / 548.50 / 702.97 ms | 53.50 / 69.20 / 120.00 ms |
+
+- 两端各 10 个样本均未达到 `<50 ms` Popup DOM 或 `<5 ms` WASM 恢复；命令保存报告后以性能断言退出。仅 Worker 时间原点之前的耗时中位数就是 380.00 / 366.00 ms，WASM 内部认证和解码中位数为 18.30 / 16.80 ms。
+- 同机同版浏览器各 10 次无 Worker、无权限的最小 MV3 对照，原生工具栏动作到执行首脚本最短 265.62 / 255.84 ms，操作就绪最短 266.52 / 256.84 ms。这是 CDP 原生动作的测量，不是物理点击，也不是其他硬件上的下限。
+- 修正测试夹具：只监听 `page` 目标事件可能漏报 Popup，改为直接查询浏览器目标；每个样本使用新的动作标签页，在停 Worker 前等待窗体稳定。每次确认 Worker 已停才触发原生工具栏动作，检查恢复时间及列表提交顺序。没有预热、改变计时起点或修改包内代码。
+- 本机证据：`test-results/wakeup-1000.rc-3a2fa7b7d66f.json`、`test-results/wakeup-popup-floor-1795146360897.json`。复现时指向 `test-results/release-unpacked-3a2fa7b7d66f`，设置 `VAULT_WAKE_ITEMS=1000`、`VAULT_WAKE_SAMPLES=10`、`VAULT_WAKE_REPORT_LABEL=rc-3a2fa7b7d66f`，运行 `node scripts/test-wakeup.cjs`。
+
+## 早期生产包复测
+
+Edge `157.0.4341.60`、Helium `157.0.8103.78`。
 
 - ZIP：`test-results/Vault-2026-11-20-0020ce897c36-chrome.zip`，5,986,049 B。SHA-256：`0020ce897c36ff7ae95efd0dae00db90f8e40398cb8d494ed8bf59c56458567c`。解压目录：`test-results/release-unpacked-0020ce897c36`；解压树摘要：`5ffd748de830b892786a5f7490f3afb827a38182cd03e5e63f5e3eff441b7e10`。主 WASM 未变，255,677 B。
 - 1,000 条合成凭证；每次先停后台，再触发原生扩展工具栏动作，每浏览器 10 次。Popup 从动作计时到条目 DOM 提交，随后检查合成条目可见、启用且中心命中；WASM 从本次冷 Worker 时间原点计时到已认证快照恢复完成。额外记录双 `requestAnimationFrame`，它跨过一次绘制机会，不保证像素已经上屏，且不替代 DOM 门槛。

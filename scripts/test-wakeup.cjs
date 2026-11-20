@@ -142,14 +142,16 @@ async function run(name, artifact) {
     await addFixture(setup);
     await setup.close();
 
-    const tab = context.pages()[0] || await context.newPage();
-    await tab.goto(tabUrl);
-    await tab.bringToFront();
+    const monitorPage = context.pages()[0] || await context.newPage();
+    await monitorPage.goto(tabUrl);
     const browserCdp = await context.browser().newBrowserCDPSession();
-    const { targetInfos } = await browserCdp.send('Target.getTargets', { filter: [{ type: 'tab' }] });
-    const actionTab = targetInfos.find(target => target.url === tabUrl);
-    assert(actionTab, 'Native action needs a real browser tab');
-    const cdp = await context.newCDPSession(tab);
+    const popupUrl = `chrome-extension://${id}/popup.html`;
+    // A toolbar Popup may be listed without a matching page-only discovery event.
+    const findNativePopup = async () => {
+      const { targetInfos } = await browserCdp.send('Target.getTargets', { filter: [{ type: 'page' }] });
+      return targetInfos.find(target => target.url === popupUrl);
+    };
+    const cdp = await context.newCDPSession(monitorPage);
     let version;
     cdp.on('ServiceWorker.workerVersionUpdated', ({ versions }) => {
       version = versions.find(entry => entry.scriptURL === worker.url()) ?? version;
@@ -160,25 +162,40 @@ async function run(name, artifact) {
     const samples = [];
     let trace;
     for (let index = 0; index < sampleCount; index++) {
+      const sample = `${name} cold sample ${index + 1}`;
+      assert(!await findNativePopup(), `${sample}: previous Popup is still open`);
+      // A fresh browser tab avoids reusing the previous toolbar action's UI state.
+      const actionPage = await context.newPage();
+      await actionPage.goto(`${tabUrl}-${index + 1}`);
+      await actionPage.bringToFront();
+      const { targetInfos } = await browserCdp.send('Target.getTargets', { filter: [{ type: 'tab' }] });
+      const actionTab = targetInfos.find(target => target.url === actionPage.url());
+      assert(actionTab, `${sample}: native action needs a real browser tab`);
+      await expect.poll(() => actionPage.evaluate(() => document.hasFocus()), {
+        message: `${sample}: action tab needs focus on the active desktop`,
+      }).toBe(true);
+      // The native toolbar can ignore the next action while its bubble is closing.
+      // Let the window settle before stopping the worker, outside the timed sample.
+      await delay(300);
       await cdp.send('ServiceWorker.stopWorker', { versionId: version.versionId });
       await expect.poll(() => version?.runningStatus).toBe('stopped');
       if (traceFirstRender && index === 0) await browserCdp.send('Tracing.start', {
         categories: 'devtools.timeline,blink.user_timing,loading,toplevel,disabled-by-default-devtools.timeline',
         transferMode: 'ReturnAsStream',
       });
+      assert.equal(version.runningStatus, 'stopped', `${sample}: worker must still be stopped at the toolbar action`);
       const startedAt = now();
       await browserCdp.send('Extensions.triggerAction', { id, targetId: actionTab.targetId });
       // Read marks after the deadline; hidden Popup timers may be throttled by Chromium.
       await delay(1000);
-      let popupTarget;
+      let popup;
       await expect.poll(async () => {
-        const { targetInfos } = await browserCdp.send('Target.getTargets', { filter: [{ type: 'page' }] });
-        popupTarget = targetInfos.find(target => target.url === `chrome-extension://${id}/popup.html`);
-        return !!popupTarget;
-      }, { timeout: 2500 }).toBe(true);
+        popup = await findNativePopup();
+        return Boolean(popup);
+      }, { timeout: 2500, message: `${sample}: expected a fresh native toolbar Popup` }).toBe(true);
       const { readyAt, presentedAt, navigationAt, requestMs, replyMs, popupModuleMs, documentResponseFromNavigationMs,
         popupListenMs, popupApplyMs, domInteractiveMs, domContentLoadedMs } =
-        await readPopup(browserCdp, popupTarget.targetId);
+        await readPopup(browserCdp, popup.targetId);
       if (traceFirstRender && index === 0) {
         trace = await renderTrace(browserCdp);
         console.log(JSON.stringify({ browser: name, diagnosticOnly: true, trace }));
@@ -202,14 +219,14 @@ async function run(name, artifact) {
         documentResponseFromNavigationMs, domInteractiveMs, domContentLoadedMs, popupReplyMs: replyMs, popupModuleMs, popupListenMs, popupApplyMs,
         restoreComputeMs: restored.restoreMs - restored.restoreComputeStartMs, workerOpenResponseMs: restored.openResponseMs,
         backgroundEntryMs: restored.backgroundEntryMs, prepareMs: restored.prepareMs, wasmLoadedMs: restored.wasmLoadedMs });
-      await browserCdp.send('Target.closeTarget', { targetId: popupTarget.targetId }).catch(error => {
+      await browserCdp.send('Target.closeTarget', { targetId: popup.targetId }).catch(error => {
         // Chromium already dismisses the toolbar Popup when it loses focus.
         if (!error.message.includes('No target with given id found')) throw error;
       });
-      if (traceFirstRender) {
-        await tab.bringToFront();
-        await delay(250);
-      }
+      await expect.poll(async () => !await findNativePopup(), {
+        message: `${sample}: Popup should close before the next action`,
+      }).toBe(true);
+      await actionPage.close();
     }
     if (fixtureCount > 32) {
       const list = await context.newPage();
