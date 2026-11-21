@@ -1,6 +1,20 @@
 const { expect } = require('@playwright/test');
+const { createHash } = require('node:crypto');
+const fs = require('node:fs/promises');
+const path = require('node:path');
 
 class BrowserTargetTimeout extends Error {}
+
+async function extensionBuildHash(directory) {
+  const entries = await fs.readdir(directory, { recursive: true, withFileTypes: true });
+  const files = entries.filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name)).sort();
+  const digest = createHash('sha256');
+  for (const file of files) {
+    digest.update(path.relative(directory, file).replaceAll('\\', '/') + '\0');
+    digest.update(createHash('sha256').update(await fs.readFile(file)).digest());
+  }
+  return digest.digest('hex');
+}
 
 async function waitForSetupTab(context, workerUrl) {
   const url = new URL('/sidepanel.html?view=setup', workerUrl).href;
@@ -62,4 +76,4 @@ async function evaluateBrowserTarget(cdp, targetId, expression) {
     await cdp.send('Target.detachFromTarget', { sessionId }).catch(() => undefined);
   }
 }
-module.exports = { waitForBuiltInFilters, waitForSetupTab, evaluateNativePopup: evaluateBrowserTarget };
+module.exports = { extensionBuildHash, waitForBuiltInFilters, waitForSetupTab, evaluateNativePopup: evaluateBrowserTarget };

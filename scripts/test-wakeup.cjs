@@ -1,11 +1,10 @@
 const { chromium, expect } = require('@playwright/test');
 const assert = require('node:assert/strict');
-const { createHash } = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
-const { evaluateNativePopup, waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
+const { extensionBuildHash, evaluateNativePopup, waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -270,27 +269,16 @@ async function run(name, artifact) {
   }
 }
 
-async function buildHash() {
-  const entries = await fs.readdir(extension, { recursive: true, withFileTypes: true });
-  const files = entries.filter(entry => entry.isFile()).map(entry => path.join(entry.parentPath, entry.name)).sort();
-  const digest = createHash('sha256');
-  for (const file of files) {
-    digest.update(path.relative(extension, file).replaceAll('\\', '/') + '\0');
-    digest.update(createHash('sha256').update(await fs.readFile(file)).digest());
-  }
-  return digest.digest('hex');
-}
-
 (async () => {
   assert(Number.isInteger(sampleCount) && sampleCount >= 2, 'At least two cold samples are required');
   assert(Number.isInteger(fixtureCount) && fixtureCount >= 1 && fixtureCount <= 5000, 'Fixture count must be 1–5000');
   assert(!reportLabel || /^[a-z0-9-]{1,36}$/.test(reportLabel), 'Report label must be 1–36 lowercase ASCII letters, digits or hyphens');
   assert(!traceFirstRender || reportLabel, 'A diagnostic trace requires a separate report label');
   const names = process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium'];
-  const artifact = await buildHash();
+  const artifact = await extensionBuildHash(extension);
   const results = [];
   for (const name of names) results.push(await run(name, artifact));
-  assert.equal(await buildHash(), artifact, 'The production build changed during measurement');
+  assert.equal(await extensionBuildHash(extension), artifact, 'The production build changed during measurement');
   const output = path.join(root, 'test-results');
   await fs.mkdir(output, { recursive: true });
   const filename = `wakeup${fixtureCount === 1 ? '' : '-' + fixtureCount}${reportLabel ? '.' + reportLabel : ''}.json`;

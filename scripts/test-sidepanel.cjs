@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
+const { extensionBuildHash, waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -92,7 +92,42 @@ async function attachPanel(cdp, targetId) {
   };
 }
 
-async function exercise(panel) {
+async function exerciseClipboard(panel, copyAfterVerification) {
+  const ordinary = 'Vault side panel clipboard test complete';
+  // Compare in the extension document. Unexpected clipboard data never enters the report or assertion output.
+  const content = () => panel.evaluate(async (secret, replacement) => {
+    const current = await navigator.clipboard.readText();
+    if (current === secret) return 'fixture';
+    if (current === replacement) return 'replacement';
+    return current === '' ? 'empty' : 'other';
+  }, password, ordinary);
+  const pending = () => panel.evaluate(async () => Boolean((await chrome.storage.session.get('clipboard')).clipboard));
+
+  async function copy() {
+    await copyAfterVerification();
+    await expect.poll(content, { timeout: 15000, intervals: [100] }).toBe('fixture');
+    return performance.now();
+  }
+  const first = await copy();
+  await expect.poll(content, { timeout: 45000, intervals: [250] }).toBe('empty');
+  const clearMs = Math.round(performance.now() - first);
+  assert(clearMs >= 28000, `Clipboard cleared too early (${clearMs} ms after observing the copy)`);
+  await expect.poll(pending).toBe(false);
+
+  const second = await copy();
+  await expect.poll(pending).toBe(true);
+  await panel.evaluate(async (secret, replacement) => {
+    if (await navigator.clipboard.readText() !== secret) throw new Error('Clipboard changed before the replacement check');
+    await navigator.clipboard.writeText(replacement);
+  }, password, ordinary);
+  await expect.poll(pending, { timeout: 45000, intervals: [250] }).toBe(false);
+  const preservationCheckMs = Math.round(performance.now() - second);
+  assert(preservationCheckMs >= 28000, 'The replacement check must span the cleanup deadline');
+  assert.equal(await content(), 'replacement', 'The ordinary text must survive the expiry of the earlier copy');
+  return { clearMs, preservationCheckMs, ordinaryTextPreserved: true };
+}
+
+async function exercise(panel, useClipboard) {
   const text = selector => panel.evaluate(selector => document.querySelector(selector)?.textContent ?? '', selector);
   const count = selector => panel.evaluate(selector => document.querySelectorAll(selector).length, selector);
   const button = (label, scope = '') => panel.click(scope + 'button', label);
@@ -137,6 +172,12 @@ async function exercise(panel) {
   await expect.poll(() => text('dialog h2')).toBe('再次验证身份');
   await button('取消', 'dialog ');
   assert.equal(await panel.evaluate(async () => Boolean((await chrome.storage.session.get('clipboard')).clipboard)), false);
+
+  const clipboard = useClipboard ? await exerciseClipboard(panel, async () => {
+    await button('复制“' + edited + '”的密码');
+    await expect.poll(() => text('dialog h2')).toBe('再次验证身份');
+    await verify(master);
+  }) : undefined;
 
   await button('设置');
   assert.equal(await panel.evaluate(() => chrome.permissions.contains({ permissions: ['privacy'] })), false);
@@ -198,9 +239,10 @@ async function exercise(panel) {
   }), { value: true, granted: false });
   await button('锁定密码库');
   await expect.poll(() => text('.lamp')).toBe('已锁定');
+  return clipboard;
 }
 
-async function run(name) {
+async function run(name, artifact, useClipboard) {
   const executablePath = process.env.VAULT_BROWSER_PATH ?? executables[name];
   assert(executablePath, `Unknown browser ${name}`);
   await fs.access(executablePath);
@@ -244,11 +286,14 @@ async function run(name) {
       return !!panelTarget;
     }).toBe(true);
     panel = await attachPanel(cdp, panelTarget.targetId);
-    await exercise(panel);
+    const platformAuthenticatorAvailable = await panel.evaluate(async () =>
+      !!window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+    const clipboard = await exercise(panel, useClipboard);
     assert.deepEqual(panel.errors, []);
     const result = {
-      browser: name, version: context.browser().version(), extension: path.relative(root, extension),
+      browser: name, version: context.browser().version(), extension: path.relative(root, extension), buildSha256: artifact,
       contextType: 'SIDE_PANEL', createSearchEdit: true, reprompt: true, cancelCopy: true,
+      platformAuthenticatorAvailable, protectedCopyClipboard: clipboard,
       privacyOptional: true, privacyPolicyAndRevocationSimulated: true,
       manualVaultLock: true, consoleErrors: panel.errors,
     };
@@ -275,9 +320,16 @@ async function run(name) {
 }
 
 (async () => {
+  const args = process.argv.slice(2);
+  const useClipboard = args.includes('--clipboard');
+  const names = args.filter(arg => arg !== '--clipboard');
+  for (const name of names) assert(Object.hasOwn(executables, name), `Unknown browser ${name}`);
+  const artifact = await extensionBuildHash(extension);
   const results = [];
-  for (const name of process.argv.slice(2).length ? process.argv.slice(2) : ['edge', 'helium']) results.push(await run(name));
+  for (const name of names.length ? names : ['edge', 'helium']) results.push(await run(name, artifact, useClipboard));
+  assert.equal(await extensionBuildHash(extension), artifact, 'The extension changed during side panel verification');
   const output = path.resolve(root, process.env.VAULT_TEST_OUTPUT || 'test-results');
   await fs.mkdir(output, { recursive: true });
-  await fs.writeFile(path.join(output, 'sidepanel.json'), JSON.stringify(results, null, 2) + '\n');
+  const filename = useClipboard ? 'sidepanel-clipboard.json' : 'sidepanel.json';
+  await fs.writeFile(path.join(output, filename), JSON.stringify(results, null, 2) + '\n');
 })().catch(error => { console.error(error); process.exitCode = 1; });
