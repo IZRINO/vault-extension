@@ -20,14 +20,22 @@ function clipboardWrite(text: string) {
   try { if (!document.execCommand('copy')) throw new Error('无法写入剪贴板'); }
   finally { document.removeEventListener('copy', onCopy); field.value = ''; field.remove(); }
 }
-function clipboardRead(): string {
+function clipboardRead(): string | null {
   const field = document.createElement('textarea');
   document.body.append(field);
   field.focus();
+  let text: string | null | undefined;
+  const onPaste = (event: ClipboardEvent) => {
+    event.preventDefault();
+    // Read the original text/plain. Inserting it into a textarea folds CRLF and CR to LF.
+    const data = event.clipboardData;
+    if (data) text = data.types.includes('text/plain') ? data.getData('text/plain') : null;
+  };
+  document.addEventListener('paste', onPaste, { once: true });
   try {
-    if (!document.execCommand('paste')) throw new Error('无法读取剪贴板');
-    return field.value;
-  } finally { field.value = ''; field.remove(); }
+    if (!document.execCommand('paste') || text === undefined) throw new Error('无法读取剪贴板');
+    return text;
+  } finally { document.removeEventListener('paste', onPaste); field.value = ''; field.remove(); }
 }
 browser.runtime.onMessage.addListener((message, sender, respond) => {
   const locked = message?.target === 'vault-event' && message.type === 'locked';
@@ -99,11 +107,11 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       const { text, expiresAt } = message.payload;
       if (typeof text !== 'string' || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error('复制请求已过期，请重试。');
       clipboardWrite(text);
-      return null;
+      return Date.now();
     }
     if (message.operation === 'clear-clipboard') {
       const current = clipboardRead();
-      if (await clipboardDigest(current) === message.payload && clipboardRead() === current) clipboardWrite('');
+      if (current !== null && await clipboardDigest(current) === message.payload && clipboardRead() === current) clipboardWrite('');
       return null;
     }
     throw new Error('无效的离屏操作');

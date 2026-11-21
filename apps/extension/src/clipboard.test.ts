@@ -15,14 +15,22 @@ async function setup() {
   let field: { value: string };
   const doc = new EventTarget();
   vi.stubGlobal('document', Object.assign(doc, {
-    createElement: () => ({ value: '', focus() {}, select() {}, remove() {} }),
+    createElement: () => {
+      let value = '';
+      return { get value() { return value; }, set value(text: string) { value = text.replace(/\r\n?/g, '\n'); },
+        focus() {}, select() {}, remove() {} };
+    },
     body: { append(element: typeof field) { field = element; } },
     execCommand(command: string) {
-      if (command === 'paste') { field.value = clipboard.text; return true; }
-      if (!clipboard.writable) return false;
-      doc.dispatchEvent(Object.assign(new Event('copy', { cancelable: true }), {
-        clipboardData: { setData(_type: string, text: string) { clipboard.text = text; } },
-      }));
+      if (command === 'copy' && !clipboard.writable) return false;
+      const event = Object.assign(new Event(command, { cancelable: true }), {
+        clipboardData: { types: ['text/plain'], getData: (type: string) => type === 'text/plain' ? clipboard.text : '',
+          setData(type: string, text: string) { if (type === 'text/plain') clipboard.text = text; } },
+      });
+      if (doc.dispatchEvent(event)) {
+        if (command === 'copy') clipboard.text = field.value;
+        if (command === 'paste') field.value = clipboard.text;
+      }
       return true;
     },
   }));
@@ -33,6 +41,7 @@ async function setup() {
     remove: async (key: string) => { delete data[key]; },
   };
   let alarm: { when: number; periodInMinutes?: number } | undefined;
+  const createAlarm = vi.fn(async (_name: string, info: NonNullable<typeof alarm>) => { alarm = { ...info }; });
   const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
   const deliver = (message: unknown) => new Promise<Reply>(resolve => {
     receive(structuredClone(message), { id, url: getURL('/background.js') }, resolve);
@@ -44,7 +53,7 @@ async function setup() {
     storage: { session },
     alarms: {
       get: async () => alarm && { scheduledTime: alarm.when, periodInMinutes: alarm.periodInMinutes },
-      create: async (_name: string, info: NonNullable<typeof alarm>) => { alarm = { ...info }; },
+      create: createAlarm,
       clear: async () => { alarm = undefined; },
     },
     offscreen,
@@ -53,6 +62,22 @@ async function setup() {
   await import('../entrypoints/offscreen/main');
   let worker = await import('./clipboard');
   const restart = async () => { vi.resetModules(); worker = await import('./clipboard'); };
+  const startBackground = async () => {
+    await restart();
+    const event = { addListener() {} };
+    vi.stubGlobal('browser', { ...browser,
+      storage: { session: { ...session, setAccessLevel: async () => {} }, local: { setAccessLevel: async () => {}, get: async () => ({}) } },
+      runtime: { ...browser.runtime, onMessage: event, onConnect: event, onInstalled: event, onStartup: event },
+      alarms: { ...browser.alarms, onAlarm: event },
+      idle: { setDetectionInterval() {}, onStateChanged: event },
+      tabs: { onRemoved: event, onUpdated: event, onActivated: event }, windows: { onRemoved: event },
+      commands: { onCommand: event }, contextMenus: { onClicked: event },
+    });
+    vi.stubGlobal('defineBackground', (start: () => void) => start);
+    const start = (await import('../entrypoints/background')).default;
+    (start as unknown as () => void)();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  };
   const advanceTo = async (now: number) => {
     clock.mockReturnValue(now);
     if (alarm && alarm.when <= now) {
@@ -60,7 +85,7 @@ async function setup() {
       await worker.clearExpiredClipboard();
     }
   };
-  return { clipboard, session, offscreen, sendMessage, deliver, restart,
+  return { clipboard, session, offscreen, sendMessage, deliver, restart, startBackground, createAlarm,
     copy: (text: string, check = () => {}) => worker.copyWithExpiry(text, check), advanceTo };
 }
 
@@ -71,6 +96,44 @@ it('keeps the existing clipboard when cleanup cannot be registered', async () =>
   f.session.set.mockRejectedValueOnce(new Error('session storage unavailable'));
   await expect(f.copy('sensitive fixture')).rejects.toThrow('session storage unavailable');
   expect(f.clipboard.text).toBe('ordinary text');
+});
+
+it('counts 30 seconds from the clipboard write when registration and the reply are slow', async () => {
+  const f = await setup();
+  const save = f.session.set.getMockImplementation()!;
+  f.session.set.mockImplementationOnce(async changes => {
+    await f.advanceTo(1_020_000);
+    await save(changes);
+  });
+  f.sendMessage.mockImplementationOnce(async message => {
+    const reply = await f.deliver(message);
+    await f.advanceTo(1_025_000);
+    return reply;
+  });
+  await f.copy('delayed fixture');
+  await f.advanceTo(1_049_999);
+  expect(f.clipboard.text === 'delayed fixture').toBe(true);
+  await f.advanceTo(1_050_000);
+  expect(f.clipboard.text.length).toBe(0);
+});
+
+it.each(['storage', 'alarm'])('reports a confirmed copy and recovers its cleanup after a %s maintenance failure', async failure => {
+  const f = await setup();
+  await f.copy('first fixture');
+  await f.advanceTo(1_010_000);
+  f.sendMessage.mockImplementationOnce(async message => {
+    const reply = await f.deliver(message);
+    const unavailable = new Error('maintenance unavailable');
+    if (failure === 'storage') f.session.set.mockRejectedValueOnce(unavailable);
+    else f.createAlarm.mockRejectedValueOnce(unavailable);
+    return reply;
+  });
+  await expect(f.copy('replacement fixture')).resolves.toBeUndefined();
+  await f.restart();
+  await f.advanceTo(1_030_000);
+  expect(f.clipboard.text === 'replacement fixture').toBe(true);
+  await f.advanceTo(1_040_000);
+  expect(f.clipboard.text.length).toBe(0);
 });
 
 it('clears the first secret at its original deadline when writing a replacement fails', async () => {
@@ -149,19 +212,46 @@ it.each([false, true])('only extends a repeated copy to a full new 30 seconds on
   expect(f.clipboard.text).toBe('');
 });
 
-it.each([['legacy fixture', ''], ['ordinary text', 'ordinary text']])(
-  'recovers a legacy record with its alarm already consumed and the clipboard holding %s', async (text, expected) => {
+it.each([
+  { startup: true, matches: true }, { startup: true, matches: false },
+  { startup: false, matches: true }, { startup: false, matches: false },
+])('recovers a consumed legacy alarm (ordinary worker startup: $startup, clipboard matches: $matches)', async ({ startup, matches }) => {
     const f = await setup();
     // Installed versions stored just this one digest with a one-shot alarm.
     await f.session.set({ clipboard: { hash: createHash('sha256').update('legacy fixture').digest('hex'), expiresAt: 1_030_000 } });
-    f.clipboard.text = text;
-    await f.advanceTo(1_010_000);
-    f.sendMessage.mockRejectedValueOnce(new Error('lost reply'));
-    await expect(f.copy('replacement fixture')).rejects.toThrow('lost reply');
-    await f.restart();
-    await f.advanceTo(1_030_000);
-    expect(f.clipboard.text).toBe(expected);
-    await f.advanceTo(1_040_000);
-    expect(f.clipboard.text).toBe(expected);
-  },
-);
+    f.clipboard.text = matches ? 'legacy fixture' : 'ordinary text';
+    if (startup) {
+      await f.advanceTo(1_040_000);
+      await f.startBackground();
+      await f.advanceTo(1_040_000);
+    } else {
+      await f.advanceTo(1_010_000);
+      f.sendMessage.mockRejectedValueOnce(new Error('lost reply'));
+      await expect(f.copy('replacement fixture')).rejects.toThrow('lost reply');
+      await f.restart();
+      await f.advanceTo(1_030_000);
+      expect(f.clipboard.text === (matches ? '' : 'ordinary text')).toBe(true);
+      await f.advanceTo(1_040_000);
+    }
+    expect(f.clipboard.text === (matches ? '' : 'ordinary text')).toBe(true);
+    expect((await f.session.get('clipboard')).clipboard).toBeUndefined();
+});
+
+it('starts a worker without opening the clipboard or scheduling an alarm when there is no cleanup', async () => {
+  const f = await setup();
+  await f.startBackground();
+  expect(f.offscreen.hasDocument).not.toHaveBeenCalled();
+  expect(f.createAlarm).not.toHaveBeenCalled();
+});
+
+it.each([
+  { action: 'clears the copied text including CRLF and CR', copied: 'a\r\nb\rc', replacement: undefined },
+  { action: 'retains other text with different newlines', copied: 'a\nb\nc', replacement: 'a\r\nb\rc' },
+])('$action', async ({ copied, replacement }) => {
+  const f = await setup();
+  await f.copy(copied);
+  expect(f.clipboard.text === copied).toBe(true);
+  if (replacement !== undefined) f.clipboard.text = replacement;
+  await f.advanceTo(1_030_000);
+  expect(f.clipboard.text === (replacement ?? '')).toBe(true);
+});

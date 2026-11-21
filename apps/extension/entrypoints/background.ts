@@ -1,7 +1,7 @@
 import { VaultController, DAV_ALARM, LOCK_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
 import { loadVaultCore } from '../src/vault-core';
 import { isVaultPage } from '../src/sender-policy';
-import { CLIPBOARD_ALARM, clearExpiredClipboard } from '../src/clipboard';
+import { CLIPBOARD_ALARM, clearExpiredClipboard, restoreClipboardAlarm } from '../src/clipboard';
 import type { VaultMessage } from '../src/vault-messages';
 import { AutofillController } from '../src/autofill-controller';
 import type { AutofillMessage } from '../src/autofill-messages';
@@ -21,6 +21,7 @@ export default defineBackground(() => {
     browser.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
   ]);
   void ready.then(restoreDavBadge).catch(() => undefined);
+  void ready.then(restoreClipboardAlarm).catch(() => undefined);
   const notifyAutofill = (type: 'settings-changed' | 'site-settings-changed') => {
     void browser.tabs.query({}).then(tabs => Promise.allSettled(tabs.filter(tab => tab.id != null)
       .map(tab => browser.tabs.sendMessage(tab.id!, { target: 'vault-fill', type })))).catch(() => undefined);

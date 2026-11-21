@@ -377,6 +377,7 @@ describe('real WASM + background session integration', () => {
     vi.mocked(offscreen).mockImplementation(async (operation, payload) => {
       if (operation === 'copy') {
         clipboardText = (await (payload as () => Promise<{ text: string }>)()).text;
+        return Date.now();
       }
       if (operation === 'clear-clipboard' && payload === createHash('sha256').update(clipboardText).digest('hex')) clipboardText = '';
       return null;
@@ -1215,7 +1216,10 @@ describe('phase two migration transactions and autofill reads', () => {
     vi.mocked(offscreen).mockClear();
     let copied = '';
     vi.mocked(offscreen).mockImplementation(async (operation, payload) => {
-      if (operation === 'copy') copied = (await (payload as () => Promise<{ text: string }>)()).text;
+      if (operation === 'copy') {
+        copied = (await (payload as () => Promise<{ text: string }>)()).text;
+        return Date.now();
+      }
     });
     const controller = await unlocked();
     const value = record('OTP copy fixture', true);

@@ -22,6 +22,12 @@ function arm(when: number): Promise<void> {
   return browser.alarms.create(CLIPBOARD_ALARM, { when, periodInMinutes: cleanupDelayMs / 60_000 });
 }
 
+async function ensureAlarm(records: ClipboardRecord[]) {
+  const firstExpiry = Math.min(...records.map(record => record.expiresAt));
+  const alarm = await browser.alarms.get(CLIPBOARD_ALARM);
+  if (!alarm?.periodInMinutes || alarm.scheduledTime > firstExpiry) await arm(firstExpiry);
+}
+
 // The offscreen bridge only serializes document calls. Queue the matching storage
 // changes here too, so an expired alarm cannot remove a newer copy's record.
 let tail = Promise.resolve();
@@ -31,6 +37,13 @@ function enqueue(operation: () => Promise<void>): Promise<void> {
   return run;
 }
 
+export function restoreClipboardAlarm(): Promise<void> {
+  return enqueue(async () => {
+    const records = await readRecords();
+    if (records.length) await ensureAlarm(records);
+  });
+}
+
 export function copyWithExpiry(value: string, checkUnlocked: () => void): Promise<void> {
   return enqueue(async () => {
     checkUnlocked();
@@ -38,14 +51,13 @@ export function copyWithExpiry(value: string, checkUnlocked: () => void): Promis
     const hash = await clipboardDigest(value);
     let registered: ClipboardRecord | undefined;
     let dispatched = false;
+    let writtenAt: number;
     try {
-      await offscreen('copy', async () => {
+      writtenAt = await offscreen<number>('copy', async () => {
         checkUnlocked();
         const next = { hash, expiresAt: Date.now() + cleanupDelayMs };
         const candidates = [...previous, next];
-        const firstExpiry = Math.min(...candidates.map(record => record.expiresAt));
-        const alarm = await browser.alarms.get(CLIPBOARD_ALARM);
-        if (!alarm?.periodInMinutes || alarm.scheduledTime > firstExpiry) await arm(firstExpiry);
+        await ensureAlarm(candidates);
         await writeRecords(candidates);
         registered = next;
         checkUnlocked();
@@ -57,10 +69,15 @@ export function copyWithExpiry(value: string, checkUnlocked: () => void): Promis
       if (registered && (!dispatched || error instanceof OffscreenRejected)) await writeRecords(previous);
       throw error;
     }
-    if (previous.length && registered) {
-      // The earlier alarm and both digests already cover interrupted compaction.
-      await writeRecords([registered]);
-      await arm(registered.expiresAt);
+    const expiresAt = writtenAt + cleanupDelayMs;
+    if (previous.length || registered?.expiresAt !== expiresAt) {
+      try {
+        await writeRecords([{ hash, expiresAt }]);
+        await arm(expiresAt);
+      } catch {
+        // The copy is confirmed. Its pre-registered digest and recurring alarm
+        // still cover cleanup if storage or alarm maintenance is interrupted.
+      }
     }
   });
 }
