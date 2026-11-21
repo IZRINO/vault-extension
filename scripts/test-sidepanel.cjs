@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { setTimeout: delay } = require('node:timers/promises');
 const { extensionBuildHash, waitForBuiltInFilters, waitForSetupTab } = require('./browser-fixtures.cjs');
 
 const root = path.resolve(__dirname, '..');
@@ -92,15 +93,30 @@ async function attachPanel(cdp, targetId) {
   };
 }
 
-async function exerciseClipboard(panel, copyAfterVerification) {
+async function exerciseClipboard(panel, editedTitle, copyAfterVerification, stopBackground) {
   const ordinary = 'Vault side panel clipboard test complete';
+  const multiline = password + '\r\nSecond fixture line';
+  // An imported login may contain CRLF, which a single-line password input cannot enter.
+  await panel.evaluate(async (title, syntheticPassword, masterPassword) => {
+    const send = async message => {
+      const reply = await chrome.runtime.sendMessage({ target: 'vault', ...message });
+      if (!reply?.ok) throw new Error('Could not prepare the protected multiline fixture');
+      return reply.value;
+    };
+    const summary = (await send({ type: 'list' })).find(item => item.title === title);
+    const proof = { method: 'master', secret: masterPassword };
+    const item = await send({ type: 'get', id: summary.id, proof });
+    item.data.password = syntheticPassword;
+    await send({ type: 'upsert', itemJson: JSON.stringify(item), proof });
+  }, editedTitle, multiline, master);
+
   // Compare in the extension document. Unexpected clipboard data never enters the report or assertion output.
   const content = () => panel.evaluate(async (secret, replacement) => {
     const current = await navigator.clipboard.readText();
     if (current === secret) return 'fixture';
     if (current === replacement) return 'replacement';
     return current === '' ? 'empty' : 'other';
-  }, password, ordinary);
+  }, multiline, ordinary);
   const pending = () => panel.evaluate(async () => Boolean((await chrome.storage.session.get('clipboard')).clipboard));
 
   async function copy() {
@@ -109,6 +125,7 @@ async function exerciseClipboard(panel, copyAfterVerification) {
     return performance.now();
   }
   const first = await copy();
+  await stopBackground();
   await expect.poll(content, { timeout: 45000, intervals: [250] }).toBe('empty');
   const clearMs = Math.round(performance.now() - first);
   assert(clearMs >= 28000, `Clipboard cleared too early (${clearMs} ms after observing the copy)`);
@@ -116,18 +133,21 @@ async function exerciseClipboard(panel, copyAfterVerification) {
 
   const second = await copy();
   await expect.poll(pending).toBe(true);
+  await delay(Math.max(0, second + 10000 - performance.now()));
   await panel.evaluate(async (secret, replacement) => {
-    if (await navigator.clipboard.readText() !== secret) throw new Error('Clipboard changed before the replacement check');
+    const current = await navigator.clipboard.readText();
+    if (current !== secret) throw new Error('Clipboard changed before the replacement check');
     await navigator.clipboard.writeText(replacement);
-  }, password, ordinary);
+  }, multiline, ordinary);
+  const replacedAtMs = Math.round(performance.now() - second);
   await expect.poll(pending, { timeout: 45000, intervals: [250] }).toBe(false);
   const preservationCheckMs = Math.round(performance.now() - second);
   assert(preservationCheckMs >= 28000, 'The replacement check must span the cleanup deadline');
   assert.equal(await content(), 'replacement', 'The ordinary text must survive the expiry of the earlier copy');
-  return { clearMs, preservationCheckMs, ordinaryTextPreserved: true };
+  return { clearMs, replacedAtMs, preservationCheckMs, workerStoppedAfterCopy: true, multiline: true, ordinaryTextPreserved: true };
 }
 
-async function exercise(panel, useClipboard) {
+async function exercise(panel, stopBackground) {
   const text = selector => panel.evaluate(selector => document.querySelector(selector)?.textContent ?? '', selector);
   const count = selector => panel.evaluate(selector => document.querySelectorAll(selector).length, selector);
   const button = (label, scope = '') => panel.click(scope + 'button', label);
@@ -173,11 +193,12 @@ async function exercise(panel, useClipboard) {
   await button('取消', 'dialog ');
   assert.equal(await panel.evaluate(async () => Boolean((await chrome.storage.session.get('clipboard')).clipboard)), false);
 
-  const clipboard = useClipboard ? await exerciseClipboard(panel, async () => {
+  const clipboard = stopBackground ? await exerciseClipboard(panel, edited, async () => {
     await button('复制“' + edited + '”的密码');
     await expect.poll(() => text('dialog h2')).toBe('再次验证身份');
     await verify(master);
-  }) : undefined;
+    await expect.poll(() => text('.toast'), { timeout: 15000 }).toContain('已复制');
+  }, stopBackground) : undefined;
 
   await button('设置');
   assert.equal(await panel.evaluate(() => chrome.permissions.contains({ permissions: ['privacy'] })), false);
@@ -262,6 +283,8 @@ async function run(name, artifact, useClipboard) {
     const origin = 'chrome-extension://' + new URL(worker.url()).host;
     const panelUrl = origin + '/sidepanel.html';
     await (await waitForSetupTab(context, worker.url())).close();
+    // The launcher closes itself after opening the native panel.
+    const monitor = useClipboard ? await context.newCDPSession(await context.newPage()) : undefined;
     const popup = await context.newPage();
     await popup.goto(origin + '/popup.html');
     await popup.evaluate(async masterPassword => {
@@ -288,7 +311,18 @@ async function run(name, artifact, useClipboard) {
     panel = await attachPanel(cdp, panelTarget.targetId);
     const platformAuthenticatorAvailable = await panel.evaluate(async () =>
       !!window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
-    const clipboard = await exercise(panel, useClipboard);
+    const clipboard = await exercise(panel, monitor ? async () => {
+      try {
+        let version;
+        monitor.on('ServiceWorker.workerVersionUpdated', ({ versions }) => {
+          version = versions.find(entry => entry.scriptURL === worker.url()) ?? version;
+        });
+        await monitor.send('ServiceWorker.enable');
+        await expect.poll(() => version?.runningStatus).toBe('running');
+        await monitor.send('ServiceWorker.stopWorker', { versionId: version.versionId });
+        await expect.poll(() => version?.runningStatus).toBe('stopped');
+      } finally { await monitor.detach(); }
+    } : undefined);
     assert.deepEqual(panel.errors, []);
     const result = {
       browser: name, version: context.browser().version(), extension: path.relative(root, extension), buildSha256: artifact,
