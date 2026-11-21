@@ -2,6 +2,12 @@
 
 2026-11-20，本机 Windows。[T01](https://github.com/IZRINO/vault-extension/issues/1) 和 [T36](https://github.com/IZRINO/vault-extension/issues/36) 的补测，不替代[候选包的功能及准出记录](release-candidate-status.md)。
 
+## 结案决定
+
+2026-11-21，维护者接受当前原生 Popup 的冷启动表现，本轮性能优化结案。首屏耗时今后只记录，不再以 `<50 ms` 作为开发或发布门槛。WASM 会话恢复的独立指标 `<5 ms` 未作变更；锁库、超时和列表可操作性的检查照常保留。
+
+[同机五方向、160 次测量](cold-start-five-directions-2026-11-21.md)中，复测原版首屏中位数为 Edge 384.06 ms、Helium 389.60 ms；领先方案分别只快 1.02 ms 和 0.39 ms，两轮快慢方向均反转。保留当前生产包，不合入实验方案。下文保留当时的目标和实测结果。
+
 ## Ente 候选包同包复测
 
 同一生产 ZIP `5a759f049e22`，解压树 SHA-256 `be27de5e5c29ca0b7265b4ed14fdef64dc70df75fe1096c69d627cf094f6c021`。Edge `158.0.4370.33`、Helium `157.0.8103.78` 各 10 次，每库 1,000 条合成凭证，使用解锁会话、停 Worker 后触发原生工具栏，同一计时口径。

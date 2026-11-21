@@ -2,7 +2,7 @@
 
 2026-11-20。对应[架构 v1.4](../密码管理器浏览器插件-技术架构与选型文档.md)与[工单 T01–T38](development-tickets.md)。生产 ZIP 不等于正式准出；不代签，也不把模拟证据当作系统设备、第三方服务或应用互通的证据。
 
-当前可安装包为 **Vault 0.1.0**。生产构建可解压安装；千条库冷开最近一次双浏览器测量仍未达标，正式准出不能签收。需真实设备、第三方环境的验收由用户日常试用，不代签。
+当前可安装包为 **Vault 0.1.0**。2026-11-21 [原生 Popup 冷启动优化结案](cold-wake-diagnostics.md#结案决定)，50 ms 不再是发布门槛。WASM 会话恢复的独立指标仍未达标；真实设备和第三方环境仍待日常试用。候选包不等于正式签收。
 
 ## 当前候选包 0.1.0
 
@@ -90,7 +90,7 @@
 | T21–T25 | ES256、Ed25519、按站停用、条件式选择、原生回退、UV 二次验证、默认零计数及可选递增、可验证的备份标志。 | 浏览器测试以真实 COSE 公钥验签，模拟网盘与认证加密备份恢复到 Helium。虚拟认证器验证回退，不等同实际 Hello/USB 或真实站点。 |
 | T26–T30 | FIDO CXF 1.0 JSON、单独标识的密码保护 JWE、Bitwarden 可迁移 Passkey 与原生 SSH 对象、KeePass KDBX/XML/CSV、1Password 1PUX、Proton JSON/ZIP 与受支持的 PGP ZIP。 | 公开合成 KDBX 3.1/4.0 样本通过口令导入；官方 KeePassXC CLI 生成的 4.1 加密库在两浏览器验签。错密、截断、超预算拒绝。厂商应用与真实网站互通待验收。 |
 | T31–T35 | Google Authenticator 多图/迁移 URI、2FAS、Aegis、Raivo、andOTP、Stratum，另有 FreeOTP+ / WinAuth。Raivo AES ZIP、andOTP v0.9 格式 AES 和 Stratum 新版加密备份可预览导入。Dashlane、NordPass、Enpass、LastPass CSV 自动识别，歧义退回手工映射。原厂 Dashlane 明文 CSV ZIP、Enpass 桌面 JSON、Dashlane 及 LastPass CLI JSON 已接入。 | 有独立合成回归与公开夹具。原厂应用日常试用待验收。[验证器样本](agents/authenticator-backup-fixtures.md) · [厂商 JSON 边界](agents/vendor-json-sources.md) |
-| T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 冷开 `<50 ms` 未达，正式发布准出和真实站点/设备验收不能签收。 |
+| T36 | Edge/Helium 的 MV3 生产 ZIP，检查清单、CSP、主 WASM 和按需模块。 | 解压候选包供试用。千条原生 Popup 的可操作性仍需验证，耗时仅记录；真实站点和设备验收仍待签收。 |
 
 ### 格式限制
 

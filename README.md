@@ -11,7 +11,7 @@
 
 ---
 
-> **项目状态（2026-11-20）**：MV3 候选包已从同一解压目录通过 Edge 和 Helium 的功能回归，覆盖本地加密库、网页填充、OTP、WebDAV 增量同步、软件 Passkey 和计划内迁移。千条凭证的原生 Popup 冷开与 WASM 会话恢复均未达到准出指标；实体设备、真实网站/网盘和第三方应用仍未验收。实测与格式限制见 [候选包验证记录](./docs/release-candidate-status.md)，历史基准见 [一期](./docs/phase-1-status.md) 和 [二期](./docs/phase-2-status.md)。下文全景也包含尚未排期的架构目标。
+> **项目状态（2026-11-21）**：MV3 候选包已从同一解压目录通过 Edge 和 Helium 的功能回归，覆盖本地加密库、网页填充、OTP、WebDAV 增量同步、软件 Passkey 和计划内迁移。[原生 Popup 冷启动优化已结案](./docs/cold-wake-diagnostics.md#结案决定)，首屏耗时仅记录。WASM 会话恢复仍未达到独立指标；实体设备、真实网站/网盘和第三方应用仍未验收。实测与格式限制见 [候选包验证记录](./docs/release-candidate-status.md)，历史基准见 [一期](./docs/phase-1-status.md) 和 [二期](./docs/phase-2-status.md)。下文全景也包含尚未排期的架构目标。
 
 ## 设计目标与安全红线
 
@@ -173,7 +173,7 @@
 | 层级 | 技术方案 | 说明 |
 | :--- | :--- | :--- |
 | **扩展工程框架** | [WXT](https://wxt.dev/) + Vite | 原生 Chromium MV3 支持，`MAIN` / `ISOLATED` 双世界脚本编排与极速 HMR |
-| **前端 UI 与状态** | React 19 + TypeScript 5 + Tailwind CSS v4 + shadcn/ui + Zustand | 轻量高响应（Popup 冷启动目标 `< 50ms`），完备键盘流无障碍导航 |
+| **前端 UI 与状态** | React 19 + TypeScript 5 + Tailwind CSS v4 + shadcn/ui + Zustand | 支持从搜索到打开凭证的键盘操作；原生 Popup 冷启动耗时仅记录 |
 | **常驻安全主核** | Rust (Edition 2024) → `vault-core.wasm` (`wasm-bindgen`) | `argon2`、`hkdf`、`chacha20poly1305`、`blake3`、`p256`、`ed25519-dalek`、`ciborium`、`rqrr`、`rmp-serde`、`zstd`、`zeroize`（目标体积 `~200 KB`） |
 | **按需导入解析包** | Rust → `vault-importers.wasm` | 独立懒加载分包（`keepass`、`prost`、`zip` 等），保持后台 Service Worker 极致精简 |
 | **本地存储与同步** | `IndexedDB` (`idb`) + `chrome.storage.local` + `chrome.storage.session` + 纯 `fetch` WebDAV 客户端 | 适配 MV3 Service Worker 无 DOM 环境，零 Polyfill 负担 |
