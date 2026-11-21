@@ -3,9 +3,12 @@ import type { Reply } from './vault-messages';
 let tail: Promise<unknown> = Promise.resolve();
 let activeDocument: { opening: Promise<void>; clipboardCleanup: Promise<unknown> } | undefined;
 
+export class OffscreenRejected extends Error {}
+
 async function send<T>(operation: string, payload: unknown): Promise<T> {
   const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault-offscreen', operation, payload });
-  if (!response?.ok) throw new Error(response?.error ?? '离屏任务失败');
+  if (!response) throw new Error('离屏任务失败');
+  if (!response.ok) throw new OffscreenRejected(response.error);
   return response.value;
 }
 
@@ -31,7 +34,7 @@ export function offscreen<T>(operation: string, payload: unknown, signal?: Abort
     activeDocument = active;
     try {
       // A session-bound task must not copy its inputs until the receiver is ready.
-      if (signal) { await opening; signal.throwIfAborted(); }
+      if (signal || operation === 'copy') { await opening; signal?.throwIfAborted(); }
       // Capture can run while the privileged document starts. All lifecycle work remains serialized.
       const [, prepared] = await Promise.all([opening, typeof payload === 'function' ? payload() : payload]);
       signal?.throwIfAborted();

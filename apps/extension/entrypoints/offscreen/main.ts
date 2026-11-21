@@ -1,15 +1,11 @@
 import type { Reply } from '../../src/vault-messages';
+import { clipboardDigest } from '../../src/clipboard-digest';
 
 const preparedScanner = location.search === '?scan' ? new Worker(browser.runtime.getURL('/qr-worker.js')) : undefined;
-const auditLockError = '密码库已锁定，请重新解锁。';
+const lockError = '密码库已锁定，请重新解锁。';
 let abortAudit: (() => void) | undefined;
-let auditLocked = false;
+let documentLocked = false;
 
-async function digest(text: string): Promise<string> {
-  const bytes = new TextEncoder().encode(text);
-  try { return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join(''); }
-  finally { bytes.fill(0); }
-}
 function clipboardWrite(text: string) {
   const field = document.createElement('textarea');
   // An empty selection makes execCommand report success without replacing the clipboard.
@@ -40,7 +36,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
   if (locked) {
     // This document is short-lived and jobs are serialized. Even an audit
     // message delivered after the lock must not start until a new document.
-    auditLocked = true;
+    documentLocked = true;
     abortAudit?.();
     return;
   }
@@ -63,9 +59,9 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       const { operation } = message.payload;
       const audit = operation === 'audit-snapshot';
       const wipeCopies = audit || operation === 'parse-authenticator-backup';
-      if (audit && auditLocked) {
+      if (audit && documentLocked) {
         for (const arg of message.payload.args) if (Array.isArray(arg?.bytes)) arg.bytes.fill(0);
-        throw new Error(auditLockError);
+        throw new Error(lockError);
       }
       return new Promise((resolve, reject) => {
         // Keep optional WASM out of the unlock path, including when WXT inlines worker assets.
@@ -80,7 +76,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
         const worker = new Worker(browser.runtime.getURL(entry));
         const timer = setTimeout(() => { finish(); reject(new Error('后台任务超时，请重试。')); }, 120000);
         const finish = () => { clearTimeout(timer); worker.terminate(); if (audit) abortAudit = undefined; };
-        if (audit) abortAudit = () => { finish(); reject(new Error(auditLockError)); };
+        if (audit) abortAudit = () => { finish(); reject(new Error(lockError)); };
         worker.onmessage = ({ data }: MessageEvent<Reply>) => {
           finish();
           if (data.ok) resolve(data.value); else reject(new Error(data.error));
@@ -99,13 +95,15 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       });
     }
     if (message.operation === 'copy') {
-      const hash = await digest(message.payload);
-      clipboardWrite(message.payload);
-      return hash;
+      if (documentLocked) throw new Error(lockError);
+      const { text, expiresAt } = message.payload;
+      if (typeof text !== 'string' || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error('复制请求已过期，请重试。');
+      clipboardWrite(text);
+      return null;
     }
     if (message.operation === 'clear-clipboard') {
       const current = clipboardRead();
-      if (await digest(current) === message.payload && clipboardRead() === current) clipboardWrite('');
+      if (await clipboardDigest(current) === message.payload && clipboardRead() === current) clipboardWrite('');
       return null;
     }
     throw new Error('无效的离屏操作');

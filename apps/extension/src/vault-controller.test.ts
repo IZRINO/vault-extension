@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import init, * as wasm from '../../../crates/vault-core/pkg/vault_core.js';
@@ -145,7 +146,7 @@ beforeEach(() => {
   state.remoteVaultId = undefined;
   state.remotePoll = undefined;
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
-  vi.stubGlobal('browser', { alarms: { create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
+  vi.stubGlobal('browser', { alarms: { get: async () => undefined, create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
     idle: { queryState: async () => state.idleState },
     storage: { session: { get: async () => ({}), set: vi.fn() }, local: {
       get: async () => structuredClone(state.local),
@@ -363,7 +364,8 @@ describe('real WASM + background session integration', () => {
       windows: { onRemoved: { addListener() {} } },
       commands: { onCommand: { addListener() {} } },
       contextMenus: { onClicked: { addListener() {} } },
-      alarms: { create: async () => undefined, onAlarm: { addListener: (listener: typeof listenAlarm) => { listenAlarm = listener; } } },
+      alarms: { get: async () => undefined, create: async () => undefined, clear: async () => true,
+        onAlarm: { addListener: (listener: typeof listenAlarm) => { listenAlarm = listener; } } },
     });
     vi.stubGlobal('defineBackground', (main: () => void) => main);
     const { default: startBackground } = await import('../entrypoints/background');
@@ -374,10 +376,9 @@ describe('real WASM + background session integration', () => {
     });
     vi.mocked(offscreen).mockImplementation(async (operation, payload) => {
       if (operation === 'copy') {
-        clipboardText = String(payload);
-        return 'digest:' + clipboardText;
+        clipboardText = (await (payload as () => Promise<{ text: string }>)()).text;
       }
-      if (operation === 'clear-clipboard' && payload === 'digest:' + clipboardText) clipboardText = '';
+      if (operation === 'clear-clipboard' && payload === createHash('sha256').update(clipboardText).digest('hex')) clipboardText = '';
       return null;
     });
     const clock = vi.spyOn(Date, 'now');
@@ -1212,7 +1213,10 @@ describe('phase two migration transactions and autofill reads', () => {
   });
   it('copies only time codes with clipboard expiry and never advances HOTP as part of login filling', async () => {
     vi.mocked(offscreen).mockClear();
-    vi.mocked(offscreen).mockResolvedValue('fixture-clipboard-hash');
+    let copied = '';
+    vi.mocked(offscreen).mockImplementation(async (operation, payload) => {
+      if (operation === 'copy') copied = (await (payload as () => Promise<{ text: string }>)()).text;
+    });
     const controller = await unlocked();
     const value = record('OTP copy fixture', true);
     value.data.uris = [{ uri: 'https://example.com' }];
@@ -1221,8 +1225,10 @@ describe('phase two migration transactions and autofill reads', () => {
     const id = (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
     await expect(controller.handle({ type: 'autofill-copy-otp', id, url: 'https://example.com', groups: [] })).rejects.toThrow('再次验证');
     expect(await controller.handle({ type: 'autofill-copy-otp', id, url: 'https://example.com', groups: [], proof })).toBe(true);
-    expect(offscreen).toHaveBeenCalledWith('copy', expect.stringMatching(/^\d{6}$/));
-    expect(browser.storage.session.set).toHaveBeenCalledWith({ clipboard: { hash: 'fixture-clipboard-hash', expiresAt: expect.any(Number) } });
+    expect(copied).toMatch(/^\d{6}$/);
+    expect(browser.storage.session.set).toHaveBeenCalledWith({ clipboard: {
+      hash: createHash('sha256').update(copied).digest('hex'), expiresAt: expect.any(Number),
+    } });
     const latest = await controller.handle({ type: 'get', id, proof }) as VaultItem;
     latest.data.totpUri = 'otpauth://hotp/Fixture?secret=JBSWY3DPEHPK3PXP&counter=5';
     await controller.handle({ type: 'upsert', itemJson: JSON.stringify(latest), proof });
