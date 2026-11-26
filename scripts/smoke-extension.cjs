@@ -193,7 +193,7 @@ async function run(name) {
     const settings = await page.evaluate(async () => (await chrome.storage.local.get('settings')).settings);
     assert(!('pinWrap' in settings));
     await send({ type: 'unlock', password: proof.secret });
-    let item = await send({ type: 'get', id: (await send({ type: 'list' }))[0].id });
+    const item = await send({ type: 'get-edit', id: (await send({ type: 'list' }))[0].id });
     item.requireReprompt = true;
     await send({ type: 'upsert', itemJson: JSON.stringify(item) });
     await assert.rejects(send({ type: 'get', id: item.id, repromptVerified: true }));

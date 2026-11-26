@@ -5,6 +5,7 @@ export const SNAPSHOT_LIMIT = 16 * 1024 * 1024;
 export const WAL_LIMIT = 16 * 1024 * 1024;
 export const MAX_REMOTE_WALS = 750;
 export const MAX_REMOTE_WAL_BYTES = 8 * 1024 * 1024;
+export const MAX_HISTORY_BYTES = 8 * 1024 * 1024;
 
 export interface RemoteHeadInfo {
   localHead: number[]; wrap: number[]; vaultId: string; keyEpoch: number;
@@ -65,8 +66,9 @@ export async function fetchRemoteWal(client: WebDavClient, entries: WalListing, 
   const objects: RemoteWal[] = [];
   for (const entry of entries) {
     const existing = cache.get(entry.id);
-    if (existing && existing.etag && entry.etag && existing.etag !== entry.etag) throw incomplete();
-    const object = existing && (existing.etag || !entry.etag) ? existing :
+    // A late immutable PUT can recreate the exact absorbed object after compaction with a new ETag.
+    // A changed or newly supplied tag always requires verifying the bytes, not just trusting its name.
+    const object = existing && (!entry.etag || existing.etag === entry.etag) ? existing :
       await client.get(`wal/${entry.id}.bin`, Math.min(remaining, WAL_LIMIT));
     if (!object || object === 'unchanged' || object.bytes.length === 0 || object.bytes.length > remaining) throw incomplete();
     if (existing && !sameBytes(existing.bytes, object.bytes)) throw incomplete();
@@ -76,9 +78,8 @@ export async function fetchRemoteWal(client: WebDavClient, entries: WalListing, 
   return objects;
 }
 
-export async function getSyncHistory(client: WebDavClient, info: RemoteHeadInfo, cached: readonly RemoteWal[] = []) {
-  const objects: RemoteWal[] = [];
-  let remaining = 8 * 1024 * 1024;
+async function* fetchSyncHistory(client: WebDavClient, info: RemoteHeadInfo, cached: readonly RemoteWal[] = []) {
+  let remaining = MAX_HISTORY_BYTES;
   for (const name of info.history.slice(1)) {
     if (!davSnapshotName.test(`${name}.bin`)) throw incomplete();
     const id = name.slice(5);
@@ -87,9 +88,38 @@ export async function getSyncHistory(client: WebDavClient, info: RemoteHeadInfo,
     const object = await client.get(`${name}.bin`, Math.min(SNAPSHOT_LIMIT, remaining));
     if (!object || object === 'unchanged') continue;
     remaining -= object.bytes.length;
-    objects.push({ id, bytes: object.bytes, etag: object.etag });
+    yield { id, bytes: object.bytes, etag: object.etag };
   }
-  return [...cached, ...objects];
+}
+
+export function replayWithAncestors(client: WebDavClient, info: RemoteHeadInfo, cached: RemoteWal[] = []) {
+  const history = [...cached];
+  let remaining = MAX_HISTORY_BYTES;
+  return async <T>(replay: (objects: RemoteWal[]) => Promise<T>): Promise<T> => {
+    while (true) {
+      try { return await replay(history); }
+      catch (error) {
+        // Only the authenticated WAL codec asks for an epoch. Locate it inside the authenticated
+        // head's consecutive snapshot history; replay still verifies the actual name, epoch and root.
+        const needed = String(error).match(/\bSyncAncestorRequired:([1-9]\d{0,15})\b/);
+        const epoch = needed ? Number(needed[1]) : NaN, index = info.snapshotEpoch - epoch;
+        if (!Number.isSafeInteger(epoch) || index < 1 || index >= info.history.length) throw error;
+        const name = info.history[index]!, id = name.slice(5);
+        if (!davSnapshotName.test(`${name}.bin`) || history.some(object => object.id === id)) throw error;
+        if (!remaining) throw new Error('远端历史超过自动回放容量。请先导出或恢复可验证数据。');
+        const object = await client.get(`${name}.bin`, remaining);
+        if (!object || object === 'unchanged') throw error;
+        remaining -= object.bytes.length;
+        history.push({ id, bytes: object.bytes, etag: object.etag });
+      }
+    }
+  };
+}
+
+export async function getSyncHistory(client: WebDavClient, info: RemoteHeadInfo, cached: readonly RemoteWal[] = []) {
+  const objects = [...cached];
+  for await (const object of fetchSyncHistory(client, info, cached)) objects.push(object);
+  return objects;
 }
 
 export function packSyncFrames(objects: readonly RemoteWal[]) {
@@ -125,8 +155,7 @@ export async function readRemoteVault<T>(client: WebDavClient, unlock: (head: Da
   const snap = await client.get(name, SNAPSHOT_LIMIT);
   if (!snap || snap === 'unchanged') throw incomplete();
   const objects = await fetchRemoteWal(client, await listRemoteWal(client));
-  const history = objects.length && authenticated.history.length > 1 ? await getSyncHistory(client, authenticated) : [];
-  const result = await replay(authenticated, snap.bytes, objects, history);
+  const result = await replayWithAncestors(client, authenticated)(history => replay(authenticated, snap.bytes, objects, history));
   // A compaction may publish while recovery downloads. Commit only against a stable authenticated head.
   const latest = await client.get('head.bin', HEAD_LIMIT, head.etag);
   if (!latest || latest !== 'unchanged' && !sameBytes(head.bytes, latest.bytes)) throw incomplete();

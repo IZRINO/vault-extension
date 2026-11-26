@@ -2,7 +2,9 @@ import type { MigrationPreview, VaultItem } from './vault-messages';
 import { localHost } from './autofill-policy';
 
 export const BITWARDEN_META = 'Bitwarden 保留字段';
-export interface MigrationBatch { rows: VaultItem[]; invalid: number; unsupported: number; ignoredOtp: number }
+export interface MigrationBatch {
+  rows: VaultItem[]; invalid: number; unsupported: number; ignoredOtp: number; unknownHotpCounters?: number; vaultCsv?: boolean;
+}
 function sourceId(item: VaultItem): string {
   try {
     const meta = JSON.parse(item.customFields.find(field => field.name === BITWARDEN_META)?.value ?? '{}');
@@ -45,16 +47,22 @@ function fingerprint(item: VaultItem): string {
   return JSON.stringify([content, item.note ?? '', !!item.requireReprompt, [...(item.tags ?? [])].sort(),
     item.customFields.filter(field => field.name !== BITWARDEN_META).map(field => [field.name, field.value, field.hidden])]);
 }
+function vaultCsvFingerprint(item: VaultItem): string {
+  const data = item.data;
+  return JSON.stringify([data.kind, item.title, Array.isArray(data.uris) ? data.uris[0]?.uri ?? '' : '',
+    data.username ?? '', data.password ?? '', item.note ?? '', data.totpUri ?? '', item.tags ?? [], !!item.trashed]);
+}
 export function planMigration(batch: MigrationBatch, existing: VaultItem[]) {
+  // A native CSV carries these eight values, not the rest of an item's metadata.
+  const identify = batch.vaultCsv ? vaultCsvFingerprint : fingerprint;
   const sources = new Set(existing.map(sourceId).filter(Boolean));
-  const known = new Set(existing.map(fingerprint));
+  const known = new Set(existing.map(identify));
   const hotp = new Set(existing.map(item => otpIdentity(item.data.totpUri)).filter(value => value.startsWith('hotp:')));
   const items: VaultItem[] = [];
   let skipped = 0, invalid = batch.invalid;
   for (const item of batch.rows) {
-    // CSV requires a valid website; Bitwarden can also contain standalone authenticators and app URIs.
     if (!item.title?.trim() || !['login', 'payment_card', 'identity', 'developer'].includes(item.data?.kind)) { invalid++; continue; }
-    const source = sourceId(item), identity = fingerprint(item);
+    const source = sourceId(item), identity = identify(item);
     const otp = otpIdentity(item.data.totpUri);
     if (source && sources.has(source) || known.has(identity) || otp.startsWith('hotp:') && hotp.has(otp)) { skipped++; continue; }
     if (source) sources.add(source);
@@ -63,6 +71,7 @@ export function planMigration(batch: MigrationBatch, existing: VaultItem[]) {
   }
   const preview: Omit<MigrationPreview, 'stamp'> = {
     ready: items.length, skipped, invalid, unsupported: batch.unsupported, ignoredOtp: batch.ignoredOtp,
+    ...(batch.unknownHotpCounters ? { unknownHotpCounters: batch.unknownHotpCounters } : {}),
     sample: items.slice(0, 5).map(item => ({ title: item.title, kind: item.data.kind,
       account: typeof item.data.username === 'string' ? item.data.username : '' })),
   };

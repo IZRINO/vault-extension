@@ -97,11 +97,12 @@ export default defineUnlistedScript(() => {
       self.postMessage({ ok: true, value });
     } catch (error) {
       const conflict = typeof error === 'string' && error.includes('SyncConflict');
+      const ancestor = typeof error === 'string' && error.match(/\bSyncAncestorRequired:[1-9]\d{0,15}\b/)?.[0];
       const message = data.operation === 'sync:unlock-head' ? '无法验证网盘密码库，请核对该库自己的主密码或恢复码。' :
         data.operation === 'sync:import-pack' ? '无法读取此备份，请核对文件密码和 .vaultpack 文件是否完整。' :
         data.operation === 'sync:local-wal' ? '同步日志无法保存，本次操作未完成。' :
         typeof error === 'string' && error.includes('InvalidResolutionAdjustment') ? '请填写有效的名称，并缩短超出长度限制的字段。' :
-        typeof error === 'string' && error.includes('SyncAncestorRequired') ? '缺少可验证的共同快照（SyncAncestorRequired）。本机编辑仍在。' :
+        ancestor ? `缺少可验证的共同快照（${ancestor}）。本机编辑仍在。` :
         conflict ? '此条目正在等待同步裁决，未保存此次修改。请先到网盘设置处理冲突。' : '网盘对象无法验证或版本不受支持。';
       self.postMessage({ ok: false, error: typeof error === 'string' && error.startsWith('COMPACT_OBJECT_TOO_LARGE: ') ? error : message });
     } finally {

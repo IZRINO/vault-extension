@@ -1,7 +1,7 @@
 const { chromium, expect } = require('@playwright/test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises'), http = require('node:http'), path = require('node:path'), os = require('node:os');
-const { createHmac, createCipheriv, createDecipheriv, createHash, pbkdf2Sync, argon2Sync, randomBytes, timingSafeEqual } = require('node:crypto');
+const { createHmac, createCipheriv, createDecipheriv, createHash, createPrivateKey, createPublicKey, generateKeyPairSync, pbkdf2Sync, argon2Sync, randomBytes, timingSafeEqual } = require('node:crypto');
 const QR = require('qrcode');
 const { waitForBuiltInFilters } = require('./browser-fixtures.cjs');
 const root = path.resolve(__dirname, '..'), output = path.resolve(root, process.env.VAULT_MIGRATION_RESULTS || 'test-results');
@@ -13,11 +13,23 @@ const master = 'Migration-Fixture-Master#2026', filePassword = 'Portable-File-Fi
 const otp = 'otpauth://totp/QR-Fixture%3Aalice?secret=JBSWY3DPEHPK3PXP&issuer=QR-Fixture';
 const sshKey = { privateKey: '-----BEGIN OPENSSH PRIVATE KEY-----\r\nsynthetic-ssh-fixture\r\n-----END OPENSSH PRIVATE KEY-----\r\n',
   publicKey: 'ssh-ed25519 synthetic-public-key fixture@example.test', keyFingerprint: 'SHA256:synthetic-fingerprint' };
+function fixturePasskey(kind, id) {
+  const { privateKey } = kind === 'ec' ? generateKeyPairSync('ec', { namedCurve: 'prime256v1' }) : generateKeyPairSync('ed25519');
+  return { keyType: 'public-key', keyAlgorithm: kind === 'ec' ? 'ECDSA' : 'EdDSA', rpId: 'example.com',
+    userHandle: Buffer.from('synthetic-account').toString('base64url'), userName: 'synthetic-account',
+    credentialId: 'b64.' + Buffer.alloc(32, id).toString('base64url'), counter: '0', discoverable: 'true',
+    keyValue: privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64url') };
+}
+const supportedPasskey = fixturePasskey('ec', 21), unsupportedPasskey = fixturePasskey('ed', 22);
 const source = { encrypted: false, folders: [{ id: 'folder-a', name: 'Fixture work' }], items: [
   { id: 'login-a', type: 1, name: 'Migrated Login', notes: 'Keep this note', folderId: 'folder-a', reprompt: 1, favorite: true,
     login: { username: 'fixture-alice', password: 'Migration-Login-Secret#2026', totp: 'JBSWY3DPEHPK3PXP',
-      uris: [{ uri: 'https://example.com/login', match: 1 }], fido2Credentials: [{ credentialId: 'preserved-fixture', keyValue: 'fixture-not-a-real-key' }] },
+      uris: [{ uri: 'https://example.com/login', match: 1 }], fido2Credentials: [
+        { credentialId: 'preserved-fixture', keyValue: 'fixture-not-a-real-key' }, supportedPasskey,
+      ] },
     fields: [{ name: 'custom hidden', value: 'Custom-Fixture-Secret', type: 1 }] },
+  { id: 'passkey-only', type: 1, name: 'Unsupported Passkey account',
+    login: { username: 'synthetic-account', password: '', fido2Credentials: [unsupportedPasskey] } },
   { id: 'note-a', type: 2, name: 'Migrated Note', notes: 'Private fixture note', secureNote: { type: 0 } },
   { id: 'card-a', type: 3, name: 'Migrated Card', card: { cardholderName: 'Test User', number: '4111111111111111', brand: 'Visa', expMonth: '11', expYear: '2030', code: '123' } },
   { id: 'identity-a', type: 4, name: 'Migrated Identity', identity: { firstName: 'Ada', lastName: 'Lovelace', passportNumber: 'Fixture-Passport', ssn: 'Fixture-SSN', address1: 'One', address2: 'Two', city: 'Test City', country: 'GB' } },
@@ -171,6 +183,28 @@ async function verifyEncrypted2fas(send, reply) {
   assert.equal((await send({ ...input, type: 'preview-auth-backup' })).ready, 0);
   return true;
 }
+async function verifyUnknownHotpUi(page, send, name) {
+  const before = await send({ type: 'list' });
+  const secret = 'JBSWY3DPEHPK3PXP';
+  const services = [
+    { name: 'Known zero', secret, otp: { tokenType: 'HOTP', algorithm: 'SHA1', counter: 0 } },
+    { name: 'Unknown counter', secret, otp: { tokenType: 'HOTP', algorithm: 'SHA256' } },
+  ];
+  await page.getByLabel('验证器', { exact: true }).selectOption('2fas');
+  await page.getByLabel('验证器备份文件', { exact: true }).setInputFiles({
+    name: 'synthetic.2fas', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify({ schemaVersion: 4, services })),
+  });
+  await page.getByRole('button', { name: '预览迁移内容', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '可导入 1 个验证码', exact: true })).toBeVisible();
+  const warning = page.getByRole('alert').filter({ hasText: '有 1 个计数型验证码的计数无法核实，不会导入。' });
+  await warning.scrollIntoViewIfNeeded();
+  await expect(warning).toBeInViewport();
+  assert(!(await page.locator('body').innerText()).includes(secret));
+  await page.screenshot({ path: path.join(output, `migration-${name}-unknown-hotp.png`) });
+  await page.getByRole('button', { name: '确认导入', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: '取消', exact: true }).click();
+  assert.deepEqual(await send({ type: 'list' }), before);
+}
 async function nativePopupQr(cdp, id, existingTargets) {
   let target;
   await expect.poll(async () => {
@@ -317,14 +351,45 @@ async function run(name, server) {
     assert(exported.encrypted && exported.passwordProtected);
     assert(!JSON.stringify(exported).includes('Migration-Login-Secret'));
     const decrypted = openPortable(exported).items;
-    assert.equal(decrypted.find(item => item.type === 1).login.password, source.items[0].login.password);
+    assert.equal(decrypted.find(item => item.name === 'Migrated Login').login.password, source.items[0].login.password);
     assert.deepEqual(decrypted.find(item => item.type === 5).sshKey, sshKey);
+    const verifyKeyExport = rows => {
+      const migrated = rows.find(row => row.name === 'Migrated Login');
+      const unsupported = rows.find(row => row.name === 'Unsupported Passkey account');
+      const ids = migrated.login.fido2Credentials.map(key => key.credentialId);
+      assert.deepEqual(ids, ['preserved-fixture', supportedPasskey.credentialId]);
+      assert.deepEqual(migrated.login.fido2Credentials[0], source.items[0].login.fido2Credentials[0]);
+      const usable = migrated.login.fido2Credentials[1];
+      assert.equal(usable.rpId, supportedPasskey.rpId);
+      assert.equal(usable.keyAlgorithm, 'ECDSA');
+      const publicKeyOf = record => createPublicKey(createPrivateKey({ key: Buffer.from(record.keyValue, 'base64url'), format: 'der', type: 'pkcs8' }))
+        .export({ format: 'der', type: 'spki' });
+      assert(publicKeyOf(usable).equals(publicKeyOf(supportedPasskey)), 'The supported credential must retain its original key pair');
+      assert.equal(unsupported.login.password, '');
+      assert.deepEqual(unsupported.login.fido2Credentials ?? [], []);
+    };
+    const resultBanner = page.getByRole('status').filter({ hasText: '已请求下载' });
+    const expectedReport = `已请求下载 ${sourceCount} 条凭证。文件包含 1 枚可用的通行密钥，1 枚未导出。另有 1 条原始密钥记录已保留，尚未验证能否登录。请保留原密码库，并确认能用目标库登录。`;
+    verifyKeyExport(decrypted);
+    await expect(resultBanner).toHaveText(expectedReport);
+    await resultBanner.scrollIntoViewIfNeeded();
+    await expect(resultBanner).toBeInViewport();
+    await page.screenshot({ path: path.join(output, `migration-${name}-bitwarden-export.png`) });
     const exportBytes = [...Buffer.from(JSON.stringify(exported))];
     const decoded = await send({ type: 'preview-migration', format: 'bitwarden', bytes: exportBytes, password: filePassword });
     assert.deepEqual([decoded.ready, decoded.skipped, decoded.invalid, decoded.unsupported], [0, sourceCount, 0, 0]);
-    const plain = await send({ type: 'export-migration', format: 'bitwarden', proof: { method: 'master', secret: master }, confirmPlaintext: true });
-    const rows = JSON.parse(plain.text).items;
-    assert.equal(rows.find(row => row.type === 1).login.fido2Credentials[0].credentialId, 'preserved-fixture');
+    await page.getByLabel('文件保护', { exact: true }).selectOption('plain');
+    await page.getByRole('checkbox', { name: '我理解文件未加密，会妥善保管', exact: true }).check();
+    await page.getByRole('button', { name: '导出 Bitwarden JSON', exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: '验证主密码并导出', exact: true }).click();
+    const plainDownload = page.waitForEvent('download');
+    await proof(page);
+    const plain = JSON.parse(await fs.readFile(await (await plainDownload).path(), 'utf8'));
+    assert.equal(plain.encrypted, false);
+    await expect(resultBanner).toHaveText(expectedReport);
+    await expect(resultBanner).toBeVisible();
+    const rows = plain.items;
+    verifyKeyExport(rows);
     assert.equal(rows.find(row => row.type === 4).identity.address2, 'Two');
     const sshRow = rows.find(row => row.type === 5);
     assert.deepEqual(sshRow.sshKey, sshKey);
@@ -371,7 +436,7 @@ async function run(name, server) {
     assert.equal((await send({ type: 'get', id: mapped.id })).data.password, ' p,"q');
     assert.equal((await send({ type: 'get', id: mapped.id })).note, 'two\r\nlines');
     const exportedCsv = await send({ type: 'export-migration', format: 'csv', proof: { method: 'master', secret: master }, confirmPlaintext: true });
-    assert.equal(exportedCsv.count, 2);
+    assert.equal(exportedCsv.count, source.items.filter(item => item.type === 1).length + 1);
     assert.equal(exportedCsv.skipped, source.items.filter(item => item.type !== 1).length);
     assert(exportedCsv.text.includes('" p,""q"'));
     await page.screenshot({ path: path.join(output, `migration-${name}-csv.png`) });
@@ -450,6 +515,7 @@ async function run(name, server) {
     await website.close();
     await page.bringToFront();
     await verifyGoogleImages(page, send, reply);
+    await verifyUnknownHotpUi(page, send, name);
     const encrypted2fasFixture = await verifyEncrypted2fas(send, reply);
     assert.deepEqual(errors, []);
     const result = { browser: name, version: context.browser().version(), portableJson: true, argon2AndPbkdf2Reference: true, tamperRejected: true, confirmationAndReprompt: true,

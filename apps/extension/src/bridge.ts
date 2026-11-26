@@ -5,11 +5,43 @@ let activeDocument: { opening: Promise<void>; clipboardCleanup: Promise<unknown>
 
 export class OffscreenRejected extends Error {}
 
-async function send<T>(operation: string, payload: unknown): Promise<T> {
-  const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault-offscreen', operation, payload });
-  if (!response) throw new Error('离屏任务失败');
-  if (!response.ok) throw new OffscreenRejected(response.error);
-  return response.value;
+async function send<T>(operation: string, payload: unknown, signal?: AbortSignal): Promise<T> {
+  const jobId = crypto.randomUUID(), receipt = crypto.randomUUID();
+  let available = true;
+  // runtime.sendMessage notifies every extension page. Its response, on the
+  // other hand, goes only to the caller: give inputs to the offscreen caller.
+  const pull: Parameters<typeof browser.runtime.onMessage.addListener>[0] = (message, sender, respond) => {
+    if (message?.target !== 'vault-offscreen-input' || message.jobId !== jobId) return;
+    if (!available || sender.id !== browser.runtime.id || sender.tab ||
+        ![browser.runtime.getURL('/offscreen.html'), browser.runtime.getURL('/offscreen.html') + '?scan'].includes(sender.url ?? '')) {
+      respond(null); return;
+    }
+    // Chromium can omit documentId on messages from an offscreen document.
+    // In that case inspect *all* contexts at the exact URL, never just the
+    // offscreen matches: a second context with that URL must fail closed.
+    const filter = sender.documentId ? { documentIds: [sender.documentId] } : { documentUrls: [sender.url!] };
+    void browser.runtime.getContexts(filter).then(contexts => {
+      const [context] = contexts;
+      if (!available || signal?.aborted || contexts.length !== 1 || context?.contextType !== 'OFFSCREEN_DOCUMENT' ||
+          context.documentUrl !== sender.url || (sender.documentId && context.documentId !== sender.documentId)) {
+        respond(null); return;
+      }
+      available = false;
+      respond({ operation, payload, receipt });
+    }, () => respond(null));
+    return true;
+  };
+  browser.runtime.onMessage.addListener(pull);
+  try {
+    const reply: Reply<T> & { receipt: string } = await browser.runtime.sendMessage({ target: 'vault-offscreen', jobId });
+    signal?.throwIfAborted();
+    if (!reply || available || reply.receipt !== receipt) throw new Error('离屏任务未获确认，请重试。');
+    if (!reply.ok) throw new OffscreenRejected(reply.error);
+    return reply.value;
+  } finally {
+    available = false;
+    browser.runtime.onMessage.removeListener(pull);
+  }
 }
 
 // Serialize the shared document's lifecycle and worker jobs. Clipboard expiry
@@ -40,7 +72,7 @@ export function offscreen<T>(operation: string, payload: unknown, signal?: Abort
       signal?.throwIfAborted();
       // Deliver the completed task without paying document teardown latency.
       // `tail` still includes teardown, so the next operation cannot race it.
-      result.resolve(await send<T>(operation, prepared));
+      result.resolve(await send<T>(operation, prepared, signal));
     } catch (error) {
       result.reject(error);
     } finally {

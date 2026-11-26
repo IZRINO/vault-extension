@@ -1,4 +1,5 @@
 import init, { wasm_passkey_candidates, wasm_passkey_perform } from '../../../crates/vault-passkeys/pkg/vault_passkeys.js';
+import type { PasskeyPerformResult } from '../src/passkeys/protocol';
 
 export default defineUnlistedScript(() => {
   self.onmessage = async ({ data }: MessageEvent<{ operation: string; args: unknown[] }>) => {
@@ -9,15 +10,22 @@ export default defineUnlistedScript(() => {
         value = wasm_passkey_candidates(...data.args as Parameters<typeof wasm_passkey_candidates>);
       } else if (data.operation === 'passkey:perform') {
         const result = wasm_passkey_perform(...data.args as Parameters<typeof wasm_passkey_perform>);
-        try { value = { reply: result.reply, head: Array.from(result.head), snap: Array.from(result.snap) }; }
+        try {
+          value = { type: 'answer', reply: result.reply, head: Array.from(result.head), snap: Array.from(result.snap) } satisfies PasskeyPerformResult;
+        }
         finally { result.free(); }
       } else throw new Error('Unknown passkey operation');
       self.postMessage({ ok: true, value });
     } catch (error) {
       const text = typeof error === 'string' ? error : '';
-      self.postMessage({ ok: false, error: text.startsWith('Passkey counter is unverified')
-        ? '无法确认这枚通行密钥的计数。请同步较新的副本，或在网站重新登记。'
-        : text.includes('already registered') ? '此站点已登记这枚通行密钥。' : '无法完成通行密钥请求，请确认网站和所选条目。' });
+      if (data.operation === 'passkey:perform' && text === 'This passkey is already registered.') {
+        const value: PasskeyPerformResult = { type: 'already-registered' };
+        self.postMessage({ ok: true, value });
+      } else {
+        self.postMessage({ ok: false, error: text.startsWith('Passkey counter is unverified')
+          ? '无法确认这枚通行密钥的计数。请同步较新的副本，或在网站重新登记。'
+          : '无法完成通行密钥请求，请确认网站和所选条目。' });
+      }
     } finally {
       for (const arg of data.args) if (arg instanceof Uint8Array) arg.fill(0);
       data.args.length = 0;

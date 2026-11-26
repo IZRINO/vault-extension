@@ -1,14 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { Reply } from './vault-messages';
+import { offscreenRuntime } from './test-fixtures/offscreen-runtime';
 
-type Listener = (message: unknown, sender: unknown, respond: (reply: Reply) => void) => boolean | undefined;
 const id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const background = { id, url: `chrome-extension://${id}/background.js` };
 const locked = { target: 'vault-event', type: 'locked' };
 
 async function setup(ready = Promise.resolve()) {
   vi.resetModules();
-  let listener!: Listener;
+  const { runtime, notify: sendMessage, deliver } = offscreenRuntime();
   let documentOpen = false;
   const opening = Promise.withResolvers<void>();
   const posted = Promise.withResolvers<void>();
@@ -16,12 +15,8 @@ async function setup(ready = Promise.resolve()) {
   const terminate = vi.fn();
   vi.stubGlobal('location', { search: '' });
   vi.stubGlobal('Worker', class { postMessage = post; terminate = terminate; });
-  const sendMessage = vi.fn((message: unknown) => new Promise<Reply>(resolve => {
-    if (!listener(structuredClone(message), background, resolve)) resolve({ ok: true, value: undefined });
-  }));
   vi.stubGlobal('browser', {
-    runtime: { id, getURL: (path: string) => `chrome-extension://${id}${path}`, sendMessage,
-      onMessage: { addListener: (value: Listener) => { listener = value; } } },
+    runtime,
     offscreen: {
       hasDocument: async () => documentOpen,
       createDocument: async () => { opening.resolve(); await ready; documentOpen = true; },
@@ -32,8 +27,9 @@ async function setup(ready = Promise.resolve()) {
   const { derive } = await import('./bridge');
   const signal = new AbortController();
   const start = () => derive('audit-snapshot', [Uint8Array.of(1), Uint8Array.of(2)], signal.signal);
-  const dispatchLock = (sender: object) => listener(locked, sender, () => {});
-  return { start, signal, sendMessage, post, terminate, opening, posted, dispatchLock };
+  const dispatchLock = (sender: object) => deliver(locked, sender);
+  const lateAudit = () => derive('audit-snapshot', [Uint8Array.of(1), Uint8Array.of(2)]);
+  return { start, lateAudit, signal, sendMessage, post, terminate, opening, posted, dispatchLock };
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -64,9 +60,7 @@ describe('the lock boundary for local audit', () => {
     expect(fixture.terminate).toHaveBeenCalledTimes(1);
     await rejected;
     await expect(fixture.start()).rejects.toThrow('锁定');
-    await expect(fixture.sendMessage({ target: 'vault-offscreen', operation: 'derive',
-      payload: { operation: 'audit-snapshot', args: [{ bytes: [1] }, { bytes: [2] }] } }))
-      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('锁定') });
+    await expect(fixture.lateAudit()).rejects.toThrow('锁定');
     expect(fixture.post).toHaveBeenCalledTimes(1);
   });
 });

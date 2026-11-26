@@ -23,6 +23,8 @@ beforeEach(() => {
     if (message.type === 'autofill-settings') return settings;
     if (!unlocked) throw new Error('请先解锁密码库。');
     if (message.type === 'autofill-candidates') return [{ id: 'credential-a', title: 'Fixture account', account: 'user' }];
+    if (message.type === 'autofill-save-target') return { kind: 'new' };
+    if (message.type === 'login-mark') return [];
     if (message.type === 'autofill-read') return { values: { username: 'user', password: 'fixture-secret' } };
   });
   sendMessage = vi.fn(async (_tab, message, options) => {
@@ -57,6 +59,41 @@ describe('autofill authorization', () => {
     controller.siteChanged('https://*.example.com', { saveDisabled: true });
     await expect(controller.handle({ type: 'menu', token }, menu)).rejects.toThrow('失效');
   });
+
+  it.each(['same origin', 'other origin', 'left and returned', 'expired', 'locked'])(
+    'checks the original capture and the destination across a fast form submission: %s', async outcome => {
+      tabUrl = url;
+      const old = { ...source, frameId: 0, tab: { id: 1, url } };
+      const checked = Promise.withResolvers<void>(), resume = Promise.withResolvers<void>();
+      const normal = handle.getMockImplementation() as (message: { type: string }) => Promise<unknown>;
+      handle.mockImplementation(async message => {
+        if (message.type === 'autofill-current') { checked.resolve(); await resume.promise; return false; }
+        return normal(message);
+      });
+      const capture = controller.handle({ type: 'capture', username: 'account', password: 'typed fixture' }, old);
+      await checked.promise;
+      const outside = 'https://other.example/success';
+      if (outcome === 'left and returned') controller.navigated(1, outside);
+      tabUrl = outcome === 'other origin' ? outside : new URL('/success', url).href;
+      controller.navigated(1, tabUrl);
+      const landed = { ...old, url: tabUrl, origin: new URL(tabUrl).origin, tab: { id: 1, url: tabUrl }, documentId: 'success-document' };
+      if (outcome === 'locked') { unlocked = false; controller.clear(); }
+      if (outcome === 'expired') vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_010);
+      try {
+        const pending = controller.handle({ type: 'pending' }, landed);
+        const done = Promise.allSettled([capture, pending]);
+        resume.resolve();
+        const [first, second] = await done;
+        if (outcome === 'same origin') {
+          expect(first.status).toBe('fulfilled');
+          expect(second).toEqual(first);
+          await expect(controller.handle({ type: 'pending' }, { ...landed, frameId: 2, documentId: 'iframe-document' })).resolves.toBeNull();
+        } else {
+          expect(first.status).toBe('rejected');
+          expect(second).toEqual({ status: 'fulfilled', value: null });
+        }
+      } finally { vi.restoreAllMocks(); }
+    });
 
   it('rejects website rule management and applies new restrictions to pending fill and capture grants', async () => {
     const { sites } = settings;

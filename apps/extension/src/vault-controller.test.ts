@@ -16,6 +16,8 @@ import { isVaultPage } from './sender-policy';
 import { endpointFingerprint } from './sync/bootstrap';
 import { webDavConfig } from './sync/webdav';
 import { VaultController } from './vault-controller';
+import { AutofillController } from './autofill-controller';
+import { markKey, markSetKey, type LoginMark, type MarkDraft } from './login-marks';
 import { offscreen } from './bridge';
 import { zip } from './test-fixtures/zip';
 import type { AuthBackupPreview, BackupExport, BrowserCsvPreview, EntePreview, HotpCode, ItemDetailData, MigrationPreview, VaultPackPreview, VaultStatus, VaultItem, ItemSummary, VaultMessage } from './vault-messages';
@@ -155,7 +157,215 @@ beforeEach(() => {
     } } });
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
+
+describe('webpage password capture with the encrypted vault', () => {
+  const url = 'https://example-bank.com/login';
+  const source = { id: 'fixture-extension', url, origin: new URL(url).origin,
+    documentId: 'login-document', frameId: 0, tab: { id: 7, url } };
+  const menu = { ...source, url: 'chrome-extension://fixture-extension/inline-menu.html',
+    origin: 'chrome-extension://fixture-extension', documentId: 'menu-document', frameId: 1 };
+
+  function startCapture(controller: VaultController) {
+    Object.assign(browser.runtime, { id: source.id, getURL: (path: string) => menu.origin + path });
+    Object.assign(browser, { tabs: { get: async () => source.tab, sendMessage: async () => null } });
+    return new AutofillController(controller);
+  }
+
+  it('updates TOTP and HOTP logins without returning or dropping their seeds or metadata (#39)', async () => {
+    const controller = await unlocked();
+    const capture = startCapture(controller);
+    for (const type of ['totp', 'hotp']) {
+      const initial = record(type, true);
+      initial.data.username = type;
+      initial.data.totpUri = `otpauth://${type}/Fixture?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ${type === 'hotp' ? '&counter=2' : ''}`;
+      initial.customFields = [{ name: 'Vault 迁移来源', value: 'Fixture source', hidden: true },
+        { name: 'Extra', value: 'Fixture custom field', hidden: false }];
+      await controller.handle({ type: 'upsert', itemJson: JSON.stringify(initial) });
+      const { id } = (await controller.handle({ type: 'list' }) as ItemSummary[]).find(item => item.title === type)!;
+      const nextPassword = `New fixture password for ${type}`;
+      const begin = () => capture.handle({ type: 'capture', username: type, password: nextPassword }, source) as Promise<{ token: string }>;
+      const cancelled = await begin();
+      await capture.handle({ type: 'close', token: cancelled.token }, menu);
+      expect(await controller.handle({ type: 'get-edit', id, proof })).toMatchObject({ data: initial.data });
+      const { token } = await begin();
+      const prompt = await capture.handle({ type: 'menu', token }, menu);
+      expect(JSON.stringify(prompt)).not.toContain('GEZDGNBV');
+      const save = { type: 'save' as const, token, confirmCrossOrigin: false };
+      await expect(capture.handle(save, menu)).rejects.toThrow('再次验证');
+      expect(await controller.handle({ type: 'get-edit', id, proof })).toMatchObject({ data: initial.data });
+      await capture.handle({ ...save, proof }, menu);
+      const restarted = await unlocked();
+      const detail = await restarted.handle({ type: 'get', id, proof }) as ItemDetailData;
+      expect(detail).toMatchObject({ data: { password: nextPassword }, requireReprompt: true });
+      expect(detail.data).not.toHaveProperty('totpUri');
+      const edit = await restarted.handle({ type: 'get-edit', id, proof }) as VaultItem;
+      expect(edit.data.totpUri).toBe(initial.data.totpUri);
+      expect(edit.customFields).toEqual(initial.customFields);
+      expect(detail.data.passwordHistory).toEqual([expect.objectContaining({ password: initial.data.password })]);
+      if (type === 'hotp') await expect(restarted.handle({ type: 'next-hotp', id, proof })).resolves.toMatchObject({ counter: '2' });
+    }
+  });
+
+  it('after a same-origin form submission updates the exact login URL, not the landing page credential', async () => {
+    const controller = await unlocked();
+    const capture = startCapture(controller);
+    const destination = new URL('/success', url).href;
+    let current = url;
+    Object.assign(browser.tabs, { get: async () => ({ id: source.tab.id, url: current }) });
+    for (const path of [url, destination]) {
+      const item = record(path);
+      item.data.uris = [{ uri: path, matchRule: 'exact' }];
+      await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    }
+    const { token } = await capture.handle({ type: 'capture', username: 'tester', password: 'Submitted fixture' }, source) as { token: string };
+    current = destination;
+    const landed = { ...source, url: current, tab: { ...source.tab, url: current }, documentId: 'landed' };
+    expect(await capture.handle({ type: 'pending' }, landed)).toEqual({ token });
+    const prompt = { ...menu, tab: landed.tab, documentId: 'new-menu' };
+    expect(await capture.handle({ type: 'menu', token }, prompt)).toMatchObject({ capture: { updating: true, ambiguous: false } });
+    await capture.handle({ type: 'save', token, confirmCrossOrigin: false }, prompt);
+    const rows = await controller.handle({ type: 'list' }) as ItemSummary[];
+    expect(rows).toHaveLength(2);
+    for (const row of rows) expect(await controller.handle({ type: 'get', id: row.id })).toMatchObject({
+      data: { password: row.title === url ? 'Submitted fixture' : 'Unique-Secret-Pass#719' },
+    });
+  });
+
+  it('distinguishes a sole match, a duplicate, and no match beyond the menu limit (#43)', async () => {
+    const controller = await unlocked();
+    const capture = startCapture(controller);
+    const add = (title: string, username: string, pinned = false) => {
+      const item = record(title);
+      item.data.username = username;
+      item.pinned = pinned;
+      return controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    };
+    const login = async (username: string, newPassword: string) => {
+      const { token } = await capture.handle({ type: 'capture', username, password: newPassword }, source) as { token: string };
+      const prompt = await capture.handle({ type: 'menu', token }, menu);
+      const save = () => capture.handle({ type: 'save', token, confirmCrossOrigin: false }, menu);
+      return { prompt, save };
+    };
+    await add('Outside the menu', 'same-user');
+    for (let i = 1; i <= 30; i++) await add(`Pinned #${i}`, `user-${i}`, true);
+    const original = (await controller.handle({ type: 'list' }) as ItemSummary[]).at(-1)!;
+    expect(original.title).toBe('Outside the menu');
+    const update = await login('same-user', 'First confirmed new password');
+    expect(update.prompt).toMatchObject({ capture: { updating: true } });
+    await update.save();
+    expect(await controller.handle({ type: 'get', id: original.id })).toMatchObject({ data: {
+      password: 'First confirmed new password', passwordHistory: [expect.objectContaining({ password: 'Unique-Secret-Pass#719' })],
+    } });
+    expect(await controller.handle({ type: 'list' })).toHaveLength(31);
+    await add('Pinned duplicate', 'same-user', true);
+    const ambiguous = await login('same-user', 'Second, ambiguous password');
+    await expect(ambiguous.save()).rejects.toThrow('多条同账号');
+    expect(await controller.handle({ type: 'get', id: original.id })).toMatchObject({ data: { password: 'First confirmed new password' } });
+    expect(await controller.handle({ type: 'list' })).toHaveLength(32);
+    await (await login('new-user', 'Password for a new record')).save();
+    expect(await controller.handle({ type: 'list' })).toHaveLength(33);
+  });
+
+  it('persists only an approved top-level mark and rejects reuse after a document change', async () => {
+    const controller = await unlocked();
+    const autofill = startCapture(controller);
+    const vaultPage = { id: source.id, url: `${menu.origin}/popup.html`, origin: menu.origin };
+    const draft: MarkDraft = { form: { id: 'fixture_signin' }, fields: { password: { type: 'password', name: 'fixture_private_field' } } };
+    let activeUrl = `${url}?session=fixture_private_query`;
+    let page = { ...source, url: activeUrl, tab: { ...source.tab, url: activeUrl } };
+    let selection = '';
+    const get = async () => ({ ...source.tab, url: activeUrl });
+    Object.assign(browser, { tabs: { get, query: async () => [await get()],
+      sendMessage: async (_: number, message: { type: string; token: string }) => {
+        if (message.type !== 'mark-open') return null;
+        selection = message.token;
+        await autofill.handle({ type: 'mark-ready', token: selection }, page);
+        return { ready: true };
+      } } });
+    await expect(autofill.handle({ type: 'mark-start' }, page)).rejects.toThrow('仅密码库');
+    await autofill.handle({ type: 'mark-start' }, vaultPage);
+    await autofill.handle({ type: 'mark-cancel', token: selection }, page);
+    expect(state.local.loginMarksSealed).toBeUndefined();
+    await autofill.handle({ type: 'mark-start' }, vaultPage);
+    await expect(autofill.handle({ type: 'mark-save', token: selection, draft }, { ...page, frameId: 1 })).rejects.toThrow('标记会话');
+    await expect(autofill.handle({ type: 'mark-save', token: selection, draft }, { ...page, documentId: 'new-document' })).rejects.toThrow('标记会话');
+    const [saved] = await autofill.handle({ type: 'mark-save', token: selection, draft }, page) as [LoginMark];
+    expect(saved).toMatchObject({ origin: new URL(url).origin, version: 1, enabled: true, ...draft });
+    expect(state.local.loginMarksSealed).toBeDefined();
+    for (const privateText of ['fixture_private_field', 'fixture_private_query', 'example-bank.com']) {
+      expect(JSON.stringify(state.local.loginMarksSealed)).not.toContain(privateText);
+    }
+    activeUrl = url;
+    page = { ...source, documentId: 'refreshed-document' };
+    const restarted = new AutofillController(new VaultController());
+    expect(await restarted.handle({ type: 'mark-get' }, page)).toEqual([saved]);
+    expect(await restarted.marking.read(url.replace('/login', '/other'))).toEqual([]);
+    expect(await restarted.marking.read(url.replace('.com', '.com:7443'))).toEqual([]);
+    await expect(restarted.handle({ type: 'begin', kind: 'login' }, page)).rejects.toThrow('标记已变化');
+    const nextStep: MarkDraft = { form: draft.form, fields: { username: { type: 'text', id: 'account_step' } } };
+    await autofill.handle({ type: 'mark-start' }, vaultPage);
+    const [first, second] = await autofill.handle({ type: 'mark-save', token: selection, draft: nextStep }, page) as [LoginMark, LoginMark];
+    expect(first).toEqual(saved);
+    expect(second).toMatchObject({ ...nextStep, revision: 1 });
+    expect(second.id).not.toBe(first.id);
+    await expect(restarted.handle({ type: 'begin', kind: 'login', markId: markKey(first), markSet: markSetKey([first]) }, page))
+      .rejects.toThrow('标记已变化');
+    await expect(restarted.handle({ type: 'begin', kind: 'username', markId: markKey(second), markSet: markSetKey([first, second]) }, page))
+      .resolves.toMatchObject({ token: expect.any(String) });
+    const edited: MarkDraft = { form: { id: 'replacement' }, fields: draft.fields };
+    await autofill.handle({ type: 'mark-start', key: markKey(saved) }, vaultPage);
+    const [replacement, unchanged] = await autofill.handle({ type: 'mark-save', token: selection, draft: edited }, page) as [LoginMark, LoginMark];
+    expect(replacement).toMatchObject({ ...edited, id: saved.id, revision: saved.revision + 1 });
+    expect(unchanged).toEqual(second);
+    await autofill.handle({ type: 'mark-start', key: markKey(replacement) }, vaultPage);
+    const updated = await restarted.handle({ type: 'mark-enable', key: markKey(replacement), enabled: false }, vaultPage) as { marks: [LoginMark, LoginMark] };
+    expect(updated.marks[0]).toMatchObject({ id: saved.id, revision: replacement.revision + 1, enabled: false });
+    await expect(autofill.handle({ type: 'mark-save', token: selection, draft }, page)).rejects.toThrow('已经变化');
+    await restarted.handle({ type: 'mark-delete', key: markKey(updated.marks[0]) }, vaultPage);
+    expect(await restarted.handle({ type: 'mark-get' }, page)).toEqual([second]);
+  });
+});
+
 describe('real WASM + background session integration', () => {
+  it.each(['note', 'HOTP'])('keeps a stale edit from overwriting synced %s at the same revision (#41)', async (remoteField) => {
+    const controller = await unlocked();
+    const initial = record('Base');
+    initial.data.totpUri = 'otpauth://hotp/Fixture?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=2';
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(initial) });
+    const [{ id }] = await controller.handle({ type: 'list' }) as [ItemSummary];
+    const baseFiles = structuredClone(state.files!);
+    const base = await controller.handle({ type: 'get-edit', id }) as VaultItem;
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify({ ...base, title: 'Saved local title' }) });
+    const local = await controller.handle({ type: 'get-edit', id }) as VaultItem;
+    const draft = { ...local, title: 'My unsaved input' };
+    const { key, wrap } = state.session!;
+    const synced = new wasm.WasmVaultEngine();
+    try {
+      synced.restore_from_session(key, wrap, baseFiles.head, baseFiles.snap);
+      const item = JSON.parse(synced.get_item_json(id, true)) as VaultItem;
+      item.title = local.title;
+      if (remoteField === 'note') item.note = 'Remote note merged into the local title';
+      else item.data.totpUri = (item.data.totpUri as string).replace('counter=2', 'counter=3');
+      // Simulate the authenticated snapshot being installed while the form stays open.
+      const result = synced.upsert_item_json(JSON.stringify(item), local.updatedAtMs!, 'peer');
+      try {
+        state.files = { ...state.files!, head: result.head_bytes, snap: result.snap_bytes };
+      } finally { result.free(); }
+    } finally { synced.free(); }
+    const resumed = new VaultController();
+    const current = await resumed.handle({ type: 'get-edit', id }) as VaultItem;
+    expect(current.revision).toBe(local.revision);
+    expect(current.updatedAtMs).toBe(local.updatedAtMs);
+    await expect(resumed.handle({ type: 'upsert', itemJson: JSON.stringify(draft) })).rejects.toThrow('其他窗口更新');
+    const saved = await resumed.handle({ type: 'get-edit', id }) as VaultItem;
+    expect(saved).toEqual(current);
+    if (remoteField === 'HOTP') await expect(resumed.handle({ type: 'next-hotp', id })).resolves.toMatchObject({ counter: '3' });
+    else {
+      await resumed.handle({ type: 'upsert', itemJson: JSON.stringify({ ...saved, title: draft.title }) });
+      expect(await resumed.handle({ type: 'get', id })).toMatchObject({ title: draft.title, note: current.note });
+    }
+  });
+
   it('audits the authenticated snapshot without exposing secrets or keeping reports across lock', async () => {
     const controller = await unlocked();
     const item = record('Sensitive fixture', true);
@@ -279,6 +489,55 @@ describe('real WASM + background session integration', () => {
     }
   });
 
+  it('refreshes opted-in OTP time on unchanged WebDAV polls, falls back offline, and resumes (#19)', async () => {
+    let now = 1_800_000_005_000, dateHeader = true;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const remote = vi.spyOn(globalThis, 'fetch').mockImplementation(async url => {
+      const path = new URL(String(url)).pathname;
+      return new Response(`<multistatus xmlns="DAV:"><response><href>${path}</href><propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>`,
+        { status: 207, headers: dateHeader ? { Date: new Date(now + 45_000).toUTCString() } : {} });
+    });
+    state.settings.autoLockMinutes = 240;
+    const controller = await unlocked();
+    const input = { provider: 'custom', base: 'https://dav.example.test/', folder: 'vault', username: 'fixture', password: 'fixture' } as const;
+    try {
+      const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+      const item = record('Polling time');
+      item.data.totpUri = secret;
+      await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+      const [{ id }] = await controller.handle({ type: 'list' }) as [ItemSummary];
+      await controller.handle({ type: 'webdav-test', input, remember: true });
+      await controller.handle({ type: 'webdav-clock', enabled: true });
+      state.remoteVaultId = fixture.vaultId;
+      state.pendingWal = []; // Initial login is already present at the last common head.
+      const poll = async () => {
+        state.remotePoll = { endpoint: await endpointFingerprint(webDavConfig(input).url), objects: [], checkedAt: now };
+        await expect(controller.handle({ type: 'webdav-scheduled' })).resolves.toEqual({ kind: 'unchanged', pending: false });
+        expect(remote.mock.lastCall?.[0]).toBe('https://dav.example.test/vault/wal/');
+      };
+      const codes = async (offset: number) => {
+        const detail = await controller.handle({ type: 'get', id }) as ItemDetailData;
+        if (detail.otp?.kind !== 'time') throw new Error('Expected a timed code');
+        const expected = wasm_totp_at(secret, now / 1000 + offset).split(':')[0];
+        const read = await controller.handle({ type: 'read-otp', id, handle: detail.otp.handle! }) as { value: string };
+        const fill = await controller.handle({ type: 'autofill-read', id, kind: 'otp', groups: [], url: 'https://example-bank.com' }) as { values: { otp: string } };
+        expect(read.value === expected && fill.values.otp === expected).toBe(true);
+      };
+      await codes(45);
+      now += 29 * 60_000; await poll();
+      now += 2 * 60_000; await codes(45);
+      now += 31 * 60_000; // No successful communication.
+      await codes(0);
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ compensation: true, offsetSeconds: null });
+      await poll(); await codes(45);
+      dateHeader = false; await poll(); await codes(0);
+      dateHeader = true; await poll();
+      await controller.handle({ type: 'webdav-clock', enabled: false });
+      await poll(); await codes(0);
+      expect(remote.mock.calls.every(([url, init]) => String(url).startsWith(input.base) && init?.method === 'PROPFIND')).toBe(true);
+    } finally { await controller.lock(); remote.mockRestore(); clock.mockRestore(); }
+  });
+
   it('tests new WebDAV settings read-only, persists a circuit break and applies opt-in HTTPS time to codes', async () => {
     const time = Math.floor(Date.now() / 30_000) * 30_000 + 95_000;
     const input = { provider: 'nutstore', base: '', folder: 'test', username: 'private-fixture-account', password: 'fixture-secret-for-this-test' } as const;
@@ -301,7 +560,8 @@ describe('real WASM + background session integration', () => {
       await expect(restarted.handle({ type: 'webdav-test', input, remember: true })).resolves.toMatchObject({ kind: 'missing', writeAllowed: false });
       await expect(restarted.handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: false, paused: 429 });
       await expect(restarted.handle({ type: 'webdav-test', input, remember: true })).resolves.toMatchObject({ writeAllowed: false });
-      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toEqual({ saved: true, paused: undefined, offsetSeconds: 45, compensation: false });
+      await expect(restarted.handle({ type: 'webdav-status' })).resolves.toEqual({ saved: true, paused: undefined,
+        offsetSeconds: 45, clockExpiresAt: time + 30 * 60_000 + 1, compensation: false });
       const stored = JSON.stringify(state.local);
       expect(stored).not.toContain(input.password);
       expect(stored).not.toContain(input.username);
@@ -879,6 +1139,31 @@ describe('Ente migration and counter-based codes', () => {
     return (await controller.handle({ type: 'list' }) as ItemSummary[])[0]!.id;
   }
 
+  it.each(['Ente', 'portable'] as const)('does not create a second live HOTP on %s reimport with a different period', async source => {
+    const controller = await unlocked();
+    const id = await addHotp(controller);
+    for (const counter of ['0', '1']) await expect(controller.handle({ type: 'next-hotp', id })).resolves.toMatchObject({ counter });
+    const stale = token('hotp', 'GitHub%3Atester', '&counter=0&period=60');
+    if (source === 'Ente') {
+      const bytes = bytesOf(stale);
+      const preview = await controller.handle({ type: 'preview-ente', bytes }) as EntePreview;
+      expect(preview).toMatchObject({ ready: 0, skipped: 1, invalid: 0 });
+      expect(await controller.handle({ type: 'import-ente', bytes, stamp: preview.stamp, proof, merges: [] })).toBe(0);
+    } else {
+      const bytes = bytesOf(JSON.stringify({ encrypted: false, items: [{
+        name: 'Counter token', type: 1, login: { username: 'tester', password: 'Unique-Secret-Pass#719',
+          uris: [{ uri: 'https://example-bank.com' }], totp: stale },
+      }] }));
+      const input = { format: 'bitwarden', bytes } as const;
+      const preview = await controller.handle({ type: 'preview-migration', ...input }) as MigrationPreview;
+      expect(preview).toMatchObject({ ready: 0, skipped: 1, invalid: 0 });
+      expect(await controller.handle({ type: 'import-migration', ...input, stamp: preview.stamp, proof })).toBe(0);
+    }
+    const items = await controller.handle({ type: 'list' }) as ItemSummary[];
+    expect(items.map(item => item.id)).toEqual([id]);
+    expect(await controller.handle({ type: 'next-hotp', id })).toEqual({ kind: 'hotp', counter: '2', value: '359152' });
+  });
+
   it('commits distinct HOTP counters for concurrent callers and resumes after worker recreation', async () => {
     const controller = await unlocked();
     const id = await addHotp(controller);
@@ -1179,7 +1464,7 @@ describe('phase two migration transactions and autofill reads', () => {
     const fill = await controller.handle({ type: 'autofill-read', id: login.id, url: 'https://example.com', kind: 'username', groups: [], proof });
     expect(fill).toEqual({ values: { username: 'fixture' } });
     expect(JSON.stringify(fill)).not.toContain('Hidden-Password');
-    const item = await controller.handle({ type: 'get', id: login.id, proof }) as VaultItem;
+    const item = await controller.handle({ type: 'get-edit', id: login.id, proof }) as VaultItem;
     item.customFields.push({ name: 'department', value: 'Visible department', hidden: true },
       { name: 'CSV 未识别的验证码设置', value: 'Reserved-Seed-Do-Not-Fill', hidden: true });
     await controller.handle({ type: 'upsert', itemJson: JSON.stringify(item), proof });
@@ -1205,6 +1490,106 @@ describe('phase two migration transactions and autofill reads', () => {
     expect(state.files).toEqual(before);
     expect(state.pendingWal).toHaveLength(0);
     await expect(controller.handle({ type: 'list' })).resolves.toEqual([]);
+  });
+  it.each(['aegis', '2fas', 'raivo'] as const)('keeps verified HOTP counters and reports unknown counters in %s backups', async format => {
+    const controller = await unlocked();
+    const secret = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+    const rows = [
+      ['Known zero', 'HOTP', 'SHA1', 6, 0],
+      ['Known positive', 'HOTP', 'SHA1', 8, 7],
+      ['Missing', 'HOTP', 'SHA256', 6, undefined],
+      ['Fraction', 'HOTP', 'SHA256', 8, 1.5],
+      ['Negative', 'HOTP', 'SHA512', 6, -1],
+      ['Timed', 'TOTP', 'SHA1', 6, undefined],
+    ] as const;
+    const records = rows.map(([name, kind, algorithm, digits, counter]) => {
+      if (format === 'aegis') return { name, type: kind.toLowerCase(), info: { secret, algo: algorithm, digits, counter } };
+      if (format === '2fas') return { name, secret, otp: { tokenType: kind, account: name, algorithm, digits, counter } };
+      return { account: name, kind: kind.toLowerCase(), secret, algorithm, digits: String(digits), counter: counter?.toString() };
+    });
+    const source = format === 'aegis' ? { version: 1, db: { version: 3, entries: records } }
+      : format === '2fas' ? { schemaVersion: 4, services: records } : records;
+    const bytes = Array.from(Buffer.from(JSON.stringify(source)));
+    const message = { type: 'preview-auth-backup', format, bytes } as const;
+
+    const before = structuredClone(state.files);
+    const preview = await controller.handle(message) as AuthBackupPreview;
+    expect(preview).toMatchObject({ ready: 3, invalid: 3, skipped: 0, unknownHotpCounters: 3 });
+    expect(JSON.stringify(preview)).not.toMatch(/GEZDGNBV|otpauth:/);
+    expect(state.files).toEqual(before);
+    expect(await controller.handle({ type: 'list' })).toEqual([]);
+
+    expect(await controller.handle({ ...message, type: 'import-auth-backup', stamp: preview.stamp, proof })).toBe(3);
+    const items = await controller.handle({ type: 'list' }) as ItemSummary[];
+    expect(items.map(item => item.title).sort()).toEqual(['Known positive', 'Known zero', 'Timed']);
+    const id = (title: string) => items.find(item => item.title === title)!.id;
+    for (const [title, counter, next, value] of [
+      ['Known zero', '0', '1', '755224'], ['Known positive', '7', '8', '82162583'],
+    ] as const) {
+      expect(await controller.handle({ type: 'next-hotp', id: id(title) })).toMatchObject({ counter, value });
+      expect(await controller.handle({ type: 'next-hotp', id: id(title) })).toMatchObject({ counter: next });
+    }
+    expect(await controller.handle({ type: 'get', id: id('Timed') })).toMatchObject({ otp: { kind: 'time' } });
+  });
+  it('round-trips Vault login CSV with offline logins and standalone authenticators', async () => {
+    const source = await unlocked();
+    const title = 'Standalone authenticator';
+    const otp = 'otpauth://totp/Fixture?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+    const offline = record('Offline login');
+    offline.data.uris = [];
+    const timed = { ...record(title), data: { kind: 'login', username: 'token account', password: '', uris: [], totpUri: otp } };
+    const online = record('Website login');
+    const onlineUrl = 'https://online.example.test/login';
+    online.data.uris = [{ uri: onlineUrl }];
+    const otherOffline = { ...offline, title: 'Second offline account' };
+    const trashedOffline = { ...offline, trashed: true };
+    for (const item of [offline, otherOffline, trashedOffline, timed, online, { ...record('Not a login'), data: { kind: 'developer', subtype: 'secure_note' } }]) {
+      await source.handle({ type: 'upsert', itemJson: JSON.stringify(item) });
+    }
+    const request = { type: 'export-migration', format: 'csv', proof, confirmPlaintext: true } as const;
+    await expect(source.handle({ ...request, confirmPlaintext: false })).rejects.toThrow('明文文件的风险');
+    await expect(source.handle({ ...request, proof: { method: 'pin', secret: '123456' } })).rejects.toThrow('主密码');
+    const exported = await source.handle(request) as { text: string; count: number; skipped: number };
+    expect(exported).toMatchObject({ count: 5, skipped: 1 });
+
+    await source.lock();
+    state.files = undefined;
+    state.pendingWal = [];
+    const target = new VaultController();
+    await target.handle({ type: 'create', masterPassword: password, calibrate: false });
+    const bytes = [...Buffer.from(exported.text)];
+    const headers = await target.handle({ type: 'csv-headers', bytes }) as { vendor?: string; mapping?: Record<string, number> };
+    const mapping = headers.mapping ?? { title: 0, url: 1, username: 2, password: 3, note: 4, totp: 5, tags: 6, trashed: 7 };
+    const message = { type: 'preview-migration', format: 'csv', bytes, mapping } as const;
+    const before = structuredClone(state.files);
+    const preview = await target.handle(message) as MigrationPreview;
+    expect(preview).toMatchObject({ ready: 5, skipped: 0, invalid: 0, ignoredOtp: 0 });
+    expect(headers.vendor).toBe('Vault');
+    expect(JSON.stringify(preview)).not.toMatch(/GEZDGNBV|Unique-Secret-Pass/);
+    expect(state.files).toEqual(before);
+    expect(await target.handle({ type: 'list' })).toEqual([]);
+    expect(await target.handle({ ...message, type: 'import-migration', stamp: preview.stamp, proof })).toBe(5);
+    const items = await target.handle({ type: 'list' }) as ItemSummary[];
+    expect(items).toHaveLength(5);
+    expect(items.filter(item => item.title === offline.title).map(item => item.trashed).sort()).toEqual([false, true]);
+    expect(items.find(item => item.title === otherOffline.title)?.trashed).toBe(false);
+    const id = (title: string) => items.find(item => item.title === title)!.id;
+    expect(await target.handle({ type: 'get-edit', id: id(offline.title) }))
+      .toMatchObject({ data: { password: offline.data.password, uris: [] } });
+    expect(await target.handle({ type: 'get-edit', id: id(online.title) }))
+      .toMatchObject({ data: { password: online.data.password, uris: [{ uri: onlineUrl }] } });
+    expect(await target.handle({ type: 'get-edit', id: id(title) })).toMatchObject({ data: { password: '', uris: [], totpUri: otp } });
+    expect(await target.handle(message)).toMatchObject({ ready: 0, skipped: 5 });
+    const detail = await target.handle({ type: 'get', id: id(title) }) as ItemDetailData;
+    expect(detail.otp?.kind).toBe('time');
+    if (detail.otp?.kind !== 'time') throw new Error('Expected timed OTP');
+    expect(await target.handle({ type: 'read-otp', id: detail.id, handle: detail.otp.handle! }))
+      .toMatchObject({ kind: 'totp', value: expect.stringMatching(/^\d{6}$/) });
+
+    const foreign = { ...message, bytes: [...Buffer.from('Website,Pass,Name\n,secret,Offline\nhttps://third.example,,No password')],
+      mapping: { url: 0, password: 1, title: 2 } };
+    expect(await target.handle(foreign)).toMatchObject({ ready: 0, invalid: 2 });
+    await expect(target.handle({ ...foreign, mapping: { password: 1 } })).rejects.toThrow('请映射网站和密码列');
   });
   it('requires a master proof and explicit plaintext consent for full-vault migration exports', async () => {
     const controller = await unlocked();
@@ -1233,7 +1618,7 @@ describe('phase two migration transactions and autofill reads', () => {
     expect(browser.storage.session.set).toHaveBeenCalledWith({ clipboard: {
       hash: createHash('sha256').update(copied).digest('hex'), expiresAt: expect.any(Number),
     } });
-    const latest = await controller.handle({ type: 'get', id, proof }) as VaultItem;
+    const latest = await controller.handle({ type: 'get-edit', id, proof }) as VaultItem;
     latest.data.totpUri = 'otpauth://hotp/Fixture?secret=JBSWY3DPEHPK3PXP&counter=5';
     await controller.handle({ type: 'upsert', itemJson: JSON.stringify(latest), proof });
     vi.mocked(offscreen).mockClear();

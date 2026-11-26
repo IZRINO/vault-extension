@@ -40,6 +40,8 @@ function Menu() {
     finally { setBusy(false); setSecret(''); if (proof) proof.secret = ''; }
   };
   const risk = state?.crossOrigin || state?.insecure;
+  const capture = state?.capture;
+  const needsProof = selected?.requireReprompt || capture?.requireReprompt;
   return <div className="inline-shell">
     <header className="inline-head"><strong>Vault</strong><button type="button" className="inline-close" aria-label="关闭填充菜单" onClick={event => { if (event.isTrusted) close(); }}>关闭</button></header>
     <main className="inline-body">
@@ -48,12 +50,14 @@ function Menu() {
           {error && <p className="banner banner-error" role="alert">{error}</p>}
           {!state && !error && <p role="status">正在确认网页来源…</p>}
           {state && <>
-            <h1>{state.capture ? state.capture.updating ? '更新网站密码' : '保存新凭证' : state.kind === 'otp' ? '选择验证码' : '选择要填入的凭证'}</h1>
+            <h1>{capture?.ambiguous ? '无法确定要更新的凭证' : capture ? capture.updating ? '更新网站密码' : '保存新凭证'
+              : state.kind === 'otp' ? '选择验证码' : '选择要填入的凭证'}</h1>
             <p className="hint">填入网站：<strong>{state.site}</strong></p>
             {state.crossOrigin && <div className="banner banner-warn" role="alert"><p>当前页面是 {state.topSite}，输入框来自 {state.site}。请确认你信任这两个网站。</p></div>}
             {state.insecure && <p className="banner banner-warn" role="alert">这是未加密的 HTTP 网页，填入的内容可能被网络上的其他人看到。</p>}
             {risk && <label className="check"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我确认网站来源，允许本次操作</label>}
-            {state.capture && <p>账号：{state.capture.account || '未填写账号'}。只有点击保存，才会写入密码库。</p>}
+            {capture && <p>账号：{capture.account || '未填写账号'}。</p>}
+            {capture?.ambiguous && <p className="banner banner-warn" role="alert">有多条同账号凭证，请在密码库中手动选择更新。</p>}
             {!state.capture && state.kind === 'login' && state.candidates.some(candidate => candidate.otpKind && candidate.otpKind !== 'hotp') &&
               <label className="check"><input type="checkbox" checked={copyOtp} disabled={busy} onChange={event => setCopyOtp(event.target.checked)} />填充后复制时间验证码，30 秒后清理</label>}
             {state.kind === 'otp' && state.candidates.some(candidate => candidate.otpKind === 'hotp') && <p className="hint">选择 HOTP 会生成并推进一次计数，请仅在网站要求时使用。</p>}
@@ -64,13 +68,12 @@ function Menu() {
               </button>)}
               {!state.candidates.length && <p className="hint">没有匹配的凭证。请在 Vault 中添加此网站，或检查已保存的网站匹配规则。</p>}
             </div>}
-            {(selected || state.capture) && <form className="form" onSubmit={event => {
+            {(selected || capture && !capture.ambiguous) && <form className="form" onSubmit={event => {
               event.preventDefault();
               if (!event.isTrusted || !!risk && !confirmed) return;
-              const needsProof = selected?.requireReprompt || state.capture && state.candidates.some(candidate => candidate.account === state.capture!.account && candidate.requireReprompt);
               void act(selected, needsProof ? { method, secret } : undefined);
             }}>
-              {(selected?.requireReprompt || state.capture && state.candidates.some(candidate => candidate.account === state.capture!.account && candidate.requireReprompt)) && <>
+              {needsProof && <>
                 {state.pinEnabled && <label className="field">验证方式<select className="select" value={method} onChange={event => { setMethod(event.target.value as Proof['method']); setSecret(''); }}>
                   <option value="master">主密码</option><option value="pin">本机 PIN</option>
                 </select></label>}

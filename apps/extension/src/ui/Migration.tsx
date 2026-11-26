@@ -39,6 +39,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
   const [exportPassword, setExportPassword] = useState('');
   const [again, setAgain] = useState('');
   const [risk, setRisk] = useState(false);
+  const [exportReport, setExportReport] = useState<Pick<MigrationExport, 'count' | 'passkeys' | 'skippedPasskeys' | 'unverifiedRetainedPasskeys'>>();
   const input = useRef<HTMLInputElement>(null);
   const dragged = useRef<{ file: File | undefined; index: number } | undefined>(undefined);
   const [target, setTarget] = useState<keyof CsvMapping>();
@@ -48,6 +49,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
     if (next === mode) return;
     clear();
     setRisk(false);
+    setExportReport(undefined);
     setMode(next);
   };
   const assign = (key: keyof CsvMapping, index?: number) => {
@@ -143,6 +145,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
         <p className="hint">重复跳过 {preview.skipped} 条，无法读取 {preview.invalid} 条，不支持的类型 {preview.unsupported} 条。</p>
         {!csv && (preview.passkeys ?? 0) > 0 && <p className="hint">可启用 {preview.passkeys} 个通行密钥。</p>}
         {!csv && !!preview.suspendedPasskeys && <p className="banner banner-warn">有 {preview.suspendedPasskeys} 枚通行密钥的签名计数待核实，暂不能登录。</p>}
+        {!csv && !!preview.suspendedHotps && <p className="banner banner-warn">有 {preview.suspendedHotps} 个计数型验证码重复或计数待核实。账号会保留，这些验证码暂不能出码。</p>}
         {!csv && (preview.ignoredPasskeys ?? 0) > 0 && <p className="banner banner-warn">有 {preview.ignoredPasskeys} 个通行密钥缺少可用私钥或使用了不支持的算法。</p>}
         {preview.ignoredOtp > 0 && <p className="banner banner-warn">有 {preview.ignoredOtp} 个验证码设置未启用，原值已保留为隐藏字段。请继续保留原验证器并检查这些记录。</p>}
         {preview.unsupported > 0 && <p className="banner banner-warn">请保留原密码库，检查未导入的条目和附件。</p>}
@@ -168,6 +171,7 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
       event.preventDefault();
       if (busy || !encrypted && !risk) return;
       void work(async () => {
+        setExportReport(undefined);
         if (encrypted && exportPassword !== again) throw new Error('两次文件密码不一致。');
         if (!encrypted && !await dialogs.confirm({ title: '导出未加密的凭证？', body: '文件包含完整密码和验证码密钥，也包含回收站中的条目。请只用于迁移，并妥善保管。', confirmLabel: '验证主密码并导出', danger: true })) return;
         const proof = await dialogs.proof({ masterOnly: true });
@@ -175,7 +179,8 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
           const result = await request<MigrationExport>({ type: 'export-migration', format, encrypted, password: exportPassword, confirmPlaintext: risk, proof });
           download(`Vault-${csv ? 'Logins' : 'Bitwarden'}-${new Date().toISOString().slice(0, 10)}.${csv ? 'csv' : 'json'}`, result.text, csv ? 'text/csv;charset=utf-8' : 'application/json');
           setExportPassword(''); setAgain(''); setRisk(false);
-          notify(`已请求下载 ${result.count} 条凭证${result.skipped ? `，跳过 ${result.skipped} 条其他类型` : ''}，请检查下载记录。`);
+          if (csv) notify(`已请求下载 ${result.count} 条凭证${result.skipped ? `，跳过 ${result.skipped} 条其他类型` : ''}，请检查下载记录。`);
+          else setExportReport({ count: result.count, passkeys: result.passkeys, skippedPasskeys: result.skippedPasskeys, unverifiedRetainedPasskeys: result.unverifiedRetainedPasskeys });
         } finally { proof.secret = ''; }
       });
     }}>
@@ -191,6 +196,9 @@ export default function Migration({ format, refresh }: { format: MigrationFormat
         <label className="check"><input type="checkbox" checked={risk} disabled={busy} onChange={event => setRisk(event.target.checked)} />我理解文件未加密，会妥善保管</label>
       </>}
       <button className="btn btn-primary" disabled={busy || !encrypted && !risk}>导出{csv ? '登录 CSV' : ' Bitwarden JSON'}</button>
+      {!csv && <p role="status" className={exportReport?.skippedPasskeys || exportReport?.unverifiedRetainedPasskeys ? 'banner banner-warn' : 'hint'}>
+        {exportReport && `已请求下载 ${exportReport.count} 条凭证。文件包含 ${exportReport.passkeys ?? 0} 枚可用的通行密钥，${exportReport.skippedPasskeys ?? 0} 枚未导出。${exportReport.unverifiedRetainedPasskeys ? `另有 ${exportReport.unverifiedRetainedPasskeys} 条原始密钥记录已保留，尚未验证能否登录。` : ''}${exportReport.skippedPasskeys || exportReport.unverifiedRetainedPasskeys ? '请保留原密码库，并确认能用目标库登录。' : '请检查下载记录。'}`}
+      </p>}
     </form>}
   </>;
 }

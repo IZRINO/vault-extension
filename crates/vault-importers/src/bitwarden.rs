@@ -312,12 +312,8 @@ pub fn export(items_json: &str, password: &str, entropy: &[u8]) -> Result<String
                         }
                     }
                 }
-                if let Some(added) = item["_vaultFido2"].as_array().filter(|values| !values.is_empty()) {
-                    let mut records = row.0["login"]["fido2Credentials"].as_array().cloned().unwrap_or_default();
-                    for key in added {
-                        if !records.iter().any(|old| old["credentialId"] == key["credentialId"]) { records.push(key.clone()); }
-                    }
-                    row.0["login"]["fido2Credentials"] = json!(records);
+                if let Some(records) = item["_vaultFido2"].as_array() {
+                    drop(SecretJson(std::mem::replace(&mut row.0["login"]["fido2Credentials"], json!(records))));
                 }
                 row.0["login"]["uris"] = json!(data["uris"].as_array().map(|uris| uris.iter().map(|uri|
                     json!({ "uri": uri["uri"], "match": RULES.iter().position(|r| *r == text(uri, "matchRule")) })

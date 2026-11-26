@@ -1,5 +1,6 @@
 import type { RemoteWal } from './bootstrap';
 import { HEAD_LIMIT, SNAPSHOT_LIMIT, WAL_LIMIT } from './bootstrap';
+import { retireReservations } from './capacity';
 import { WebDavClient } from './webdav';
 
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, index) => value === b[index]);
@@ -22,8 +23,9 @@ export async function publishSnapshot(client: WebDavClient, id: string, previous
 
 export async function cleanAbsorbedWal(client: WebDavClient, consumed: readonly RemoteWal[], included: readonly string[]) {
   const absorbed = new Set(included);
-  for (const object of consumed) {
-    if (!absorbed.has(object.id)) continue;
+  const confirmed = consumed.filter(object => absorbed.has(object.id));
+  await retireReservations(client, confirmed);
+  for (const object of confirmed) {
     const name = `wal/${object.id}.bin`;
     let tag = object.etag;
     if (!tag) {

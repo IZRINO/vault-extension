@@ -290,7 +290,7 @@ pub(crate) fn replay(
         let batch = open_batch(keys, &base.vault_id, id, bytes)?;
         if (batch.base_epoch, batch.base_root) != (base.snapshot_epoch, base.state_mac) &&
            !ancestors.contains(&(batch.base_epoch, batch.base_root)) {
-            return Err(VaultError::InvalidInput("SyncAncestorRequired".into()));
+            return Err(VaultError::InvalidInput(format!("SyncAncestorRequired:{}", batch.base_epoch)));
         }
         for (before, after) in batch.devices {
             let name = &before.as_ref().or(after.as_ref()).ok_or_else(invalid)?.device_id;

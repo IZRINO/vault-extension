@@ -29,6 +29,61 @@ function fixtureCode(ms, steam = false) {
   }).join('');
 }
 
+// Monitor incoming messages in ordinary extension pages, not offscreen's private responses.
+// Only counts and a violation flag leave the page; never retain or print a message.
+async function observeOtpMessages(pages) {
+  assert.deepEqual(pages.map(page => new URL(page.url()).pathname).sort(), ['/popup.html', '/sidepanel.html']);
+  await Promise.all(pages.map(page => page.evaluate(() => {
+    const counts = { notifications: 0, pulls: 0, other: 0, violation: false };
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    const shapes = {
+      vault: { open: [], status: [], list: [], get: ['id', 'proof'], 'read-otp': ['id', 'handle'],
+        'next-hotp': ['id', 'proof'], 'copy-sensitive': ['value'], 'webdav-status': [], 'autofill-settings': [] },
+      'vault-autofill': { flags: [], pending: [], 'mark-get': [], 'mark-manage': [], 'site-rules': ['origin'],
+        begin: ['kind', 'manual'], menu: ['token'], close: ['token'], fill: ['token', 'id', 'confirmCrossOrigin', 'copyOtp', 'proof'] },
+      'vault-event': { locked: [], 'sync-changed': [] },
+    };
+    const field = (name, value) => {
+      if (name === 'id') return typeof value === 'string' && uuid.test(value);
+      if (name === 'token') return typeof value === 'string' && value.length === 72 && uuid.test(value.slice(0, 36)) && uuid.test(value.slice(36));
+      if (name === 'handle') return typeof value === 'string' && /^[A-Za-z0-9+/]{43}=$/.test(value);
+      if (name === 'proof') return value == null || Object.keys(value).sort().join(',') === 'method,secret' &&
+        ['master', 'pin'].includes(value.method) && typeof value.secret === 'string' && !/otpauth(?:-migration)?:|^[A-Z2-7]{16,}=*$/i.test(value.secret);
+      if (name === 'kind') return value === 'otp';
+      if (name === 'origin') { try { return new URL(value).origin === value && /^https?:\/\//.test(value); } catch { return false; } }
+      if (name === 'value') return typeof value === 'string' && /^(?:\d{6,8}|[23456789BCDFGHJKMNPQRTVWXY]{5})$/.test(value);
+      return typeof value === 'boolean';
+    };
+    const listener = message => {
+      if (message?.target === 'vault-offscreen' || message?.target === 'vault-offscreen-input') {
+        if (message.target === 'vault-offscreen') counts.notifications++; else counts.pulls++;
+        if (Object.keys(message).sort().join(',') !== 'jobId,target' || typeof message.jobId !== 'string' || !uuid.test(message.jobId)) counts.violation = true;
+        return;
+      }
+      counts.other++;
+      const allowed = message && Object.hasOwn(shapes, message.target) && Object.hasOwn(shapes[message.target], message.type)
+        ? shapes[message.target][message.type] : null;
+      if (!allowed || !Object.keys(message).every(key => key === 'target' || key === 'type' || allowed.includes(key) && field(key, message[key]))) {
+        counts.violation = true;
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+    globalThis.stopVaultOtpObservation = () => {
+      chrome.runtime.onMessage.removeListener(listener);
+      delete globalThis.stopVaultOtpObservation;
+      return counts;
+    };
+  })));
+  return async () => {
+    const observations = await Promise.all(pages.map(page => page.evaluate(() => globalThis.stopVaultOtpObservation())));
+    for (const counts of observations) {
+      assert.equal(counts.violation, false, 'An ordinary extension page received a message outside the daily-use allowlist');
+      assert(counts.notifications > 0 && counts.pulls > 0, 'Each extension page must witness both offscreen message paths');
+    }
+    return observations;
+  };
+}
+
 async function verify(name) {
   const executablePath = process.env.VAULT_BROWSER_PATH || browsers[name];
   assert(executablePath, 'Unknown browser: ' + name);
@@ -134,6 +189,11 @@ async function verify(name) {
     await page.getByRole('switch', { name: '查看或修改前再次验证' }).check();
     await page.getByRole('button', { name: '保存凭证', exact: true }).click();
     await expect(page.getByText('凭证已保存。')).toBeVisible();
+    const peer = await context.newPage();
+    await peer.goto(`chrome-extension://${id}/${view === 'popup' ? 'sidepanel' : 'popup'}.html`);
+    await page.bringToFront();
+    const otpPages = [page, peer];
+    const endTotp = await observeOtpMessages(otpPages);
     await page.getByText('Mail import', { exact: true }).click();
     await expect(page.getByRole('dialog')).toBeVisible();
     await expect(page.locator('output[aria-label="当前验证码"]')).toHaveCount(0);
@@ -150,7 +210,9 @@ async function verify(name) {
     await screenshot(page, name, 'totp');
     await page.getByRole('button', { name: '复制验证码', exact: true }).click();
     await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe(fixtureCode(fixtureTime + 1000));
-    await verifyEnte(page, send, name, () => setClock(fixtureTime + 30000), fixtureTime + 30000);
+    const totp = await endTotp();
+    const { hotp, steam } = await verifyEnte(page, send, name, () => setClock(fixtureTime + 30000), fixtureTime + 30000, otpPages);
+    await peer.close();
     await verifyEncryptedEnte(page, send, name);
     await verifyAuditReminders(page, send, name);
     await verifyPasswordFormats(page, send, name);
@@ -161,6 +223,7 @@ async function verify(name) {
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, csvPreviewAndImport: true, otpNeverLoadedInPanel: true,
       totpRotationCopyAndReprompt: true, entePreviewMergeAndExport: true, encryptedEnteImport: true, steamAndHotp: true,
+      ordinaryPageOtpMessages: { totp, hotp, steam },
       offlineAuditAndDeveloperExpiry: true, protonPgpAndBitwardenCsv: true, vendorJsonPreviewAndImport: true, dashlaneCsvZipPreviewAndImport: true, errors }));
   } finally {
     try { await context?.close(); }
@@ -307,7 +370,7 @@ async function verifyVendorFiles(page, send) {
   }
 }
 
-async function verifyEnte(page, send, name, setSteamTime, steamTime) {
+async function verifyEnte(page, send, name, setSteamTime, steamTime, otpPages) {
   const proof = { method: 'master', secret: password };
   await send({ type: 'upsert', itemJson: JSON.stringify({
     title: 'GitHub login', data: { kind: 'login', username: 'tester', password: 'Keep-Original-GitHub-Password', uris: [{ uri: 'https://github.com/login' }] },
@@ -362,6 +425,7 @@ async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   }
 
   await page.getByRole('button', { name: '密码库', exact: true }).click();
+  const endHotp = await observeOtpMessages(otpPages);
   await page.getByText('Counter', { exact: true }).click();
   await expect(page.locator('output[aria-label="当前验证码"]')).toHaveCount(0);
   await page.getByRole('button', { name: '生成验证码', exact: true }).click();
@@ -392,6 +456,7 @@ async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   await page.getByRole('button', { name: '复制验证码', exact: true }).click();
   await expect.poll(() => page.evaluate(() => globalThis.vaultCopiedCode)).toBe('287082');
   assert.equal((await send({ type: 'status' })).changesSinceBackup, changes);
+  const hotp = await endHotp();
   await screenshot(page, name, 'hotp');
   await page.getByRole('button', { name: '编辑', exact: true }).click();
   await page.getByLabel('备注', { exact: true }).fill('Edited after generating');
@@ -400,6 +465,7 @@ async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   assert(!(await send({ type: 'get', id: counterId })).data.totpUri);
   assert((await send({ type: 'get-edit', id: counterId })).data.totpUri.includes('counter=2'));
 
+  const endSteam = await observeOtpMessages(otpPages);
   await page.getByText('Steam', { exact: true }).click();
   await expect(page.getByText('两步验证码', { exact: true })).toHaveCount(2);
   await expect(page.getByText('密码', { exact: true })).toHaveCount(0);
@@ -407,6 +473,9 @@ async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   await setSteamTime();
   await expect(page.locator('output[aria-label="当前验证码"] .cells')).toHaveText(fixtureCode(steamTime, true));
   await expect(page.locator('output[aria-label="下一期验证码"]')).toBeVisible();
+  await page.getByRole('button', { name: '复制验证码', exact: true }).click();
+  await expect.poll(() => page.evaluate(expected => globalThis.vaultCopiedCode === expected, fixtureCode(steamTime, true))).toBe(true);
+  const steam = await endSteam();
   await screenshot(page, name, 'steam-next-code');
 
   await send({ type: 'create-pin', pin: '734928', proof });
@@ -442,6 +511,7 @@ async function verifyEnte(page, send, name, setSteamTime, steamTime) {
   assert(JSON.parse(entries.find(entry => entry.searchParams.get('issuer') === 'Archived').searchParams.get('codeDisplay')).trashed);
   await expect(page.getByText(/已请求下载验证码文本/)).toBeVisible();
   await screenshot(page, name, 'ente-export');
+  return { hotp, steam };
 }
 
 async function enterProof(page) {
@@ -611,7 +681,8 @@ async function screenshot(page, name, stage) {
   await page.screenshot({ path: path.join(output, `phase-2-${name}-${stage}.png`), animations: 'disabled' });
 }
 
-(async () => {
+module.exports = { observeOtpMessages };
+if (require.main === module) (async () => {
   const readBundle = entry => fs.readFile(path.join(extension, entry), 'utf8');
   const [background, kdf, csv, otp, ente, audit] = await Promise.all(['background.js', 'kdf-worker.js', 'csv-worker.js', 'otp-worker.js', 'ente-worker.js', 'audit-worker.js'].map(readBundle));
   const optionalExports = /wasm_parse_browser_csv|wasm_validate_totp|wasm_totp_at|wasm_parse_ente_auth|wasm_audit_snapshot/;

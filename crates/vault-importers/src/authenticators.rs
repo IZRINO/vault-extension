@@ -57,7 +57,10 @@ struct Login {
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Batch { rows: Vec<Record>, invalid: usize, unsupported: usize, ignored_otp: usize, repeated_parts: usize, missing_parts: usize }
+struct Batch {
+    rows: Vec<Record>, invalid: usize, unsupported: usize, ignored_otp: usize,
+    repeated_parts: usize, missing_parts: usize, unknown_hotp_counters: usize,
+}
 
 fn str_at<'a>(v: &'a Value, name: &str) -> &'a str { v.get(name).and_then(Value::as_str).unwrap_or("") }
 fn number(v: &Value, name: &str) -> Option<u64> { v.get(name).and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())) }
@@ -92,10 +95,18 @@ impl Batch {
         let label = if !row.issuer.is_empty() && !row.account.is_empty() && !row.account.contains(':') { format!("{}:{}", row.issuer, row.account) } else { default_label.into() };
         let algorithm = if row.algorithm.is_empty() { "SHA1".to_owned() } else { row.algorithm.to_ascii_uppercase().replace('-', "") };
         if !matches!(algorithm.as_str(), "SHA1" | "SHA256" | "SHA512") { self.unsupported += 1; return; }
+        let counter = if kind == "hotp" {
+            let Some(counter) = row.counter else {
+                self.invalid += 1;
+                self.unknown_hotp_counters += 1;
+                return;
+            };
+            Some(counter)
+        } else { None };
         let mut setup = Zeroizing::new(format!("otpauth://{kind}/{}?secret={}&algorithm={algorithm}&digits={}",
             uri_encode(&label), uri_encode(row.secret), if kind == "steam" { 5 } else { row.digits.unwrap_or(6) }));
         if !row.issuer.is_empty() { setup.push_str(&format!("&issuer={}", uri_encode(row.issuer))); }
-        if kind == "hotp" { setup.push_str(&format!("&counter={}", row.counter.unwrap_or(0))); }
+        if let Some(counter) = counter { setup.push_str(&format!("&counter={counter}")); }
         else { setup.push_str(&format!("&period={}", if kind == "steam" { 30 } else { row.period.unwrap_or(30) })); }
         if let Ok(valid) = parse(&setup) {
             self.rows.push(Record { title: first(&[row.title, row.issuer, row.account, "验证码"]).into(), note: row.note.into(),

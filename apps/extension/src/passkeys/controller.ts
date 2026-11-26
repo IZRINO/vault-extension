@@ -5,6 +5,7 @@ import { readRequest, type PasskeyCandidate, type PasskeyOutcome, type PasskeySe
 type Port = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
 type Sender = NonNullable<Port['sender']>;
 type Source = { tabId: number; windowId: number; documentId: string; href: string; origin: string };
+type Waiting = { source: Source; ticket: string };
 type Ceremony = {
   port: Port;
   source: Source;
@@ -16,23 +17,21 @@ type Ceremony = {
   inlineDocument?: string;
   popupDocument?: string;
   popup?: number;
-  presenting?: boolean;
   performing?: boolean;
   chosen?: string;
 };
 const PROMPT = '/passkey-prompt.html';
+const WAITING = 'passkey-waiting';
+const CONFIRMATION_MS = 60_000;
 
 export class PasskeyController {
   private pending = new Map<number, Ceremony>();
+  private waitingTail: Promise<unknown> = Promise.resolve();
   constructor(private vault: VaultController) {}
 
   stop(tabId?: number, rule?: string) {
-    for (const entry of this.pending.values()) {
-      if ((tabId == null || entry.source.tabId === tabId) && (!rule || siteRuleMatches(rule, new URL(entry.source.origin)))) {
-        // A request already performing may have committed a credential or counter.
-        this.finish(entry, { type: rule && !entry.performing ? 'native' : 'cancel' });
-      }
-    }
+    this.invalidate(source => (tabId == null || source.tabId === tabId) && (!rule || siteRuleMatches(rule, new URL(source.origin))),
+      rule ? 'native' : 'cancel');
   }
 
   closed(windowId: number) {
@@ -40,9 +39,36 @@ export class PasskeyController {
   }
 
   selected(tabId: number, windowId: number) {
-    for (const entry of this.pending.values()) {
-      if (entry.source.windowId === windowId && entry.source.tabId !== tabId) this.finish(entry, { type: 'cancel' });
-    }
+    this.invalidate(source => source.windowId === windowId && source.tabId !== tabId, 'cancel');
+  }
+
+  private waiting<T>(run: (records: Waiting[]) => Promise<T>): Promise<T> {
+    // Store only the opaque reservation and its document binding. The request
+    // itself stays in the bridge while the service worker is allowed to sleep.
+    const next = this.waitingTail.then(async () => {
+      const saved = await browser.storage.session.get<{ [WAITING]?: Waiting[] }>(WAITING);
+      return run(saved[WAITING] ?? []);
+    });
+    this.waitingTail = next.catch(() => undefined);
+    return next;
+  }
+
+  private invalidate(matches: (source: Source) => boolean, type: 'native' | 'cancel') {
+    const cancelActive = () => {
+      for (const entry of this.pending.values()) if (matches(entry.source)) {
+        // A request already performing may have committed a credential or counter.
+        this.finish(entry, { type: entry.performing ? 'cancel' : type });
+      }
+    };
+    cancelActive();
+    void this.waiting(async records => {
+      cancelActive(); // A queued input interaction may just have become active.
+      const expired = records.filter(({ source }) => matches(source));
+      if (!expired.length) return;
+      await browser.storage.session.set({ [WAITING]: records.filter(record => !expired.includes(record)) });
+      await Promise.allSettled(expired.map(({ source, ticket }) => browser.tabs.sendMessage(source.tabId,
+        { target: 'vault-passkey-bridge', type, ticket }, { documentId: source.documentId })));
+    }).catch(() => undefined);
   }
 
   private finish(entry: Ceremony, result: PasskeyOutcome) {
@@ -79,48 +105,62 @@ export class PasskeyController {
     });
     port.onMessage.addListener(message => {
       const send = (value: unknown) => { if (live) try { port.postMessage(value); } catch { live = false; } };
-      if (message?.type === 'show' && entry?.request.conditional && !entry.presenting && !entry.candidates) {
-        const target = entry;
-        target.presenting = true;
-        void (async () => {
-          await this.revalidate(target.source, true);
-          target.candidates = await this.vault.passkeyCandidates(target.request);
-          this.current(target);
-          send({ type: 'inline', ticket: target.ticket });
-        })().catch(() => this.finish(target, { type: 'cancel' }));
-        return;
-      }
-      if (started || message?.type !== 'begin') return;
+      if (started || !['begin', 'show', 'discard'].includes(message?.type)) return;
       started = true;
+      const showing = message.type === 'show';
+      const ticket = typeof message.ticket === 'string' && /^[a-f0-9-]{36}$/.test(message.ticket) ? message.ticket : undefined;
+      const unavailable = showing ? 'cancel' : 'native';
       void (async () => {
-        const source = await this.source(port.sender);
-        if (message.request === 'capability') {
+        if (message.type === 'begin' && message.request === 'capability') {
+          const source = await this.source(port.sender);
           send({ type: 'capability', available: await this.vault.passkeyAvailable(source.origin) });
           return;
         }
-        const request = readRequest(message.request);
-        if (!live || !request || this.pending.has(source.tabId) || this.pending.size >= 6) { send({ type: 'native' }); return; }
-        const trusted: TrustedRequest = { ...request, origin: source.origin, rpId: request.rpId ?? new URL(source.origin).hostname };
-        await this.revalidate(source, !trusted.conditional);
-        if (!await this.vault.passkeyAvailable(source.origin)) return send({ type: 'native' });
-        if (!live || this.pending.has(source.tabId) || this.pending.size >= 6) return send({ type: 'cancel' });
-        const duration = trusted.conditional ? 120_000 : 60_000;
-        const record: Ceremony = {
-          port, source, request: trusted, ticket: crypto.randomUUID(), deadline: Date.now() + duration,
-          timer: setTimeout(() => { this.finish(record, { type: 'cancel' }); }, duration),
-        };
-        entry = record;
-        this.pending.set(source.tabId, record);
-        if (trusted.conditional) send({ type: 'conditional' });
-        else {
-          record.candidates = await this.vault.passkeyCandidates(trusted);
-          this.current(record);
-          if (trusted.kind === 'assert' && record.candidates.length === 0) { this.finish(record, { type: 'native' }); return; }
-          await this.popup(record);
-        }
+        const record = await this.waiting(async records => {
+          const source = await this.source(port.sender);
+          const slot = records.find(record => record.source.tabId === source.tabId);
+          const matches = slot && slot.ticket === ticket && slot.source.documentId === source.documentId && slot.source.href === source.href;
+          if (message.type === 'discard') {
+            if (matches) await browser.storage.session.set({ [WAITING]: records.filter(value => value !== slot) });
+            send({ type: 'discarded' });
+            return;
+          }
+          const request = readRequest(message.request);
+          if (!request || (request.conditional && !ticket) || (showing && (!request.conditional || !matches)) ||
+              this.pending.has(source.tabId) || (!showing && (slot || records.length + this.pending.size >= 6))) {
+            send({ type: unavailable });
+            return;
+          }
+          const trusted: TrustedRequest = { ...request, origin: source.origin, rpId: request.rpId ?? new URL(source.origin).hostname };
+          await this.revalidate(source, !trusted.conditional || showing);
+          const available = live && await this.vault.passkeyAvailable(source.origin);
+          if (showing) await browser.storage.session.set({ [WAITING]: records.filter(value => value !== slot) });
+          if (!live || !available) { send({ type: unavailable }); return; }
+          if (trusted.conditional && !showing) {
+            await browser.storage.session.set({ [WAITING]: [...records, { source, ticket: ticket! }] });
+            if (live) send({ type: 'conditional' });
+            if (!live) await browser.storage.session.set({ [WAITING]: records });
+            return;
+          }
+          const record: Ceremony = {
+            port, source, request: trusted, ticket: crypto.randomUUID(), deadline: Date.now() + CONFIRMATION_MS,
+            timer: setTimeout(() => this.finish(record, { type: 'cancel' }), CONFIRMATION_MS),
+          };
+          entry = record;
+          this.pending.set(source.tabId, record);
+          return record;
+        });
+        if (!record) return;
+        this.current(record);
+        record.candidates = await this.vault.passkeyCandidates(record.request);
+        this.current(record);
+        if (showing) send({ type: 'inline', ticket: record.ticket });
+        else if (record.request.kind === 'assert' && !record.candidates.length) this.finish(record, { type: 'native' });
+        else await this.popup(record);
       })().catch(() => {
-        if (entry) this.finish(entry, { type: 'native' });
-        else send({ type: 'native' });
+        const result = message.type === 'discard' ? 'discarded' : unavailable;
+        if (entry) this.finish(entry, { type: unavailable });
+        else send({ type: result });
       });
     });
   }
@@ -194,7 +234,7 @@ export class PasskeyController {
       const result = await this.vault.passkeyAnswer(entry.request, { itemId, credentialId, increment, proof }, () => this.current(entry));
       await this.revalidate(entry.source);
       this.current(entry);
-      this.finish(entry, { type: 'answer', value: result });
+      this.finish(entry, result);
     } finally { entry.performing = false; }
   }
 }

@@ -660,8 +660,9 @@ mod tests {
         der.extend_from_slice(&[17; 32]);
         let row = |id: &str, count: u32, paused: bool, trashed: bool| {
             let suffix = if paused { "&vaultCounterUnverified=1" } else { "" };
+            let period = if paused { 90 } else if trashed { 60 } else { 45 };
             let mut item = VaultItem::from_json_str(&format!(
-                r#"{{"id":"{id}","trashed":{trashed},"title":"Fixture","data":{{"kind":"login","totpUri":"otpauth://hotp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter={count}{suffix}"}}}}"#
+                r#"{{"id":"{id}","trashed":{trashed},"title":"Fixture","data":{{"kind":"login","totpUri":"otpauth://hotp/Test?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period={period}&counter={count}{suffix}"}}}}"#
             )).unwrap();
             let CredentialData::Login(login) = &mut item.data else { panic!() };
             let mut key = Passkey::from_pkcs8(vec![3; 32], "example.com".into(), vec![5], "fixture".into(), &der, true, true, Some(count)).unwrap();

@@ -72,13 +72,14 @@ async function fixture() {
       window.settings = { kind: 'assert', conditional: false, uv: 'discouraged' };
       window.start = async () => {
         window.outcome = undefined;
-        const { kind, alg, conditional, uv, rp = location.hostname, allow, abort, user = 22 } = settings;
+        const { kind, alg, conditional, uv, rp = location.hostname, allow, exclude, abort, user = 22 } = settings;
         const challenge = from64(window.challenge);
         try {
           const result = kind === 'register'
             ? await navigator.credentials.create({ signal: abort?.signal, publicKey: {
                 rp: { id: rp, name: 'Local verifier' }, user: { id: new Uint8Array([21, user, alg + 10]), name: 'local fixture ' + alg, displayName: 'Fixture' },
                 challenge, pubKeyCredParams: [{ type: 'public-key', alg }],
+                excludeCredentials: exclude ? [{ type: 'public-key', id: from64(exclude) }] : [],
                 authenticatorSelection: { userVerification: uv, residentKey: 'required' }, attestation: 'none', extensions: { credProps: true }
               } })
             : await navigator.credentials.get({ mediation: conditional ? 'conditional' : 'optional', signal: abort?.signal, publicKey: {
@@ -188,8 +189,8 @@ const auth = (response, kind, origin, challenge, flags) => {
   assert.equal(data[32], flags);
   return { value, data, json };
 };
-const result = async page => {
-  await page.waitForFunction(() => !!window.outcome);
+const result = async (page, timeout) => {
+  await page.waitForFunction(() => !!window.outcome, undefined, { timeout });
   return page.evaluate(() => window.outcome);
 };
 const set = async (page, settings) => page.evaluate(value => { window.settings = value; window.outcome = undefined; }, settings);
@@ -229,13 +230,47 @@ async function register(local, page, alg, increment = false) {
   return { alg, id: reg.value.id, publicKey };
 }
 
-async function sign(local, page, expected, conditional, flags, count = 0, issuedChallenge) {
+async function verifyDuplicateRegistration(local, page, key) {
+  const before = await local.send({ type: 'list' });
+  const changes = (await local.send({ type: 'status' })).changesSinceBackup;
+  const prepare = async () => {
+    await page.bringToFront();
+    await set(page, { kind: 'register', alg: key.alg, uv: 'required', exclude: key.id });
+    await page.getByText('Start ceremony').click();
+    const prompt = await nextPanel(local);
+    await expect(prompt.getByRole('button', { name: '保存', exact: true })).toBeDisabled();
+    assert.equal(await page.evaluate(() => window.outcome), undefined, 'Do not reveal a duplicate before consent and user verification');
+    return prompt;
+  };
+
+  const cancelled = await prepare();
+  await cancelled.getByRole('button', { name: '取消', exact: true }).click().catch(error => { if (!cancelled.isClosed()) throw error; });
+  assert.deepEqual(await result(page, 5000), { error: 'NotAllowedError' });
+  await expect.poll(() => cancelled.isClosed()).toBe(true);
+
+  const confirmed = await prepare();
+  const password = confirmed.getByLabel('主密码', { exact: true });
+  const save = confirmed.getByRole('button', { name: '保存', exact: true });
+  await password.fill('wrong-synthetic-password');
+  await save.click();
+  await expect(confirmed.getByRole('alert')).toBeVisible();
+  assert.equal(await page.evaluate(() => window.outcome), undefined, 'Wrong proof is retryable and does not reveal a duplicate');
+  await password.fill(local.password);
+  await save.click().catch(error => { if (!confirmed.isClosed()) throw error; });
+  assert.deepEqual(await result(page, 5000), { error: 'InvalidStateError' });
+  await expect.poll(() => confirmed.isClosed()).toBe(true);
+  assert.deepEqual(await local.send({ type: 'list' }), before);
+  assert.equal((await local.send({ type: 'status' })).changesSinceBackup, changes);
+}
+
+async function sign(local, page, expected, conditional, flags, count = 0, issuedChallenge, beforeInput) {
   const before = await local.send({ type: 'status' });
   await page.bringToFront();
   await set(page, { kind: 'assert', conditional, uv: flags & 4 ? 'required' : 'discouraged', allow: expected.id });
   if (conditional) {
     await page.evaluate(() => { void window.start(); });
     assert.equal(await page.evaluate(() => PublicKeyCredential.isConditionalMediationAvailable()), true);
+    if (beforeInput) await beforeInput();
     await page.getByLabel('Account').click();
     const iframe = () => page.frames().find(frame => frame.url().endsWith('.inline'));
     await expect.poll(() => !!iframe(), { timeout: 12000 }).toBe(true);
@@ -253,6 +288,70 @@ async function sign(local, page, expected, conditional, flags, count = 0, issued
   assert.equal(verify(expected.alg === -7 ? 'sha256' : null, Buffer.concat([assertion.data, hash(assertion.json)]), expected.publicKey,
     decode(assertion.value.response.signature)), true);
   assert.equal((await local.send({ type: 'status' })).changesSinceBackup, before.changesSinceBackup + (count > 0 ? 1 : 0));
+}
+
+async function observeWaiting(page) {
+  await page.evaluate(() => {
+    window.conditionalWaits = 0;
+    addEventListener('message', event => {
+      if (event.source === window && event.origin === location.origin &&
+          event.data?.channel === 'vault-passkey-v1' && event.data.direction === 'receive' && event.data.type === 'waiting') {
+        window.conditionalWaits++;
+      }
+    });
+  });
+}
+
+async function verifyLongConditionalWait(local, page, key) {
+  await page.clock.install({ time: new Date() });
+  const cdp = await local.context.newCDPSession(page);
+  let version;
+  cdp.on('ServiceWorker.workerVersionUpdated', ({ versions }) => {
+    version = versions.find(entry => entry.scriptURL === `${local.root}/background.js`) ?? version;
+  });
+  try {
+    await cdp.send('ServiceWorker.enable');
+    await sign(local, page, key, true, 0x0d, 0, undefined, async () => {
+      await page.waitForFunction(() => window.conditionalWaits === 1);
+      await expect.poll(() => version?.runningStatus).toBe('running');
+      await cdp.send('ServiceWorker.stopWorker', { versionId: version.versionId });
+      await expect.poll(() => version?.runningStatus).toBe('stopped');
+      await page.clock.fastForward(126_000);
+      assert.equal(await page.evaluate(() => window.outcome), undefined);
+      assert(!panel(local), 'Normal waiting must not open a Vault confirmation or hand over to the browser');
+    });
+  } finally { await cdp.detach(); }
+}
+
+async function verifyWaitingCancellation(local, page, key) {
+  const before = (await local.send({ type: 'status' })).changesSinceBackup;
+  const start = async () => {
+    const seen = await page.evaluate(() => window.conditionalWaits);
+    await page.bringToFront();
+    await set(page, { kind: 'assert', conditional: true, uv: 'required', allow: key.id });
+    await page.evaluate(() => {
+      window.settings.abort = new AbortController();
+      void window.start();
+    });
+    await page.waitForFunction(count => window.conditionalWaits === count + 1, seen);
+  };
+  await start();
+  await page.evaluate(() => window.settings.abort.abort());
+  assert.deepEqual(await result(page, 5000), { error: 'AbortError' });
+
+  await start();
+  await local.send({ type: 'lock' });
+  assert.deepEqual(await result(page, 5000), { error: 'NotAllowedError' });
+  await local.send({ type: 'unlock', password: local.password });
+  await page.getByLabel('Account').click();
+  assert(!page.frames().some(frame => frame.url().endsWith('.inline')));
+  assert(!panel(local));
+  await start();
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByLabel('Account').click();
+  assert(!page.frames().some(frame => frame.url().endsWith('.inline')));
+  assert(!panel(local));
+  assert.equal((await local.send({ type: 'status' })).changesSinceBackup, before);
 }
 
 async function verifyKeepassxc(local, page, source, site) {
@@ -938,7 +1037,29 @@ async function run() {
     await dav.close();
   }
 }
+async function runAuditedCeremonies() {
+  const site = await fixture();
+  try {
+    for (const browser of ['edge', 'helium']) {
+      const local = await open(browser);
+      try {
+        const page = await site.page(local);
+        const key = await register(local, page, -7);
+        await verifyDuplicateRegistration(local, page, key);
+        await sign(local, page, key, false, 0x0d);
+        await observeWaiting(page);
+        await verifyLongConditionalWait(local, page, key);
+        await verifyWaitingCancellation(local, page, key);
+        await verifyNativeFallback(local, page);
+        console.log(JSON.stringify({ browser, duplicateRegistration: 'InvalidStateError', proofRetryAndCancel: true, originalCredentialVerified: true,
+          conditionalAssertionAfter126SecondsAndWorkerStop: true, waitingAbortLockNavigationCancelled: true, nativeFallback: true }));
+      } finally { await local.close(); }
+    }
+  } finally { await site.done(); }
+}
+
 const regress = async () => {
+  if (process.argv.includes('--audit-ceremonies')) return runAuditedCeremonies();
   const proton = process.argv.indexOf('--proton-only');
   if (proton >= 0) return runProtonMigration(process.argv[proton + 1]);
   if (process.argv.includes('--retained-bitwarden-only')) return runRetainedBitwardenMigration();

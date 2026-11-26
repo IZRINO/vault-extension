@@ -1,16 +1,13 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import type { Reply } from './vault-messages';
-
-type Receiver = (message: unknown, sender: unknown, respond: (reply: Reply) => void) => boolean | undefined;
+import { offscreenRuntime } from './test-fixtures/offscreen-runtime';
 
 // Exercise the real background queue, bridge and offscreen listener. Only browser
 // APIs and the operating system clipboard are replaced.
 async function setup() {
   vi.resetModules();
-  const id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-  const getURL = (path: string) => `chrome-extension://${id}${path}`;
-  let receive!: Receiver;
+  const { runtime, notify: sendMessage, deliver } = offscreenRuntime();
   const clipboard = { text: 'ordinary text', writable: true };
   let field: { value: string };
   const doc = new EventTarget();
@@ -43,10 +40,6 @@ async function setup() {
   let alarm: { when: number; periodInMinutes?: number } | undefined;
   const createAlarm = vi.fn(async (_name: string, info: NonNullable<typeof alarm>) => { alarm = { ...info }; });
   const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
-  const deliver = (message: unknown) => new Promise<Reply>(resolve => {
-    receive(structuredClone(message), { id, url: getURL('/background.js') }, resolve);
-  });
-  const sendMessage = vi.fn(deliver);
   const offscreen = { hasDocument: vi.fn(async () => true), closeDocument: async () => undefined };
   vi.stubGlobal('location', { search: '' });
   vi.stubGlobal('browser', {
@@ -57,7 +50,7 @@ async function setup() {
       clear: async () => { alarm = undefined; },
     },
     offscreen,
-    runtime: { id, getURL, sendMessage, onMessage: { addListener(listener: Receiver) { receive = listener; } } },
+    runtime,
   });
   await import('../entrypoints/offscreen/main');
   let worker = await import('./clipboard');
@@ -67,7 +60,7 @@ async function setup() {
     const event = { addListener() {} };
     vi.stubGlobal('browser', { ...browser,
       storage: { session: { ...session, setAccessLevel: async () => {} }, local: { setAccessLevel: async () => {}, get: async () => ({}) } },
-      runtime: { ...browser.runtime, onMessage: event, onConnect: event, onInstalled: event, onStartup: event },
+      runtime: { ...browser.runtime, onConnect: event, onInstalled: event, onStartup: event },
       alarms: { ...browser.alarms, onAlarm: event },
       idle: { setDetectionInterval() {}, onStateChanged: event },
       tabs: { onRemoved: event, onUpdated: event, onActivated: event }, windows: { onRemoved: event },

@@ -11,7 +11,12 @@ pub(crate) fn records(bytes: &[u8]) -> Result<Zeroizing<Vec<Vec<String>>>, &'sta
 }
 
 type Mapping = BTreeMap<&'static str, usize>;
+const VAULT_COLUMNS: [&str; 8] = ["title", "url", "username", "password", "note", "totp", "tags", "trashed"];
+
 fn detect(head: &[String]) -> Option<(&'static str, Mapping)> {
+    if head.iter().map(String::as_str).eq(VAULT_COLUMNS) {
+        return Some(("Vault", VAULT_COLUMNS.into_iter().zip(0..).collect()));
+    }
     let names = head.iter().map(|name| name.trim().to_ascii_lowercase()).collect::<Vec<_>>();
     let columns = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
     if columns.len() != head.len() || columns.contains("") { return None; }
@@ -174,6 +179,7 @@ fn import_rows(records: &[Vec<String>], mapping: &str, allow_incomplete_dashlane
     let additional = vendor.filter(|v| *v == "NordPass").and_then(|_| column("additional_urls"));
     let favorite = vendor.filter(|v| *v == "LastPass").and_then(|_| column("fav"));
     let dashlane = vendor == Some("Dashlane");
+    let vault_csv = vendor == Some("Vault");
     let aliases = ["username2", "username3"].into_iter().filter_map(|name| Some((name, column(name)?))).collect::<Vec<_>>();
     let mut used = Vec::new();
     for (key, index) in mapping.as_object().unwrap() {
@@ -192,15 +198,21 @@ fn import_rows(records: &[Vec<String>], mapping: &str, allow_incomplete_dashlane
             continue;
         }
         let source_url = get("url");
-        let url = source_url.trim();
+        let url = if vault_csv { source_url } else { source_url.trim() };
         let blocked_url = dashlane && !url.is_empty() && !valid_additional_url(url);
-        if !(dashlane && allow_incomplete_dashlane_rows) && (get("password").is_empty() || url.is_empty()) { invalid += 1; continue; }
+        if vault_csv {
+            // Only the exact Vault header and mapping permit empty URL/password values.
+            if get("title").trim().is_empty() { invalid += 1; continue; }
+        } else if !(dashlane && allow_incomplete_dashlane_rows) && (get("password").is_empty() || url.is_empty()) {
+            invalid += 1;
+            continue;
+        }
         if dashlane && ["title", "username", "password", "note", "totp", "url"].iter().all(|key| get(key).is_empty())
             && aliases.iter().all(|(_, index)| row[*index].is_empty()) {
             invalid += 1;
             continue;
         }
-        let tags = if get("tags").is_empty() { Vec::new() } else if vendor.is_some() { vec![get("tags").into()] } else {
+        let tags = if get("tags").is_empty() { Vec::new() } else if vendor.is_some() && !vault_csv { vec![get("tags").into()] } else {
             serde_json::from_str::<Vec<String>>(get("tags")).unwrap_or_else(|_| get("tags").split(';').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
         };
         let extra = additional.map_or("", |index| row[index].trim());
@@ -218,12 +230,15 @@ fn import_rows(records: &[Vec<String>], mapping: &str, allow_incomplete_dashlane
             // A bare URL may contain commas and nested URLs. Only the JSON form denotes a list.
             add_additional_url(&mut urls, Some(extra), &mut unsupported);
         }
-        let title = get("title").trim();
+        let title = if vault_csv { get("title") } else { get("title").trim() };
         let title = if dashlane && title.is_empty() { "Dashlane 登录项" } else { title };
         let mut mapped = SecretJson(login_row(Login { title, username: get("username"),
             password: get("password"), note: get("note"), otp: get("totp"), urls, tags,
             pinned: favorite.is_some_and(|i| row[i] == "1"), trashed: ["true","1","yes"].contains(&get("trashed")),
             dashlane }, &mut ignored_otp));
+        if vault_csv && mapped.0["data"]["totpUri"].is_string() {
+            drop(SecretJson(std::mem::replace(&mut mapped.0["data"]["totpUri"], json!(get("totp")))));
+        }
         if dashlane {
             let mut source_fields: BTreeMap<_, _> = aliases.iter().filter_map(|&(name, index)| {
                 let value = row[index].as_str();
@@ -239,13 +254,15 @@ fn import_rows(records: &[Vec<String>], mapping: &str, allow_incomplete_dashlane
         }
         output.0.as_array_mut().unwrap().push(std::mem::take(&mut mapped.0));
     }
-    Ok(csv_result(output, invalid, unsupported, ignored_otp))
+    let mut result = csv_result(output, invalid, unsupported, ignored_otp);
+    if vault_csv { result.0["vaultCsv"] = Value::Bool(true); }
+    Ok(result)
 }
 fn cell(value: &str) -> String { format!("\"{}\"", value.replace('"', "\"\"")) }
 fn export(items: &str) -> Result<String, &'static str> {
     let items = SecretJson(serde_json::from_str(items).map_err(|_| "无法导出 CSV。")?);
     let rows = items.0.as_array().ok_or("无法导出 CSV。")?;
-    let mut output = Zeroizing::new(String::from("\u{feff}title,url,username,password,note,totp,tags,trashed\r\n"));
+    let mut output = Zeroizing::new(format!("\u{feff}{}\r\n", VAULT_COLUMNS.join(",")));
     let (mut count, mut skipped) = (0, 0);
     for item in rows {
         if text(&item["data"], "kind") != "login" { skipped += 1; continue; }

@@ -15,7 +15,7 @@ export interface RemoteAnchor {
   vaultId: string; endpoint: string; head: Uint8Array; snap: Uint8Array; etag?: string;
   objects: RemoteWal[];
   appliedHead: Uint8Array; appliedSnap: Uint8Array; hasRecords: boolean;
-  outbox?: RemoteWal & { priorIds: string[]; source: VaultFiles };
+  outbox?: RemoteWal & { priorIds: string[]; source: VaultFiles; capacityVersion?: 1 };
   checkedAt?: number;
   conflicts?: Uint8Array;
   conflictCount?: number;

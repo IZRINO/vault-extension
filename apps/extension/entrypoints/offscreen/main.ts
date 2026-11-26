@@ -48,7 +48,8 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
     abortAudit?.();
     return;
   }
-  const run = async (): Promise<unknown> => {
+  if (typeof message.jobId !== 'string') return;
+  const run = async (message: { operation: string; payload: any }): Promise<unknown> => {
     if (message.operation === 'scan-otp' || message.operation === 'scan-migration-qr') {
       const migration = message.operation !== 'scan-otp';
       if (typeof message.payload !== 'string' || !/^data:image\/(?:png|jpeg|webp);base64,/.test(message.payload) || message.payload.length > (migration ? 6 : 48) * 1024 * 1024) throw new Error('图像内容无效。');
@@ -116,6 +117,12 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
     }
     throw new Error('无效的离屏操作');
   };
-  void run().then(value => respond({ ok: true, value }), error => respond({ ok: false, error: error.message }));
+  // Only the initiating service worker receives this response; the two public
+  // notifications carry a job ID but neither inputs nor results.
+  void browser.runtime.sendMessage({ target: 'vault-offscreen-input', jobId: message.jobId }).then(async job => {
+    if (!job || typeof job.receipt !== 'string') { respond({ ok: false }); return; }
+    try { respond({ receipt: job.receipt, ok: true, value: await run(job) }); }
+    catch (error) { respond({ receipt: job.receipt, ok: false, error: error instanceof Error ? error.message : String(error) }); }
+  }, () => respond({ ok: false }));
   return true;
 });

@@ -60,11 +60,23 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const input: WebDavInput = { provider, base, folder, username, password, confirmHttp };
   useEffect(() => {
     let live = true;
-    void request<DavConnectionStatus>({ type: 'webdav-status' }).then(value => {
+    const update = () => void request<DavConnectionStatus>({ type: 'webdav-status' }).then(value => {
       if (live) setStatus(value);
     }).catch(e => { if (live) setError(errorText(e)); });
-    return () => { live = false; };
+    const changed = (changes: Record<string, unknown>, area: string) => {
+      if (area === 'local' && ('webDavClock' in changes || 'webDavPaused' in changes)) update();
+    };
+    update();
+    browser.storage.onChanged.addListener(changed);
+    return () => { live = false; browser.storage.onChanged.removeListener(changed); };
   }, []);
+  useEffect(() => {
+    const end = status?.clockExpiresAt;
+    if (end === undefined) return;
+    const timer = window.setTimeout(() => setStatus(current => current?.clockExpiresAt === end
+      ? { ...current, clockExpiresAt: undefined, offsetSeconds: null } : current), Math.max(0, end - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [status?.clockExpiresAt]);
   useEffect(() => {
     if (result?.kind !== 'empty' && result?.kind !== 'missing') return;
     let live = true;
@@ -130,7 +142,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
       setVerifyWrites(false); setSyncResult(undefined);
     } finally { setSecret(''); }
   });
-  const offset = result?.offsetSeconds ?? status?.offsetSeconds;
+  const offset = status?.saved ? status.offsetSeconds : result?.offsetSeconds;
   if (readingHistory) return <SyncHistory close={() => setReadingHistory(false)} changed={async () => {
     await refresh?.();
     setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
@@ -217,6 +229,8 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     {offset != null && <p className="hint">网盘时间与本机相差 {Math.abs(offset)} 秒，本机时钟{offset > 0 ? '偏慢' : '偏快'}。</p>}
     {status?.saved && <SwitchRow label="补偿时间验证码偏差" checked={status.compensation} disabled={busy || (!status.compensation && (status.paused != null || status.offsetSeconds == null))}
       onChange={enabled => void run(async () => setStatus(await request<DavConnectionStatus>({ type: 'webdav-clock', enabled })))} />}
+    {status?.compensation && <p className="hint" role="status">{status.offsetSeconds == null
+      ? '当前使用本机时间，等待有效的网盘时间偏差样本。' : '当前按网盘时间校正动态码。'}</p>}
     {stayLocal && <>
       <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => stayLocal('create')}>暂不配置，创建本地密码库</button>
       <button type="button" className="btn btn-l btn-wide" disabled={busy} onClick={() => stayLocal('restore')}>从本地备份恢复</button>

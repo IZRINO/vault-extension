@@ -21,6 +21,7 @@ export interface DavEntry { name: string; collection: boolean; etag?: string; by
 export interface DavContext {
   signal?: AbortSignal;
   check?(): void;
+  observeClock?(offsetSeconds: number | null, receivedAt: number): Promise<void>;
   stop?(status: DavStopStatus): void | Promise<void>;
 }
 
@@ -28,7 +29,7 @@ export interface DavObject { bytes: Uint8Array<ArrayBuffer>; etag?: string }
 export const davSnapshotName = /^snap_[0-9a-f]{14}_[0-9a-f]{8}_[0-9a-f]{14}\.bin$/;
 export const davWalName = /^[0-9a-f]{14}_[0-9a-f]{8}_[0-9a-f]{14}\.bin$/;
 const probeName = /^verify_[0-9a-f]{32}\.bin$/;
-const davObjectPath = (name: string) => name === 'head.bin' || davSnapshotName.test(name) ||
+const davObjectPath = (name: string) => name === 'head.bin' || name === 'wal-budget.bin' || davSnapshotName.test(name) ||
   (name.startsWith('wal/') && davWalName.test(name.slice(4))) || probeName.test(name);
 const strongTag = (value: string | null) => value && /^"[\x21\x23-\x7e]{1,512}"$/.test(value) ? value : undefined;
 const discard = (response: Response) => { void response.body?.cancel().catch(() => undefined); };
@@ -301,6 +302,10 @@ export class WebDavClient {
         const seconds = (server - (started + received) / 2) / 1000;
         if (Math.abs(seconds) >= 15 && Math.abs(seconds) <= 86400) offsetSeconds = Math.round(seconds);
       }
+    }
+    if (relative === 'wal/' && this.context.observeClock) {
+      await this.context.observeClock(offsetSeconds, received);
+      checkDav(this.context);
     }
     return { entries, offsetSeconds };
   }

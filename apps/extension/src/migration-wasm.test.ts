@@ -535,6 +535,142 @@ function restoredItem(v: ReturnType<typeof fresh>) {
   return restoredItems(v)[0];
 }
 
+describe('Bitwarden migration identity', () => {
+  it('keeps both distinct accounts sharing HOTP, with one usable counter at the highest known position', () => {
+    const account = (id: string, trashed: boolean, counter: number, period: number) => ({
+      id, type: 1, name: 'Similar account', ...(trashed ? { deletedDate: '2026-01-02T00:00:00Z' } : {}),
+      login: { username: 'fixture', password: `synthetic-${id}`, uris: [{ uri: origin }],
+        totp: `otpauth://hotp/Fixture?secret=${base32}&counter=${counter}&period=${period}` },
+    });
+    const bytes = bin({ items: [account('archived', true, 8, 60), account('current', false, 2, 30)] });
+    const vault = fresh();
+    const preview = imported(vault, 'bitwarden', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 2, skipped: 0, suspendedHotps: 1 });
+    expect(preview.snap).toHaveLength(0);
+    const saved = imported(vault, 'bitwarden', bytes);
+    expect(saved.count).toBe(2);
+    const state = { ...vault, ...saved };
+    const items = restoredItems(state);
+    const active = items.find(item => !item.trashed), archived = items.find(item => item.trashed);
+    expect(active.data.password).toBe('synthetic-current');
+    expect(archived.data.password).toBe('synthetic-archived');
+    expect(codeAt(active)).toBe(independentCode('sha1', 8, 6));
+    expect(() => codeAt(archived)).toThrow('无法确认');
+    expect(imported(state, 'bitwarden', bytes).count).toBe(0);
+  });
+
+  it('keeps lookalike credentials, then skips the same file without replacing stored rows', () => {
+    const note = { type: 2, name: 'Recovery note', notes: 'Same note', secureNote: { type: 0 } };
+    const login = { type: 1, name: 'Same account', login: { username: 'fixture', password: 'test-only',
+      uris: [{ uri: origin }] } };
+    const recovery = (type: number) => [{ name: 'Recovery', type, value: 'synthetic-recovery' }];
+    const bytes = bin({ items: [
+      { ...note, id: 'text-note', fields: recovery(0) },
+      { ...note, id: 'hidden-note', fields: recovery(1) },
+      { ...note, id: 'separate-source', fields: recovery(1) },
+      { ...login, deletedDate: '2026-01-02T00:00:00Z' },
+      { ...login, reprompt: 1 },
+      login,
+    ] });
+    const vault = fresh();
+    const preview = imported(vault, 'bitwarden', bytes, '', false);
+    expect(preview.report).toMatchObject({ ready: 6, skipped: 0 });
+    expect(preview.snap).toHaveLength(0);
+    expect(preview.head).toHaveLength(0);
+    expect(JSON.stringify(preview.report)).not.toContain('synthetic-recovery');
+    expect(restoredItems(vault)).toEqual([]);
+
+    const committed = imported(vault, 'bitwarden', bytes);
+    const state = { ...vault, ...committed };
+    expect(committed.count).toBe(6);
+    const items = restoredItems(state);
+    const recoveryFields = items.filter(item => item.title === note.name)
+      .map(item => item.customFields.find((field: { name: string }) => field.name === 'Recovery'));
+    expect(recoveryFields).toHaveLength(3);
+    expect(recoveryFields.filter(field => field.hidden)).toHaveLength(2);
+    expect(recoveryFields.every(field => field.value === 'synthetic-recovery')).toBe(true);
+    const accounts = items.filter(item => item.title === login.name);
+    expect(accounts).toHaveLength(3);
+    expect(accounts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requireReprompt: false, trashed: true, trashedAtMs: Date.UTC(2026, 0, 2) }),
+      expect.objectContaining({ requireReprompt: true, trashed: false }),
+      expect.objectContaining({ requireReprompt: false, trashed: false }),
+    ]));
+
+    expect(imported(state, 'bitwarden', bytes, '', false).report).toMatchObject({ ready: 0, skipped: 6 });
+    const repeated = imported(state, 'bitwarden', bytes);
+    expect(repeated.count).toBe(0);
+    expect(repeated.snap).toHaveLength(0);
+
+    const exported = JSON.parse(wasm_portable_export('bitwarden', state.key, state.wrap, state.head, state.snap, '', now * 1000));
+    expect(imported(state, 'bitwarden', Buffer.from(exported.text), '', false).report)
+      .toMatchObject({ ready: 0, skipped: 6 });
+  });
+});
+
+describe('Bitwarden Passkey export', () => {
+  it('counts retained legacy keys from the actual output without calling opaque records usable', () => {
+    const input = JSON.parse(bitwarden.toString('utf8'));
+    input.items[0].login.fido2Credentials.push({ credentialId: 'opaque', rpId, vendorData: 'preserve-for-source' });
+    const vault = fresh();
+    const engine = new WasmVaultEngine();
+    engine.restore_from_session(vault.key, vault.wrap, vault.head, vault.snap);
+    const { rows } = JSON.parse(wasm_parse_bitwarden(bin(input), ''));
+    const stored = engine.import_records_json(str({ prepared: true, rows }), now * 1000, true);
+    try {
+      for (const password of ['', filePassword]) {
+        const result = JSON.parse(wasm_portable_export('bitwarden', vault.key, vault.wrap, stored.head_bytes, stored.snap_bytes, password, now * 1000));
+        const written = JSON.parse(wasm_parse_bitwarden(Buffer.from(result.text), password)).rows[0];
+        const records = JSON.parse(written.customFields.find((field: { name: string }) => field.name === 'Bitwarden 保留字段').value).extra.login.fido2Credentials;
+        expect(records.map((record: { credentialId: string }) => record.credentialId)).toEqual([ck.fields.credentialId, 'opaque']);
+        expect(records[1].vendorData).toBe('preserve-for-source');
+        expect(result).toMatchObject({ count: 1, passkeys: 1, skippedPasskeys: 0, unverifiedRetainedPasskeys: 1 });
+      }
+    } finally { stored.free(); engine.free(); }
+  });
+
+  it.each([
+    ['mixed keys', [ck, ek], 1, 1],
+    ['only unsupported keys', [ek], 0, 1],
+    ['no skipped keys', [ck], 1, 0],
+  ] as const)('reports accounts and usable keys separately for %s in both file modes', (_, keys, included, skipped) => {
+    const items = keys.map((key, index) => ({
+      id: String(index + 1), title: key === ck ? 'Supported credential' : 'Unsupported credential',
+      scope: { urls: [origin] }, credentials: [{ type: 'passkey', ...key.fields, key: url64(key.der) }],
+    }));
+    const input = bin({ version: { major: 1, minor: 0 }, exporterRpId: 'example.org', accounts: [{ id: 'YQ', items }] });
+    const vault = fresh();
+    const saved = imported(vault, 'cxf', input);
+    expect(saved.report).toMatchObject({ ready: keys.length, passkeys: keys.length });
+
+    for (const password of ['', filePassword]) {
+      const result = JSON.parse(wasm_portable_export('bitwarden', vault.key, vault.wrap, saved.head, saved.snap, password, now * 1000));
+      expect(result).toMatchObject({ count: keys.length, skipped: 0, passkeys: included, skippedPasskeys: skipped });
+      const doc = JSON.parse(result.text);
+      expect(doc.encrypted).toBe(!!password);
+      if (password) expect(doc.passwordProtected).toBe(true);
+      const rows = password
+        ? JSON.parse(wasm_parse_bitwarden(Buffer.from(result.text), password)).rows.map((row: {
+          title: string; data: { password: string }; customFields: { name: string; value: string }[];
+        }) => ({
+          name: row.title, login: { password: row.data.password, fido2Credentials: JSON.parse(
+            row.customFields.find(field => field.name === 'Bitwarden 保留字段')!.value,
+          ).extra.login.fido2Credentials },
+        }))
+        : doc.items;
+      expect(rows).toHaveLength(keys.length);
+      const records = rows.flatMap((row: { login: { fido2Credentials?: unknown[] } }) => row.login.fido2Credentials ?? []);
+      expect(records).toHaveLength(included);
+      if (included) expect(records[0]).toMatchObject({ credentialId: `b64.${ck.fields.credentialId}`, keyAlgorithm: 'ECDSA' });
+      if (skipped) {
+        const unsupported = rows.find((row: { name: string }) => row.name === 'Unsupported credential');
+        expect(unsupported.login.password).toBe('');
+        expect(unsupported.login.fido2Credentials ?? []).toEqual([]);
+      }
+    }
+  });
+});
+
 describe('Dashlane native CSV ZIP migration', () => {
   const header = 'username,username2,username3,title,password,note,url,category,otpUrl\r\n';
   const credentials = Buffer.from('\ufeff' + header +

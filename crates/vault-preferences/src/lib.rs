@@ -43,7 +43,7 @@ fn open(session_key: &[u8], session_wrap: &[u8], sealed: &[u8], domain: Domain) 
 }
 
 fn authorization(key: &[u8], scope: &str, payload: &[u8]) -> Result<Hmac<sha2::Sha256>, VaultError> {
-    if key.len() != 32 || payload.len() > 64 * 1024 || !matches!(scope, "otp:read:v1" | "vaultpack:receipt:v1") {
+    if key.len() != 32 || payload.len() > 64 * 1024 || !matches!(scope, "item:edit:v1" | "otp:read:v1" | "vaultpack:receipt:v1") {
         return Err(VaultError::CryptoAuthFailed);
     }
     let mut derived = Zeroizing::new([0u8; 32]);

@@ -6,19 +6,20 @@ import { capacityErrorText, MAX_BROWSER_CSV_BYTES, MAX_ENTE_BYTES, MAX_OTP_SETUP
 import { planEnteImport, type EnteBatch } from './ente-auth';
 import { defaultFlags, loginUrisMatch, resolveSiteFlags, validateGroups, validateSiteRule, webUrl, type AutofillSettings } from './autofill-policy';
 import { SITE_FLAG_KEYS, validSiteFlags } from './autofill-settings';
-import type { FillCandidate, FillKind, FillPayload } from './autofill-messages';
+import type { CaptureTarget, FillCandidate, FillKind, FillPayload } from './autofill-messages';
 import { planMigration, type MigrationBatch } from './migration';
-import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTABLE_FORMATS, type AuthBackupPreview, type MigrationExport, type MigrationPreview } from './vault-messages';
+import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTABLE_FORMATS, STALE_EDIT, type AuthBackupPreview, type MigrationExport, type MigrationPreview } from './vault-messages';
 import type { QrScan } from './vault-messages';
-import { davClockOffset, davStatus, openSavedDav, pauseDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
+import { davClockOffset, davStatus, observeDavClock, openSavedDav, pauseDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
 import { adoptDevice, nextJournalVersion, type JournalClock } from './sync/journal-device';
 import { createRemoteVault, endpointFingerprint, HEAD_LIMIT, packSyncFrames, readRemoteVault, type RemoteHeadInfo, type ReplayOutput } from './sync/bootstrap';
 import { proveConditionalWrites, WebDavClient, webDavConfig } from './sync/webdav';
 import { runDavSync, type SyncResult } from './sync/run';
 import { deviceProfile } from './sync/device-profile';
 import { listHistory, prepareRestore, restoreHistory, restoreHistoryLocally } from './sync/history';
-import type { PasskeyCandidate, PasskeyReply, PasskeySelection, TrustedRequest } from './passkeys/protocol';
+import type { PasskeyCandidate, PasskeyPerformResult, PasskeyReply, PasskeyResolution, PasskeySelection, TrustedRequest } from './passkeys/protocol';
 import { checkScanSource, type ScanSource, type ScanTicket } from './qr-scan';
+import { markKey, markScope, sameMarkDraft, validLoginMark, validMarkDraft, type LoginMark } from './login-marks';
 
 export const LOCK_ALARM = 'vault-lock';
 export const DAV_ALARM = 'vault-webdav';
@@ -35,7 +36,7 @@ async function digestHex(bytes: Uint8Array<ArrayBuffer>) {
 }
 
 const internalFields = new Set(['Bitwarden 保留字段', 'Bitwarden 未识别的验证码设置', 'CSV 未识别的验证码设置', 'CSV 源自定义字段', 'CSV 源归档状态', '厂商 JSON 源字段', 'Vault 迁移来源']);
-type AuthorizationScope = 'vaultpack:receipt:v1' | 'otp:read:v1';
+type AuthorizationScope = 'vaultpack:receipt:v1' | 'otp:read:v1' | 'item:edit:v1';
 async function authorize(key: Uint8Array, scope: AuthorizationScope, payload: Uint8Array) {
   try {
     const mac = await derive<number[]>('sign-authorization', [key, scope, payload]);
@@ -65,6 +66,12 @@ function otpPayload(item: VaultItem, setup: string) {
   return new TextEncoder().encode(JSON.stringify([item.id, item.revision, item.updatedAtMs, item.requireReprompt, setup]));
 }
 
+async function editPayload(itemJson: string) {
+  const bytes = new TextEncoder().encode(itemJson);
+  try { return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)); }
+  finally { bytes.fill(0); }
+}
+
 function sessionExpired(session: store.SessionState, settings: store.LocalSettings): boolean {
   const now = Date.now();
   return session.lastActivityMs > now || now - session.lastActivityMs >= settings.autoLockMinutes * 60000;
@@ -89,6 +96,14 @@ export class VaultController {
   handle(message: VaultMessage): Promise<unknown> {
     if (message.type === 'lock') return this.lock();
     return this.enqueue(check => this.dispatch(message, check));
+  }
+
+  commitCapturedLogin(message: Extract<VaultMessage, { type: 'autofill-save' }>, confirmSource: () => Promise<void>) {
+    return this.enqueue(check => this.dispatch(message, check, confirmSource));
+  }
+
+  changeLoginMark(message: Extract<VaultMessage, { type: 'login-mark' }>, confirmSource: () => Promise<void>) {
+    return this.enqueue(check => this.dispatch(message, check, confirmSource));
   }
 
   private enqueue<T>(operation: (check: () => void) => Promise<T>): Promise<T> {
@@ -177,7 +192,7 @@ export class VaultController {
     });
   }
 
-  passkeyAnswer(request: TrustedRequest, selection: PasskeySelection, current: () => void): Promise<PasskeyReply> {
+  passkeyAnswer(request: TrustedRequest, selection: PasskeySelection, current: () => void): Promise<PasskeyResolution> {
     return this.enqueue(async generationCheck => {
       const check = () => { generationCheck(); current(); };
       check();
@@ -188,7 +203,7 @@ export class VaultController {
       const active = this.files!;
       const anchor = await store.loadRemoteAnchor(active.vaultId);
       check();
-      const result = await derive<{ reply: string; head: number[]; snap: number[] }>('passkey:perform', [
+      const result = await derive<PasskeyPerformResult>('passkey:perform', [
         key, wrap, active.head, active.snap, JSON.stringify(request), JSON.stringify({
           itemId: selection.itemId, credentialId: selection.credentialId, verified: !!selection.proof,
           increment: selection.increment === true && request.kind === 'register', now: Date.now(),
@@ -196,6 +211,7 @@ export class VaultController {
         anchor?.appliedHead ?? new Uint8Array(), anchor?.appliedSnap ?? new Uint8Array(),
       ]);
       check();
+      if (result.type === 'already-registered') return result;
       if (result.snap.length) {
         const files = { ...active, head: new Uint8Array(result.head), snap: new Uint8Array(result.snap),
           updatedAtMs: Date.now(), everHadRecords: true, changesSinceBackup: active.changesSinceBackup + 1 };
@@ -203,7 +219,7 @@ export class VaultController {
         this.engine!.restore_from_session(key, wrap, files.head, files.snap);
       }
       check();
-      return JSON.parse(result.reply) as PasskeyReply;
+      return { type: 'answer', value: JSON.parse(result.reply) as PasskeyReply };
     });
   }
 
@@ -650,7 +666,12 @@ export class VaultController {
         files, session, anchor, clock: (await store.loadJournal(files.vaultId)).clock,
         pending: await store.hasPendingWal(files.vaultId),
         compactWhenIdle: message.type === 'webdav-scheduled',
-        forceHead: message.type === 'webdav-sync', context: { check, signal, stop: status => { this.davClock = undefined; return pauseDav(status); } },
+        forceHead: message.type === 'webdav-sync', context: { check, signal,
+          stop: status => { this.davClock = undefined; return pauseDav(status); },
+          observeClock: async (offset, receivedAt) => {
+            await observeDavClock(files.vaultId, offset, receivedAt, check);
+            this.davClock = undefined;
+          } },
         commit: async (next, current, consume, clock) => {
           check();
           await store.saveRemoteAnchor(next, current, clock, false, consume);
@@ -814,7 +835,7 @@ export class VaultController {
     } finally { config.password = ''; config.username = ''; }
   }
 
-  private async dispatch(message: VaultMessage, check: () => void): Promise<unknown> {
+  private async dispatch(message: VaultMessage, check: () => void, confirmPageSource?: () => Promise<void>): Promise<unknown> {
     const core = this.core!;
     const engine = this.engine!;
     const settings = this.settings!;
@@ -931,7 +952,7 @@ export class VaultController {
       if (code.kind === 'hotp' || code.validTo === null) throw invalid();
       return { kind: code.kind, value: code.value, validTo: code.validTo, nextValue: code.nextValue } satisfies TimedOtpCode;
     }
-    await this.touch();
+    if (message.type !== 'login-mark' || message.change) await this.touch();
     check();
     const session = this.session;
     switch (message.type) {
@@ -1088,6 +1109,73 @@ export class VaultController {
             return item.data.username === message.username && item.data.password === message.password && this.autofillMatches(item, 'login', url, message.groups);
           });
       }
+      case 'login-mark': {
+        const scope = await markScope(webUrl(message.url));
+        if (!scope && message.change) throw new Error('此页面的地址不适合保存长期标记。');
+        if (!scope) return [];
+        const { loginMarksSealed } = await browser.storage.local.get('loginMarksSealed') as {
+          loginMarksSealed?: { vaultId: string; bytes: number[] };
+        };
+        let marks: LoginMark[] = [];
+        if (loginMarksSealed?.vaultId === this.files!.vaultId) {
+          const result = JSON.parse(await derive<string>('open-preferences', [session.key, session.wrap,
+            new Uint8Array(loginMarksSealed.bytes)])) as unknown;
+          if (!Array.isArray(result) || result.length > 128 || !result.every(validLoginMark)) {
+            throw new Error('无法读取登录框标记。');
+          }
+          marks = result;
+        }
+        check();
+        const inScope = (mark: LoginMark) => mark.origin === scope.origin && mark.route === scope.route;
+        const change = message.change;
+        if (!change) return marks.filter(inScope);
+        if (!confirmPageSource) throw new Error('仅可通过标记界面管理登录框规则。');
+        const index = marks.findIndex(mark => inScope(mark) && markKey(mark) === change.key);
+        const current = marks[index];
+        if (change.key !== undefined && !current) throw new Error('此标记已经变化，请重新打开网站设置。');
+        if (change.action !== 'delete' && current?.revision === 0xffff_ffff) throw new Error('标记修改次数已达上限。');
+        if (change.action === 'replace') {
+          if (!validMarkDraft(change.draft) || index < 0 && marks.length >= 128) throw new Error('登录框标记无效，或已达到 128 条上限。');
+          if (marks.some(mark => mark !== current && inScope(mark) && sameMarkDraft(mark, change.draft))) {
+            throw new Error('这一组登录框已有标记，请选择原标记后修改。');
+          }
+          const updated: LoginMark = { ...change.draft, ...scope, version: 1, id: current?.id ?? crypto.randomUUID(),
+            revision: (current?.revision ?? 0) + 1, enabled: true };
+          if (index < 0) marks.push(updated); else marks[index] = updated;
+        } else {
+          if (!current) throw new Error('此标记已经变化，请重新打开网站设置。');
+          if (change.action === 'enable' && typeof change.enabled === 'boolean') {
+            marks[index] = { ...current, enabled: change.enabled, revision: current.revision + 1 };
+          } else if (change.action === 'delete') marks.splice(index, 1);
+          else throw new Error('无效的标记操作。');
+        }
+        const bytes = await derive<number[]>('seal-preferences', [session.key, session.wrap, JSON.stringify(marks)]);
+        await confirmPageSource();
+        check();
+        await browser.storage.local.set({ loginMarksSealed: { vaultId: this.files!.vaultId, bytes } });
+        return marks.filter(inScope);
+      }
+      case 'autofill-save-target':
+      case 'autofill-save': {
+        const url = webUrl(message.url);
+        const settings = await this.readAutofillSettings(check);
+        if (resolveSiteFlags(settings.sites, url).saveDisabled) throw new Error('此网站已停用这项功能。');
+        const { target, item } = this.captureTarget(url, message.username, settings.equivalentDomains);
+        if (message.type === 'autofill-save-target') return target;
+        if (!confirmPageSource) throw new Error('仅可通过网页保存提示确认改密。');
+        if (target.kind === 'ambiguous') throw new Error('有多条同账号凭证，请在密码库中手动选择更新。');
+        if (target.kind !== message.expected.kind || (target.kind === 'update' &&
+            (message.expected.kind !== 'update' || target.id !== message.expected.id ||
+              target.requireReprompt !== message.expected.requireReprompt))) throw new Error('保存目标已变化，请关闭提示后重新尝试。');
+        if (target.kind === 'update') await this.requireItemProof(target.id, message.proof, check);
+        await confirmPageSource();
+        const login: VaultItem = item ?? { id: '', title: url.hostname,
+          data: { kind: 'login', username: message.username, uris: [{ uri: url.origin, matchRule: 'host' }] },
+          note: '', customFields: [], tags: [], pinned: false, trashed: false, requireReprompt: false };
+        if (login.data.password === message.password) return 0;
+        login.data.password = message.password;
+        return this.saveMutation(() => engine.upsert_item_json(JSON.stringify(login), Date.now(), '本机'), check);
+      }
       case 'autofill-candidates': {
         const url = webUrl(message.url);
         const results: FillCandidate[] = [];
@@ -1147,8 +1235,12 @@ export class VaultController {
       case 'get':
       case 'get-edit': {
         await this.requireItemProof(message.id, message.proof, check);
-        const item = JSON.parse(engine.get_item_json(message.id, true)) as ItemDetailData;
-        if (message.type === 'get-edit') return item;
+        const itemJson = engine.get_item_json(message.id, true);
+        const item = JSON.parse(itemJson) as ItemDetailData;
+        if (message.type === 'get-edit') {
+          item.editStamp = await authorize(session.key, 'item:edit:v1', await editPayload(itemJson));
+          return item;
+        }
         const setup = otpSetup(item);
         if (setup) {
           item.otp = setup.startsWith('otpauth://hotp/') ? { kind: 'hotp' } :
@@ -1159,13 +1251,18 @@ export class VaultController {
         return item;
       }
       case 'upsert': {
-        const item = JSON.parse(message.itemJson) as VaultItem;
+        const { editStamp, ...item } = JSON.parse(message.itemJson) as VaultItem;
         if (!item.title?.trim()) throw new Error('请输入名称。');
         let previousTotp: unknown;
         if (item.id) {
           await this.requireItemProof(item.id, message.proof, check);
-          const existing = JSON.parse(engine.get_item_json(item.id, true)) as VaultItem;
-          if (existing.revision !== item.revision) throw new Error('条目已在其他窗口更新，请重新打开后编辑。');
+          const existingJson = engine.get_item_json(item.id, true);
+          const existing = JSON.parse(existingJson) as VaultItem;
+          // Independently edited branches can have identical revision and time.
+          if (existing.revision !== item.revision || !validAuthorization(editStamp) ||
+              !await verifyAuthorization(session.key, 'item:edit:v1', editStamp, await editPayload(existingJson))) {
+            throw new Error(STALE_EDIT);
+          }
           previousTotp = existing.data.totpUri;
         }
         const setupKey = item.data.totpUri;
@@ -1173,7 +1270,7 @@ export class VaultController {
           if (typeof setupKey !== 'string' || setupKey.length > MAX_OTP_SETUP_LENGTH) throw new Error('验证码设置密钥无效。');
           await derive('validate-totp', [setupKey]);
         }
-        return this.saveMutation(() => engine.upsert_item_json(message.itemJson, Date.now(), '本机'), check);
+        return this.saveMutation(() => engine.upsert_item_json(JSON.stringify(item), Date.now(), '本机'), check);
       }
       case 'trash': return this.saveMutation(() => engine.set_trashed(message.id, message.trashed, Date.now()), check);
       case 'delete': {
@@ -1433,6 +1530,19 @@ export class VaultController {
   }
   private autofillKind(kind: string, fill: FillKind) {
     return kind === (fill === 'card' ? 'payment_card' : fill === 'identity' ? 'identity' : 'login');
+  }
+  private captureTarget(url: URL, username: string, groups: string[][]): { target: CaptureTarget; item?: VaultItem } {
+    let match: VaultItem | undefined;
+    const engine = this.engine!;
+    for (const summary of JSON.parse(engine.list_summaries_json()) as ItemSummary[]) {
+      if (summary.kind !== 'login' || summary.trashed) continue;
+      const item = JSON.parse(engine.get_item_json(summary.id, true)) as VaultItem;
+      if ((item.data.username ?? '') !== username || !this.autofillMatches(item, 'login', url, groups)) continue;
+      if (match) return { target: { kind: 'ambiguous' } };
+      match = item;
+    }
+    return match ? { target: { kind: 'update', id: match.id, requireReprompt: match.requireReprompt }, item: match }
+      : { target: { kind: 'new' } };
   }
   private autofillMatches(item: VaultItem, fill: FillKind, url: URL, groups: string[][]): boolean {
     if (item.trashed || !this.autofillKind(item.data.kind, fill)) return false;

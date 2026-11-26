@@ -26,7 +26,7 @@ const takeLocal = (result: { head_bytes: Uint8Array; snap_bytes: Uint8Array; fre
 const digest = (input: string | Buffer) => createHash('sha256').update(input).digest();
 const decode = (value: string) => Buffer.from(value, 'base64url');
 
-it('authenticates WebDAV history, keeps verified counts and pauses unknown HOTP/Passkeys', () => {
+it('authenticates WebDAV history, keeps verified counts across HOTP periods and pauses unknown HOTP/Passkeys', () => {
   const key = randomBytes(32), empty = new Uint8Array();
   const opened = wasm_create_new_vault('Synthetic restore fixture', 32768, 2, 1, key, 1000);
   const wrap = opened.session_wrap_bytes;
@@ -43,7 +43,7 @@ it('authenticates WebDAV history, keeps verified counts and pauses unknown HOTP/
   };
   const oldId = '00000000001800_09abcd11_00000000000001';
   const currentId = '00000000002000_09abcd11_00000000000002';
-  const hotp = 'otpauth://hotp/Example?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=0';
+  const hotp = 'otpauth://hotp/Example?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=0&period=60';
   try {
     local = withEngine(local, engine => takeLocal(engine.upsert_item_json(JSON.stringify({
       title: 'HOTP fixture', data: { kind: 'login', username: 'hotp', totpUri: hotp },
@@ -90,7 +90,7 @@ it('authenticates WebDAV history, keeps verified counts and pauses unknown HOTP/
       const row = JSON.parse(engine.get_item_json(otpId, true));
       const issued = JSON.parse(wasm_otp_at(row.data.totpUri, 0, 0));
       expect(issued).toMatchObject({ counter: '0', value: '755224' });
-      row.data.totpUri = issued.nextSetupKey;
+      row.data.totpUri = issued.nextSetupKey.replace('&period=60', '&period=45');
       return takeLocal(engine.upsert_item_json(JSON.stringify(row), 5100));
     });
     const compacted = takeFiles(wasm_sync_compact(key, wrap, historical.head, local.head, local.snap, currentId));

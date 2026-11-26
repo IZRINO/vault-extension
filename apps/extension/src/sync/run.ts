@@ -1,10 +1,11 @@
 import { derive } from '../bridge';
 import type { SessionState, RemoteAnchor, VaultFiles } from '../vault-storage';
 import {
-  endpointFingerprint, fetchRemoteWal, getSyncHistory, HEAD_LIMIT, listRemoteWal, packSyncFrames, SNAPSHOT_LIMIT, WAL_LIMIT,
+  endpointFingerprint, fetchRemoteWal, HEAD_LIMIT, listRemoteWal, MAX_REMOTE_WAL_BYTES, MAX_REMOTE_WALS, packSyncFrames, replayWithAncestors, SNAPSHOT_LIMIT,
   type RemoteHeadInfo, type RemoteWal, type ReplayOutput, type SnapshotOutput,
 } from './bootstrap';
 import { nextJournalVersion, type JournalClock } from './journal-device';
+import { assistReservation, blockingReservation, fitsAppend, MAX_APPEND_BYTES, reserveAppend, retireReservations } from './capacity';
 import { cleanAbandonedSnapshot, cleanAbsorbedWal, cleanOldHistory, publishSnapshot, snapshotDigest } from './publish';
 import { WebDavClient, type DavContext, type WebDavConfig } from './webdav';
 
@@ -12,6 +13,7 @@ const VERIFY_HEAD_EVERY_MS = 10 * 60_000;
 const rejectHistory = () => new Error('远端返回了旧版本或缺少已经确认的变更。本机数据未覆盖（RollbackDetected）。');
 const requireUpdate = () => new Error('远端主密码已更新。请用新主密码重新验证；未上传的编辑仍在本机。');
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, index) => byte === b[index]);
+const walBytes = (objects: readonly RemoteWal[]) => objects.reduce((sum, { bytes }) => sum + bytes.length, 0);
 
 type CipherState = Pick<VaultFiles, 'head' | 'snap'>;
 type Verification = { before: number; after: number; removed: number; stamp: string; blocked: boolean };
@@ -68,7 +70,7 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
     !cached.has(id) || (etag && anchor.objects.find(object => object.id === id)?.etag !== etag));
   const headDue = !anchor.checkedAt || Date.now() < anchor.checkedAt || Date.now() - anchor.checkedAt >= VERIFY_HEAD_EVERY_MS;
   const shouldCompact = !!(options.compactWhenIdle && writeVerified && !anchor.conflicts?.length && (
-    listing.length >= 20 || (listing.length > 0 && anchor.objects.reduce((size, object) => size + object.bytes.length, 0) > anchor.snap.length / 4)));
+    listing.length >= 20 || (listing.length > 0 && walBytes(anchor.objects) > anchor.snap.length / 4)));
   if (!directoryChanged && !headDue && !shouldCompact && !forceHead && !anchor.outbox &&
       !(writeVerified && anchor.pendingCompaction) && anchor.rotationFrom == null &&
       (!(pending || anchor.draftCount) || !writeVerified)) {
@@ -120,7 +122,7 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   const snapChanged = info.snapshotId !== oldHead.snapshotId;
   const missing = cache.filter(({ id }) => !listed.has(id));
   let remoteSnap = anchor.snap;
-  let history: RemoteWal[] = [];
+  const history: RemoteWal[] = [];
   if (snapChanged) {
     const latest = await client.get(`${info.snapshotId}.bin`, SNAPSHOT_LIMIT);
     if (!latest || latest === 'unchanged') throw rejectHistory();
@@ -130,18 +132,10 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   const remoteWals = await fetchRemoteWal(client, listing, cache);
   let outbox = anchor.outbox;
   const localHead = new Uint8Array(info.localHead);
-  let fetchedHistory = false;
+  const withAncestors = replayWithAncestors(client, info, history);
   async function replay(wal: RemoteWal[]) {
     const packed = packSyncFrames(wal);
-    const decode = () => derive<ReplayOutput>('sync:replay', [key, wrap, localHead, remoteSnap, packed, packSyncFrames(history)]);
-    try { return await decode(); }
-    catch (error) {
-      if (fetchedHistory || info.history.length <= 1 || !String(error).includes('SyncAncestorRequired')) throw error;
-      check();
-      fetchedHistory = true;
-      history = await getSyncHistory(client, info, history);
-      return decode();
-    }
+    return withAncestors(ancestors => derive<ReplayOutput>('sync:replay', [key, wrap, localHead, remoteSnap, packed, packSyncFrames(ancestors)]));
   }
   const remote = await replay(remoteWals);
   check();
@@ -163,6 +157,11 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   }
   const compactedIds = new Set(remote.compacted);
   const uncompacted = remoteWals.filter(({ id }) => !compactedIds.has(id));
+  if (!cleanup && writeVerified && head.etag && uncompacted.length !== remoteWals.length) {
+    // A delayed immutable PUT can reappear after its original cleanup. Retire only authenticated receipts.
+    await cleanAbsorbedWal(client, remoteWals, remote.compacted);
+    check();
+  }
   const resolutions = matchedReceipts(anchor.pendingResolutions, remote.receipts);
   const ready = (view: CipherState, conflicts: ReplayOutput, uploaded?: RemoteWal): RemoteAnchor => {
     const observed = uploaded ? [...remoteWals, uploaded].sort((a, b) => a.id < b.id ? -1 : 1) : remoteWals;
@@ -174,29 +173,47 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
   };
   const nextFiles = (view: CipherState, count: number): VaultFiles => ({ ...files, ...view, updatedAtMs: Date.now(),
     everHadRecords: files.everHadRecords || count > 0 });
+  const canCompact = !remote.conflictCount && uncompacted.length > 0 && (remote.count > 0 || !anchor.hasRecords);
+  async function compactRemote(previousTag: string, keepLocal: boolean, contents = remote, priorClock = clock) {
+    const blocked = await blockingReservation(client, info.history, contents.included);
+    if (blocked) {
+      if (!listed.has(blocked.id) && remoteWals.length < MAX_REMOTE_WALS && walBytes(remoteWals) + blocked.bytes.length <= MAX_REMOTE_WAL_BYTES) {
+        await replay([...remoteWals, blocked]);
+        check();
+        await assistReservation(client, blocked);
+      }
+      return 'pull' as const;
+    }
+    const viewToPublish = contents === remote ? remoteView : fromOutput(contents);
+    const now = Date.now(), next = nextJournalVersion(priorClock, now, contents.hlc);
+    const output = await derive<SnapshotOutput>('sync:compact', [key, wrap, head.bytes, viewToPublish.head, viewToPublish.snap, next.id, now - 30 * 86_400_000]);
+    const nextSnap = new Uint8Array(output.snap);
+    if (nextSnap.length > SNAPSHOT_LIMIT) return false;
+    const reservation = { id: next.id, digest: await snapshotDigest(nextSnap), priorHistory: info.history };
+    check();
+    // Do not change the common version or consume local edits during a capacity-only compaction.
+    const base = keepLocal ? anchor : ready(remoteView, remote);
+    await options.commit({ ...base, pendingCompaction: reservation }, keepLocal ? files : nextFiles(remoteView, remote.count), false, next.state);
+    const compacted = await publishSnapshot(client, next.id, previousTag, new Uint8Array(output.head), nextSnap);
+    if (!compacted) return false;
+    const latest = await derive<RemoteHeadInfo>('sync:authenticate-head', [compacted.bytes, key, wrap]);
+    check();
+    const view = { head: new Uint8Array(latest.localHead), snap: nextSnap };
+    const current = { ...(keepLocal ? { ...base, objects: remoteWals } : ready(view, remote)),
+      head: compacted.bytes, snap: view.snap, etag: compacted.etag, pendingCompaction: reservation };
+    const currentFiles = keepLocal ? files : nextFiles(view, remote.count);
+    await options.commit(current, currentFiles, false);
+    await cleanAbsorbedWal(client, remoteWals, contents.included);
+    await cleanOldHistory(client, info.history.filter(name => !latest.history.includes(name)));
+    check();
+    await options.commit({ ...current, pendingCompaction: undefined }, currentFiles, false);
+    return true;
+  }
   if (!pending && !outbox && !anchor.conflicts?.length) {
-    if (!remote.conflictCount && writeVerified && head.etag && options.compactWhenIdle && uncompacted.length > 0 &&
-        (uncompacted.length >= 20 || uncompacted.reduce((size, object) => size + object.bytes.length, 0) > remoteSnap.length / 4) &&
-        (remote.count > 0 || !anchor.hasRecords)) {
-      const now = Date.now(), next = nextJournalVersion(clock, now, remote.hlc);
-      const output = await derive<SnapshotOutput>('sync:compact', [key, wrap, head.bytes, remoteView.head, remoteView.snap, next.id, now - 30 * 86_400_000]);
-      const nextSnap = new Uint8Array(output.snap);
-      const reservation = { id: next.id, digest: await snapshotDigest(nextSnap), priorHistory: info.history };
-      check();
-      // Reserve the ID before sending it. Do not reuse it after an interrupted compaction.
-      await options.commit({ ...ready(remoteView, remote), pendingCompaction: reservation }, nextFiles(remoteView, remote.count), false, next.state);
-      const compacted = await publishSnapshot(client, next.id, head.etag, new Uint8Array(output.head), nextSnap);
-      if (!compacted) return { kind: 'synced', pending: false };
-      const latest = await derive<RemoteHeadInfo>('sync:authenticate-head', [compacted.bytes, key, wrap]);
-      check();
-      const view = { head: new Uint8Array(latest.localHead), snap: new Uint8Array(output.snap) };
-      const current = { ...ready(view, remote), head: compacted.bytes, snap: view.snap, etag: compacted.etag, pendingCompaction: reservation };
-      await options.commit(current, nextFiles(view, remote.count), false);
-      await cleanAbsorbedWal(client, remoteWals, remote.included);
-      await cleanOldHistory(client, info.history.filter(name => !latest.history.includes(name)));
-      check();
-      await options.commit({ ...current, pendingCompaction: undefined }, nextFiles(view, remote.count), false);
-      return { kind: 'synced', pending: false };
+    if (writeVerified && head.etag && options.compactWhenIdle && canCompact &&
+        (uncompacted.length >= 20 || walBytes(uncompacted) > remoteSnap.length / 4)) {
+      const published = await compactRemote(head.etag, false);
+      if (published !== 'pull') return { kind: published ? 'synced' : 'unchanged', pending: false };
     }
     const updated = directoryChanged || !unchangedHead;
     await options.commit(ready(remoteView, remote), updated ? nextFiles(remoteView, remote.count) : files, false);
@@ -258,23 +275,51 @@ export async function runDavSync(config: WebDavConfig, options: RunOptions, requ
     return { kind: 'confirm-deletion', pending: true, before: guard.before, after: guard.after, removed: guard.removed, stamp: guard.stamp };
   }
   check();
+  // For a large batch, commit the authenticated result by head CAS without putting that batch in wal/.
+  // The outbox ID is absorbed in this snapshot, so an interrupted publish is confirmed on the next poll.
+  const viaSnapshot = (delta.length > MAX_APPEND_BYTES || identicalDraft && !outbox?.capacityVersion) &&
+    remoteWals.length < MAX_REMOTE_WALS && walBytes(remoteWals) + delta.length <= MAX_REMOTE_WAL_BYTES;
+  if (!fitsAppend(remoteWals.length, walBytes(remoteWals), delta.length) && !viaSnapshot) {
+    if (canCompact && delta.length <= MAX_REMOTE_WAL_BYTES) await compactRemote(head.etag, true);
+    return { kind: 'deferred', pending: true };
+  }
+  const candidate: RemoteWal = { id, bytes: delta };
+  const final = await replay([...remoteWals, candidate]);
+  check();
+  if (viaSnapshot && final.conflictCount) return { kind: 'deferred', pending: true };
   if (!identicalDraft) {
     const source = nextFiles(mergedView, merged.count);
-    outbox = { id, bytes: delta, priorIds: [...listed], source };
+    outbox = { id, bytes: delta, priorIds: [...listed], source, capacityVersion: 1 };
     anchor = { ...ready(remoteView, merged), outbox, pendingResolutions: resolutions };
     await options.commit(anchor, source, false, version.state);
   }
   check();
+  // A newer head or listing invalidates the replay and the capacity check used to prepare this batch.
+  const listingStillMatches = async () => {
+    const current = await listRemoteWal(client);
+    return current.length === listing.length && current.every((row, i) =>
+      row.id === listing[i]!.id && row.etag === listing[i]!.etag && row.bytes === listing[i]!.bytes);
+  };
+  const admission = viaSnapshot ? (await listingStillMatches() ? 'snapshot' : 'retry') :
+    await reserveAppend(client, remoteWals, candidate, info.snapshotId, remoteSnap.length, remote.compacted, listingStillMatches);
+  if (admission === 'retry') return { kind: 'deferred', pending: true };
+  // Register first, then recheck the head. A compactor that may evict our ancestor must see the grant.
+  const latestHead = await client.get('head.bin', HEAD_LIMIT, head.etag);
+  if (latestHead !== 'unchanged' && (!latestHead || latestHead.etag !== head.etag || !sameBytes(latestHead.bytes, head.bytes))) {
+    if (admission === 'granted') await retireReservations(client, [candidate], true); // This invocation never sent the PUT.
+    return { kind: 'deferred', pending: true };
+  }
+  if (admission !== 'granted') {
+    if (admission === 'snapshot' && !final.conflictCount) await compactRemote(head.etag, true, final, version.state);
+    return { kind: 'deferred', pending: true };
+  }
   const name = `wal/${id}.bin`;
-  let etag: string | undefined;
   await client.put(name, delta, { absent: true });
   // A lost response can leave this exact WAL on the server. Do not apply a stranger's bytes.
-  const accepted = await client.get(name, WAL_LIMIT);
+  const accepted = await client.get(name, delta.length);
   if (!accepted || accepted === 'unchanged' || !sameBytes(accepted.bytes, delta)) throw rejectHistory();
-  etag = accepted.etag;
   // Anchor the exact replay result, not the pre-append state used to generate the WAL.
-  const appended: RemoteWal = { id, bytes: delta, etag };
-  const final = await replay([...remoteWals, appended]);
+  const appended = { ...candidate, etag: accepted.etag };
   check();
   const view = fromOutput(final);
   const review = final.conflictCount ? await derive<ReplayOutput>('sync:reconcile', [key, wrap, mergedView.head, mergedView.snap,

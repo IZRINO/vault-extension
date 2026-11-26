@@ -1,27 +1,58 @@
-import { useEffect, useState } from 'react';
-import { ArrowLeft, ChevronRight, Dices, Eye, EyeOff, Plus, Trash2 } from 'lucide-react';
-import { MAX_OTP_SETUP_LENGTH, request, type VaultItem } from '../vault-messages';
+import { useEffect, useRef, useState } from 'react';
+import { ArrowLeft, ChevronRight, Dices, Eye, EyeOff, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { MAX_OTP_SETUP_LENGTH, request, STALE_EDIT, type VaultItem } from '../vault-messages';
 import { AreaField, Ico, SecretField, SelectField, SwitchRow, TextField } from './components';
 import { developerFieldVisible, fieldSets, formatExpiryDate, kinds, matchRules, subtypeNames, text } from './lib';
 import { useOps } from './Main';
+import { applyDraftField, rebaseDraft, type DraftConflict } from './edit-draft';
 
-export default function ItemEditor({ initial, save, close, onDirty }: {
-  initial: VaultItem; save(item: VaultItem): void; close(): void; onDirty(value: boolean): void;
+export default function ItemEditor({ initial, save, loadLatest, close, onDirty }: {
+  initial: VaultItem; save(item: VaultItem): Promise<void>; loadLatest(id: string): Promise<VaultItem>; close(): void; onDirty(value: boolean): void;
 }) {
   const [item, setItem] = useState(() => structuredClone(initial));
+  const [base, setBase] = useState(initial);
+  const [stale, setStale] = useState(false);
+  const [review, setReview] = useState<DraftConflict[]>();
+  const draft = useRef(item);
+  draft.current = item;
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const { busy, work } = useOps();
   // Compare actual content so typing and then undoing does not trigger a false warning.
-  useEffect(() => { onDirty(JSON.stringify(item) !== JSON.stringify(initial)); }, [item, initial, onDirty]);
+  useEffect(() => { onDirty(!!review?.length || JSON.stringify(item) !== JSON.stringify(base)); }, [item, base, review, onDirty]);
+  const recover = () => void work(async () => {
+    const latest = await loadLatest(base.id);
+    const result = rebaseDraft(base, draft.current, latest);
+    setBase(latest); setItem(result.item); setReview(result.conflicts); setStale(false); setRevealed({});
+  });
+  const resolve = (conflict: DraftConflict, mine: boolean) => {
+    if (mine) setItem(value => applyDraftField(value, conflict));
+    setReview(current => current?.filter(field => field !== conflict));
+  };
+  const submit = () => void work(async () => {
+    try { await save(item); }
+    catch (error) {
+      if (error instanceof Error && error.message === STALE_EDIT) setStale(true);
+      throw error;
+    }
+  });
   const update = (key: string, value: unknown) => setItem(old => ({ ...old, data: { ...old.data, [key]: value } }));
   const uris = (item.data.uris ?? []) as { uri: string; matchRule?: string }[];
   const fields = (fieldSets[item.data.kind] ?? []).filter(field => item.data.kind !== 'developer' ||
     developerFieldVisible(field.key, text(item.data.subtype), item.data[field.key]));
-  return <form className="view form" onSubmit={event => { event.preventDefault(); if (!busy) save(item); }}>
+  return <form className="view form" onSubmit={event => { event.preventDefault(); if (!busy && !stale && !review?.length) submit(); }}>
     <div className="view-head">
       <button type="button" className="icon-btn" aria-label="返回" onClick={close}><Ico of={ArrowLeft} /></button>
       <h1>{item.id ? '编辑' : '新建'}{kinds[item.data.kind] ?? '凭证'}</h1>
     </div>
+    {stale && <button className="btn" type="button" disabled={busy} onClick={recover}><Ico of={RefreshCw} />载入最新版本并保留草稿</button>}
+    {review && !stale && <div className="banner banner-warn" aria-live="polite">
+      {review.length ? <><p>以下字段也在其他地方改过。表单先显示库中版本，请逐项确认。</p>
+        {review.map(conflict => <div key={conflict.key}><strong>{conflict.label}</strong>
+          {!conflict.canUseMine && <p>为保护已有数据，不会重放这个字段的旧值；保留最新版本后可重新编辑。</p>}
+          <button type="button" className="btn" onClick={() => resolve(conflict, false)}>保留库中版本</button>
+          {conflict.canUseMine && <button type="button" className="btn" onClick={() => resolve(conflict, true)}>采用我的修改</button>}
+        </div>)}</> : '已在最新版本上保留你的修改，尚未保存。请检查表单后保存。'}
+    </div>}
     <TextField label="名称" value={item.title} onChange={title => setItem({ ...item, title })} required maxLength={200} autoFocus placeholder="例如：常用邮箱" />
     {item.data.kind === 'developer' && <SelectField label="凭证类型" value={text(item.data.subtype)} onChange={value => update('subtype', value)}>
       {Object.entries(subtypeNames).map(([value, name]) => <option key={value} value={value}>{name}</option>)}
@@ -91,7 +122,7 @@ export default function ItemEditor({ initial, save, close, onDirty }: {
       </div>
     </details>
     <div className="form-bar"><button type="button" className="btn" disabled={busy} onClick={close}>取消</button>
-      <button className="btn btn-primary" disabled={busy}>{busy ? '正在保存…' : '保存凭证'}</button></div>
+      <button className="btn btn-primary" disabled={busy || stale || !!review?.length}>{busy ? '正在保存…' : '保存凭证'}</button></div>
   </form>;
 }
 import ScanOtp from './ScanOtp';

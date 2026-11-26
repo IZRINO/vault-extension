@@ -6,6 +6,7 @@ import {
   type ReplayOutput, type RemoteHeadInfo, type SnapshotOutput,
 } from './bootstrap';
 import { cleanAbsorbedWal, cleanOldHistory, publishSnapshot, snapshotDigest } from './publish';
+import { blockingReservation } from './capacity';
 import { nextJournalVersion, type JournalClock } from './journal-device';
 import { WebDavClient } from './webdav';
 
@@ -92,6 +93,7 @@ export async function restoreHistory(client: WebDavClient, anchor: RemoteAnchor,
   const snap = new Uint8Array(output.snap);
   const pending = { id: version.id, digest: await snapshotDigest(snap), priorHistory: prepared.info.history };
   await confirmRestore(client, anchor, prepared, check);
+  if (await blockingReservation(client, prepared.info.history, prepared.proposed.included)) throw changed();
   await reserve(version.state, pending);
   const published = await publishSnapshot(client, version.id, prepared.object.etag, new Uint8Array(output.head), snap);
   if (!published) throw changed();

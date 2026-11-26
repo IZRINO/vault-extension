@@ -266,20 +266,24 @@ fn hash_text(hash: &mut Sha256, text: &str) {
     hash.update(text.len().to_le_bytes());
     hash.update(text.as_bytes());
 }
-fn signature(row: &VaultItem, keepass: bool, strict_vendor: bool) -> [u8; 32] {
+fn strict_vendor(format: &str) -> bool {
+    matches!(format, "bitwarden" | "enpass" | "dashlane-json" | "lastpass-json" | "dashlane-zip")
+}
+fn signature(row: &VaultItem, format: &str) -> [u8; 32] {
     let ssh = matches!(&row.data, CredentialData::Developer(data) if data.subtype == DeveloperCredentialSubtype::SshKey);
-    let include_protection = strict_vendor || ssh;
+    let include_protection = strict_vendor(format) || ssh;
     let json = row.to_json_value();
     let data = Zeroizing::new(json.get_field("data").map(|value| value.stringify()).unwrap_or_default());
     let mut hash = Sha256::new();
     for value in [&*data, &row.title, &row.note] { hash_text(&mut hash, value); }
     if include_protection { hash.update(row.tags.len().to_le_bytes()); }
-    if keepass || include_protection {
+    if format == "keepass" || include_protection {
         for tag in &row.tags { hash_text(&mut hash, tag); }
     }
     if include_protection {
         hash.update([row.pinned as u8, row.require_reprompt as u8, row.trashed as u8]);
-        for field in row.custom_fields.iter().filter(|field| field.name != SOURCE && !(ssh && field.name == META)) {
+        for field in row.custom_fields.iter().filter(|field| field.name != SOURCE &&
+            !(ssh && format != "bitwarden" && field.name == META)) {
             hash_text(&mut hash, &field.name);
             hash_text(&mut hash, &field.value);
             hash.update([field.hidden as u8]);
@@ -291,13 +295,12 @@ fn signature(row: &VaultItem, keepass: bool, strict_vendor: bool) -> [u8; 32] {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Preview { ready: usize, skipped: usize, invalid: usize, unsupported: usize, ignored_otp: usize, passkeys: usize,
-    suspended_passkeys: usize, ignored_passkeys: usize, unsupported_passkey_versions: usize, sample: Vec<Sample> }
+    suspended_passkeys: usize, ignored_passkeys: usize, unsupported_passkey_versions: usize, suspended_hotps: usize, sample: Vec<Sample> }
 #[derive(Serialize)]
 struct Sample { title: String, kind: &'static str, account: String }
 
 fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) -> Result<Preview> {
-    let keepass = format == "keepass";
-    let strict_vendor = matches!(format, "enpass" | "dashlane-json" | "lastpass-json" | "dashlane-zip");
+    let skip_duplicates = matches!(format, "keepass" | "bitwarden");
     let mut report = Preview { invalid: batch.invalid, unsupported: batch.unsupported, ignored_otp: batch.ignored_otp,
         ignored_passkeys: batch.ignored_passkeys, unsupported_passkey_versions: batch.unsupported_passkey_versions, ..Default::default() };
     let mut sources = BTreeMap::new();
@@ -305,9 +308,14 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
     let mut ids = BTreeMap::new();
     let mut known_keys = BTreeSet::new();
     let mut hotp = BTreeSet::new();
+    let mut bitwarden_hotps: BTreeMap<String, Vec<(usize, vault_otp::Otp)>> = BTreeMap::new();
     for (index, row) in vault.items.iter().enumerate() {
         if let Some(id) = source_key(row) { sources.insert(id, index); }
-        signatures.insert(signature(row, keepass, strict_vendor), index);
+        if format == "bitwarden" {
+            // Our Bitwarden exports use Vault IDs; matching one still only skips the row.
+            sources.insert(format!("bitwarden:{}", row.id), index);
+        }
+        signatures.insert(signature(row, format), index);
         ids.insert(row.id.clone(), index);
         if let CredentialData::Login(login) = &row.data {
             for key in bundle::read(&login.passkey_data)? { known_keys.insert((key.rp_id.clone(), key.credential_id.clone())); }
@@ -316,17 +324,18 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
         }
     }
     for mut row in batch.records.drain(..) {
-        let index = ids.get(&row.id).copied().or_else(|| source_key(&row).and_then(|id| sources.get(&id).copied()))
-            .or_else(|| signatures.get(&signature(&row, keepass, strict_vendor)).copied());
+        let source = source_key(&row);
+        let index = ids.get(&row.id).copied().or_else(|| source.as_ref().and_then(|id| sources.get(id).copied()))
+            .or_else(|| signatures.get(&signature(&row, format)).copied());
         let mut incoming = match &row.data {
             CredentialData::Login(login) => bundle::read(&login.passkey_data)?,
             _ => Vec::new(),
         };
         incoming.retain(|key| !known_keys.contains(&(key.rp_id.clone(), key.credential_id.clone())));
         if let Some(index) = index {
-            if keepass || incoming.is_empty() {
-                // A source UUID (especially in plaintext XML) detects duplicates; it never
-                // authorizes attaching a different private key to the existing credential.
+            if skip_duplicates || incoming.is_empty() {
+                // Duplicate Bitwarden and KeePass rows must not change an existing credential
+                // or authorize attaching a different private key to it.
                 report.ignored_passkeys += incoming.len();
                 report.skipped += 1;
                 continue;
@@ -353,7 +362,15 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
         }
         if let CredentialData::Login(login) = &mut row.data {
             let otp = login.totp_uri.as_deref().and_then(|uri| vault_otp::parse(uri).ok()).filter(|otp| otp.kind == vault_otp::Kind::Hotp);
-            if let Some(otp) = otp { if !hotp.insert(otp.identity()) { report.skipped += 1; continue; } }
+            if let Some(otp) = otp {
+                let identity = otp.identity();
+                if format == "bitwarden" && source.is_some() {
+                    bitwarden_hotps.entry(identity).or_default().push((vault.items.len(), otp));
+                } else if bitwarden_hotps.contains_key(&identity) || !hotp.insert(identity) {
+                    report.skipped += 1;
+                    continue;
+                }
+            }
             if incoming.is_empty() && login.password.is_empty() && login.totp_uri.is_none() && !login.passkey_data.is_empty() {
                 report.skipped += 1; continue;
             }
@@ -364,11 +381,31 @@ fn apply(vault: &mut VaultSnapshot, mut batch: Batch, now: u64, format: &str) ->
         row.id = generate_uuid_v4().map_err(|_| INVALID)?;
         if row.created_at_ms == 0 { row.created_at_ms = now; }
         if row.updated_at_ms == 0 { row.updated_at_ms = now; }
-        if strict_vendor && row.trashed && row.trashed_at_ms.is_none() { row.trashed_at_ms = Some(now); }
-        if let Some(id) = source_key(&row) { sources.insert(id, vault.items.len()); }
-        signatures.insert(signature(&row, keepass, strict_vendor), vault.items.len());
+        if strict_vendor(format) && row.trashed && row.trashed_at_ms.is_none() { row.trashed_at_ms = Some(now); }
+        if let Some(id) = source { sources.insert(id, vault.items.len()); }
+        signatures.insert(signature(&row, format), vault.items.len());
         record_sample(&mut report, &row);
         vault.items.push(row);
+    }
+    // Distinct Bitwarden source IDs can legitimately share a token, not a password.
+    // Do not rewrite an existing owner. Among new copies prefer a usable, non-trashed account.
+    for (identity, copies) in bitwarden_hotps {
+        let owner = if hotp.contains(&identity) { None } else {
+            copies.iter().filter(|(_, otp)| !otp.counter_unverified)
+                .min_by_key(|(index, _)| vault.items[*index].trashed).map(|(index, _)| *index)
+        };
+        let highest = copies.iter().filter(|(_, otp)| !otp.counter_unverified).map(|(_, otp)| otp.counter).max();
+        for (index, mut otp) in copies {
+            let paused = owner != Some(index);
+            if paused { report.suspended_hotps += 1; }
+            let counter = if paused { otp.counter } else { highest.unwrap_or(otp.counter) };
+            if paused == otp.counter_unverified && counter == otp.counter { continue; }
+            otp.counter_unverified = paused;
+            otp.counter = counter;
+            if let CredentialData::Login(login) = &mut vault.items[index].data {
+                drop(Zeroizing::new(login.totp_uri.replace(otp.canonical_uri().to_string())));
+            }
+        }
     }
     Ok(report)
 }
@@ -445,28 +482,51 @@ pub fn wasm_portable_import(format: &str, key: Vec<u8>, wrap: Vec<u8>, head: &[u
     Ok(PortableImport { report, head, snap, count })
 }
 
-fn write_bitwarden(vault: &VaultSnapshot, password: &str) -> Result<(String, usize)> {
+#[derive(Default)]
+struct BitwardenKeys { exported: usize, skipped: usize, unverified_retained: usize }
+
+fn write_bitwarden(vault: &VaultSnapshot, password: &str) -> Result<(String, BitwardenKeys)> {
     let mut rows = SecretJson(json!([]));
-    let mut skipped_keys = 0;
+    let mut counts = BitwardenKeys::default();
     for item in &vault.items {
         let mut row = SecretJson(serde_json::from_str(&Zeroizing::new(item.to_json_value().stringify())).map_err(|_| INVALID)?);
         if let CredentialData::Login(login) = &item.data {
             let mut records = SecretJson(json!([]));
-            for key in bundle::read(&login.passkey_data)? {
-                if key.algorithm != -7 || !key.eligible || key.count_unverified { skipped_keys += 1; continue; }
+            let keys = bundle::read(&login.passkey_data)?;
+            let meta = metadata(item).ok().filter(|value| value.0["version"] == 1);
+            let retained = meta.as_ref().and_then(|value| value.0["extra"]["login"]["fido2Credentials"].as_array());
+            if let Some(retained) = retained {
+                for raw in retained {
+                    // The bundle is authoritative, including for keys now ineligible for export.
+                    if id_bytes(text(raw, "credentialId")).is_ok_and(|id| keys.iter().any(|key|
+                        key.rp_id == text(raw, "rpId") && key.credential_id == id)) { continue; }
+                    if bitwarden_key(raw).is_ok_and(|key| key.algorithm == -7 && !key.count_unverified) &&
+                        raw["counter"].as_u64().or_else(|| text(raw, "counter").parse().ok()) == Some(0) &&
+                        text(raw, "keyAlgorithm").eq_ignore_ascii_case("ECDSA") {
+                        counts.exported += 1;
+                    } else {
+                        counts.unverified_retained += 1;
+                    }
+                    records.0.as_array_mut().unwrap().push(raw.clone());
+                }
+            }
+            let has_key_records = retained.is_some() || !keys.is_empty();
+            for key in keys {
+                if key.algorithm != -7 || !key.eligible || key.count_unverified { counts.skipped += 1; continue; }
                 let der = key.to_pkcs8()?;
                 records.0.as_array_mut().unwrap().push(json!({ "credentialId": bw_id(&key.credential_id), "keyType": "public-key",
                     "keyAlgorithm": "ECDSA", "keyCurve":"P-256", "keyValue":B64.encode(&*der), "rpId":key.rp_id, "rpName":key.rp_id,
                     "userHandle":B64.encode(&key.user_handle), "userName":key.account, "userDisplayName":key.account,
                     "counter":key.count.to_string(), "discoverable":key.discoverable.to_string(), "creationDate":bitwarden::date(&json!(item.created_at_ms)) }));
+                counts.exported += 1;
             }
-            row.0["_vaultFido2"] = records.0.clone();
+            if has_key_records { row.0["_vaultFido2"] = records.0.take(); }
         }
         rows.0.as_array_mut().unwrap().push(row.0.clone());
     }
     let mut entropy = Zeroizing::new([0; 64]);
     csprng_fill(entropy.as_mut()).map_err(|_| INVALID)?;
-    Ok((bitwarden::export(&Zeroizing::new(rows.0.to_string()), password, entropy.as_ref())?, skipped_keys))
+    Ok((bitwarden::export(&Zeroizing::new(rows.0.to_string()), password, entropy.as_ref())?, counts))
 }
 
 fn bw_id(id: &[u8]) -> String {
@@ -480,21 +540,23 @@ pub fn wasm_portable_export(format: &str, key: Vec<u8>, wrap: Vec<u8>, head: &[u
     let (key, wrap, password) = (Zeroizing::new(key), Zeroizing::new(wrap), Zeroizing::new(password));
     let (_, _, vault) = open_vault(&key, &wrap, head, snap)?;
     let encode = || -> Result<String> {
-        let (text, count, skipped, skipped_keys) = match format {
+        let (text, count, skipped, passkeys, skipped_keys, unverified_retained) = match format {
             "cxf" => {
                 let (plain, count, skipped, skipped_keys) = crate::cxf::write(&vault, now as u64)?;
                 let data = if password.is_empty() { plain.to_string() } else { crate::protected_jwe::seal(plain.as_bytes(), &password)? };
-                (data, count, skipped, skipped_keys)
+                (data, count, skipped, None, skipped_keys, 0)
             }
             "bitwarden" => {
-                let (encoded, skipped_keys) = write_bitwarden(&vault, &password)?;
-                (encoded, vault.items.len(), 0, skipped_keys)
+                let (encoded, keys) = write_bitwarden(&vault, &password)?;
+                (encoded, vault.items.len(), 0, Some(keys.exported), keys.skipped, keys.unverified_retained)
             }
             _ => return Err(INVALID),
         };
         let text = Zeroizing::new(text);
         if text.len() > LIMIT { return Err("导出内容超过 16 MiB，请使用 .vaultpack。"); }
-        let response = SecretJson(json!({ "text": &*text, "count":count, "skipped":skipped, "skippedPasskeys":skipped_keys }));
+        let mut response = SecretJson(json!({ "text": &*text, "count":count, "skipped":skipped, "skippedPasskeys":skipped_keys }));
+        if let Some(passkeys) = passkeys { response.0["passkeys"] = json!(passkeys); }
+        if unverified_retained > 0 { response.0["unverifiedRetainedPasskeys"] = json!(unverified_retained); }
         Ok(response.0.to_string())
     };
     encode().map_err(JsValue::from_str)

@@ -57,10 +57,12 @@ export default defineBackground(() => {
       return true;
     }
     if (message?.target === 'vault-event' && message.type === 'locked' && !sender.tab &&
-        (!sender.url || sender.url === browser.runtime.getURL('/background.js')) && sender.id === browser.runtime.id) passkeys.stop();
+        (!sender.url || sender.url === browser.runtime.getURL('/background.js')) && sender.id === browser.runtime.id) {
+      autofill.clear(); passkeys.stop();
+    }
     if (message?.target !== 'vault') return;
-    if (message.type === 'webdav-scheduled') {
-      respond({ ok: false, error: '无效的同步消息。' });
+    if (['webdav-scheduled', 'autofill-save', 'autofill-save-target', 'login-mark'].includes(message.type)) {
+      respond({ ok: false, error: '无效的内部消息。' });
       return;
     }
     if (!isVaultPage(sender, browser.runtime.id)) {
@@ -93,7 +95,10 @@ export default defineBackground(() => {
   });
   browser.idle.onStateChanged.addListener(state => { if (state === 'locked') { autofill.clear(); passkeys.stop(); void vault.lock(); } });
   browser.tabs.onRemoved.addListener(tabId => { autofill.clear(tabId); passkeys.stop(tabId); });
-  browser.tabs.onUpdated.addListener((tabId, update) => { if (update.status === 'loading' || update.url != null) passkeys.stop(tabId); });
+  browser.tabs.onUpdated.addListener((tabId, update) => {
+    if (update.url != null) autofill.navigated(tabId, update.url);
+    if (update.status === 'loading' || update.url != null) { passkeys.stop(tabId); autofill.marking.clear(tabId); }
+  });
   browser.tabs.onActivated.addListener(info => passkeys.selected(info.tabId, info.windowId));
   browser.windows.onRemoved.addListener(id => passkeys.closed(id));
   browser.commands.onCommand.addListener(async (command, tab) => {

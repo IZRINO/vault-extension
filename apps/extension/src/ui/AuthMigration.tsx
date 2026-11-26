@@ -112,6 +112,7 @@ export default function AuthMigration({ refresh }: { refresh(): Promise<void> })
       {preview.missingParts > 0 && <p role="alert" className="banner banner-warn">缺少 {preview.missingParts} 张二维码。请选齐同一批的图片后重新预览。</p>}
       {damaged && <p role="alert" className="banner banner-warn">这批二维码有损坏的条目。请从原验证器重新导出。</p>}
       <p className="hint">重复记录 {preview.skipped} 条，无法读取 {preview.invalid} 条，不支持 {preview.unsupported} 条。{preview.repeatedParts ? `忽略重复图片 ${preview.repeatedParts} 张。` : ''}</p>
+      {!!preview.unknownHotpCounters && <p className="banner banner-warn" role="alert">有 {preview.unknownHotpCounters} 个计数型验证码的计数无法核实，不会导入。请保留原验证器。</p>}
       <ul className="facts">{preview.sample.map((row, index) => <li className="fact" key={index}><div className="fact-text">
         <span className="fact-value">{row.title}</span><span className="fact-label">{row.account}</span>
       </div></li>)}</ul>

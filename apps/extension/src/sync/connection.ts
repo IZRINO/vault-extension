@@ -6,7 +6,7 @@ import { davPresets, probeWebDav, webDavConfig, type DavContext, type DavProbe, 
 interface Seal { vaultId: string; bytes: number[] }
 interface ClockSample { offset: number | null; observedAt: number; enabled: boolean }
 interface LocalData { webDavSealed?: Seal; webDavPaused?: DavStopStatus | null; webDavClock?: ClockSample; webDavConflicts?: number }
-export interface DavConnectionStatus { saved: boolean; paused?: DavStopStatus; offsetSeconds: number | null; compensation: boolean; linked?: boolean; writeVerified?: boolean; conflicts?: number; drafts?: number; localRestoreHeld?: boolean }
+export interface DavConnectionStatus { saved: boolean; paused?: DavStopStatus; offsetSeconds: number | null; clockExpiresAt?: number; compensation: boolean; linked?: boolean; writeVerified?: boolean; conflicts?: number; drafts?: number; localRestoreHeld?: boolean }
 const keys: (keyof LocalData)[] = ['webDavSealed', 'webDavPaused', 'webDavClock', 'webDavConflicts'];
 const maxClockAge = 30 * 60 * 1000;
 const read = () => browser.storage.local.get<LocalData>(keys);
@@ -72,8 +72,19 @@ export async function saveDavConnection(config: WebDavConfig, session: SessionSt
 export async function davStatus(vaultId?: string): Promise<DavConnectionStatus> {
   const state = await read();
   const saved = !!state.webDavSealed && state.webDavSealed.vaultId === vaultId;
-  return { saved, paused: pauseStatus(state), offsetSeconds: saved ? clockOffset(state.webDavClock) : null,
+  const paused = pauseStatus(state);
+  const offsetSeconds = saved && !paused ? clockOffset(state.webDavClock) : null;
+  return { saved, paused, offsetSeconds,
+    ...(offsetSeconds !== null ? { clockExpiresAt: state.webDavClock!.observedAt + maxClockAge + 1 } : {}),
     compensation: saved && state.webDavClock?.enabled === true };
+}
+
+export async function observeDavClock(vaultId: string, offset: number | null, observedAt: number, check: () => void) {
+  const state = await read();
+  check();
+  if (state.webDavSealed?.vaultId !== vaultId || pauseStatus(state) ||
+      (offset === null && state.webDavClock?.offset == null)) return;
+  await browser.storage.local.set({ webDavClock: { offset, observedAt, enabled: state.webDavClock?.enabled === true } });
 }
 
 export async function openSavedDav(state: SessionState, vaultId: string): Promise<WebDavConfig> {

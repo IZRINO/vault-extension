@@ -1,6 +1,9 @@
 import { autofillRequest, type FillKind, type FillPayload } from '../src/autofill-messages';
 import { controls, fieldKey, fillControls, fillKind, safeAction, visible, type Control } from '../src/autofill-dom';
 import { defaultFlags, type SiteFlags } from '../src/autofill-settings';
+import { fillMarked, markedForm, markForTarget } from '../src/login-mark-dom';
+import { openMarkPicker } from '../src/login-mark-picker';
+import { markKey, markSetKey, type LoginMark, type MarkDraft } from '../src/login-marks';
 
 export default defineContentScript({
   matches: ['http://*/*', 'https://*/*'],
@@ -13,6 +16,7 @@ export default defineContentScript({
     let token: string | undefined;
     let menuTarget: Control | undefined;
     let menuKind: FillKind | undefined;
+    let menuMark: LoginMark | undefined;
     let manualMenu = false;
     let lastUrl = location.href;
     let restoring = false;
@@ -20,11 +24,15 @@ export default defineContentScript({
     let opening = false;
     let recentUsername = '';
     let stopHandshake: (() => void) | undefined;
+    let marks: LoginMark[] = [];
+    let markFetch = 0;
+    let picker: ReturnType<typeof openMarkPicker> | undefined;
     const extensionOrigin = 'chrome-extension://' + browser.runtime.id;
-    const note = (message: string) => {
+    const note = (message: string, error = false) => {
       const box = document.createElement('div');
       const root = box.attachShadow({ mode: 'closed' });
       const text = document.createElement('p');
+      text.setAttribute('role', error ? 'alert' : 'status');
       text.textContent = message;
       text.style.cssText = 'font:14px/1.5 system-ui;margin:0;padding:12px 16px;color:#fff;background:#1f2428;border-radius:8px;max-width:320px';
       root.append(text);
@@ -35,6 +43,21 @@ export default defineContentScript({
     const remove = () => {
       stopHandshake?.(); stopHandshake = undefined;
       host?.remove(); host = undefined; token = undefined; menuTarget = undefined; menuKind = undefined; manualMenu = false;
+      menuMark = undefined;
+    };
+    const closePicker = () => { picker?.close(); picker = undefined; };
+    const getMarks = async () => {
+      if (window !== window.top) return;
+      const epoch = ++markFetch;
+      const url = location.href;
+      const current = await autofillRequest<LoginMark[]>({ type: 'mark-get' }).catch(() => []);
+      if (epoch === markFetch && url === location.href) marks = current;
+    };
+    const choiceFor = (target: Control): { kind: FillKind; mark?: LoginMark } | undefined => {
+      const marked = markForTarget(marks, target);
+      if (marked) return marked;
+      const detected = fillKind(target);
+      if (detected && (!marks.length || (detected === 'card' || detected === 'identity') && !markedForm(marks, target))) return { kind: detected };
     };
     const position = (box: HTMLElement, target?: Control, menu = false) => {
       const rect = target?.getBoundingClientRect();
@@ -48,9 +71,9 @@ export default defineContentScript({
       const top = rect ? menu ? upwards ? rect.top - height - 4 : rect.bottom + 4 : narrow ? rect.top - 30 : rect.top + (rect.height - 28) / 2 : 12;
       box.style.cssText = `all:initial;position:fixed;left:${Math.max(8, Math.min(left, innerWidth - width - 8))}px;top:${Math.max(8, top)}px;width:${width}px;height:${height}px;z-index:2147483647;display:block`;
     };
-    const showMenu = (value: string, target?: Control, kind?: FillKind, manual = false) => {
+    const showMenu = (value: string, target?: Control, kind?: FillKind, manual = false, marked?: LoginMark) => {
       remove();
-      token = value; menuTarget = target; menuKind = kind; manualMenu = manual;
+      token = value; menuTarget = target; menuKind = kind; manualMenu = manual; menuMark = marked;
       host = document.createElement('div');
       host.setAttribute('data-vault-ui', '');
       position(host, target, true);
@@ -70,21 +93,27 @@ export default defineContentScript({
       document.documentElement.append(host);
     };
     const begin = async (manual?: true) => {
-      if (opening || token) return;
-      if (!active || !visible(active) || !safeAction(active)) { note('请先选择可见的输入框。跨域提交的表单需要在原网站手动填写。'); return; }
-      const kind = fillKind(active);
-      if (!kind || (!manual && flags.inlineDisabled)) return;
+      if (opening || token || picker || (!manual && flags.inlineDisabled)) return;
+      const field = active, url = location.href;
+      if (!field || !visible(field) || !safeAction(field)) { note('请先选择可见的输入框。跨域提交的表单需要在原网站手动填写。'); return; }
       opening = true;
       try {
-        const { token } = await autofillRequest<{ token: string }>({ type: 'begin', kind, manual });
-        if (!ctx.isInvalid && (manual || !flags.inlineDisabled) && active && visible(active)) showMenu(token, active, kind, manual);
+        await getMarks();
+        if (active !== field || location.href !== url || picker) return;
+        const choice = choiceFor(field);
+        if (!choice) { if (marks.length) note('已标记的输入框找不到或不唯一，请重新标记。', true); return; }
+        const { kind, mark } = choice;
+        const { token } = await autofillRequest<{ token: string }>({ type: 'begin', kind, manual,
+          markId: mark && markKey(mark), markSet: mark && markSetKey(marks) });
+        if (!ctx.isInvalid && (manual || !flags.inlineDisabled) && active === field && location.href === url &&
+            !picker && visible(field)) showMenu(token, field, kind, manual, mark);
       } catch (error) { note(error instanceof Error ? error.message : '无法打开填充菜单。'); }
       finally { opening = false; }
     };
     const icon = (target: Control) => {
-      if (token) return;
+      if (token || picker) return;
       remove();
-      if (flags.inlineDisabled || !fillKind(target) || !visible(target)) return;
+      if (flags.inlineDisabled || !choiceFor(target) || !visible(target)) return;
       host = document.createElement('div');
       host.setAttribute('data-vault-ui', '');
       position(host, target);
@@ -110,17 +139,20 @@ export default defineContentScript({
         console.warn('[Vault] 无法确认网站设置：', error instanceof Error ? error.message : '消息失败');
       }
     };
+    const refreshPageSettings = () => Promise.all([getMarks(), refreshFlags()]).then(() => {
+      if (!ctx.isInvalid && !picker && active?.matches(':focus')) icon(active);
+    });
     const pending = async () => {
-      if (restoring || flags.saveDisabled) return;
+      if (restoring || picker || flags.saveDisabled) return;
       restoring = true;
       try {
         const response = await autofillRequest<{ token: string } | null>({ type: 'pending' });
-        if (response && !ctx.isInvalid && !flags.saveDisabled) showMenu(response.token);
+        if (response && !ctx.isInvalid && !picker && !flags.saveDisabled) showMenu(response.token);
       } catch { /* A page without an unlocked vault has no save prompt. */ }
       finally { restoring = false; }
     };
     const capture = (form: HTMLFormElement | null) => {
-      if (flags.saveDisabled || Date.now() > pendingSubmit) return;
+      if (picker || flags.saveDisabled || Date.now() > pendingSubmit) return;
       pendingSubmit = 0;
       const fields = controls(form ?? document).filter(field => field.form === form && visible(field) && safeAction(field));
       const passwords = fields.filter(field => field instanceof HTMLInputElement && field.type === 'password' && field.value);
@@ -132,7 +164,7 @@ export default defineContentScript({
         .then(response => { if (response && !ctx.isInvalid && !flags.saveDisabled) showMenu(response.token); }).catch(() => undefined);
     };
     ctx.addEventListener(document, 'focusin', event => {
-      if (!event.isTrusted) return;
+      if (!event.isTrusted || picker) return;
       const target = fromEvent(event);
       if (!target) return;
       active = target;
@@ -144,7 +176,7 @@ export default defineContentScript({
     }, true);
     ctx.addEventListener(document, 'keydown', event => {
       const key = event as KeyboardEvent;
-      if (!key.isTrusted) return;
+      if (!key.isTrusted || picker) return;
       if (key.code === 'KeyL' && key.altKey && key.shiftKey && !key.ctrlKey && !key.metaKey) {
         key.preventDefault(); void begin(true); return;
       }
@@ -159,7 +191,7 @@ export default defineContentScript({
       }
     }, true);
     ctx.addEventListener(document, 'click', event => {
-      if (!event.isTrusted) return;
+      if (!event.isTrusted || picker) return;
       const element = event.composedPath()[0];
       if (!(element instanceof Element)) return;
       const button = element.closest('button,input[type=submit]');
@@ -181,17 +213,50 @@ export default defineContentScript({
       if (active && !active.isConnected && !token) { active = undefined; remove(); }
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    ctx.onInvalidated(() => { observer.disconnect(); remove(); });
+    ctx.onInvalidated(() => { observer.disconnect(); remove(); closePicker(); });
     ctx.setInterval(() => {
       if (location.href !== lastUrl) {
-        lastUrl = location.href; remove();
-        void refreshFlags().then(pending);
+        lastUrl = location.href; remove(); closePicker(); marks = [];
+        void refreshPageSettings().then(pending);
       }
       if (active && host && !token) position(host, active);
     }, 350);
+    // A tool-popup closes when the user returns to the page. Keep only its bounded,
+    // active document selection alive across the service worker's idle interval.
+    ctx.setInterval(() => {
+      const current = picker;
+      if (current) void autofillRequest({ type: 'mark-ready', token: current.token }).catch(() => {
+        if (picker === current) { closePicker(); note('标记会话已结束，请从 Vault 重新打开。'); }
+      });
+    }, 15_000);
     const onMessage = (message: Record<string, unknown>, sender: { id?: string }, respond: (value: unknown) => void) => {
       if (sender.id !== browser.runtime.id || message?.target !== 'vault-fill') return;
-      if (message.type === 'settings-changed') { remove(); void refreshFlags(); return; }
+      if (message.type === 'settings-changed') { remove(); closePicker(); void refreshPageSettings(); return; }
+      if (message.type === 'mark-changed') {
+        remove(); void getMarks().then(() => { if (active?.matches(':focus')) icon(active); }); return;
+      }
+      if (message.type === 'mark-ended') { if (picker?.token === message.token) closePicker(); return; }
+      if (message.type === 'mark-open' && typeof message.token === 'string' && window === window.top && message.url === location.href) {
+        const secret = message.token, url = location.href;
+        void autofillRequest({ type: 'mark-ready', token: secret }).then(() => {
+          if (ctx.isInvalid || location.href !== url) { respond({ ready: false }); return; }
+          if (token) void autofillRequest({ type: 'close', token }).catch(() => undefined);
+          remove(); closePicker(); pendingSubmit = 0;
+          picker = openMarkPicker(secret, async (draft: MarkDraft) => {
+            const saved = await autofillRequest<LoginMark[]>({ type: 'mark-save', token: secret, draft });
+            if (location.href === url && !ctx.isInvalid) {
+              if (picker?.token === secret) closePicker();
+              marks = saved; ++markFetch;
+              note('已保存登录框标记。');
+            }
+          }, () => {
+            closePicker();
+            void autofillRequest({ type: 'mark-cancel', token: secret }).catch(() => undefined);
+          });
+          respond({ ready: true });
+        }).catch(() => respond({ ready: false }));
+        return true;
+      }
       if (message.type === 'site-settings-changed') {
         void refreshFlags().then(() => {
           if (ctx.isInvalid) return;
@@ -213,23 +278,28 @@ export default defineContentScript({
       if (message.type === 'probe') {
         host?.style.setProperty('visibility', 'hidden', 'important');
         try {
-          const ready = !!menuTarget && visible(menuTarget) && safeAction(menuTarget);
-          const fields = ready ? controls(menuTarget!.form ?? menuTarget!.getRootNode() as Document | ShadowRoot)
+          const ready = !!menuTarget && visible(menuTarget) && safeAction(menuTarget) &&
+            (!menuMark || markForTarget(marks, menuTarget)?.mark === menuMark);
+          const fields = ready && !menuMark ? controls(menuTarget!.form ?? menuTarget!.getRootNode() as Document | ShadowRoot)
             .filter(field => field.form === menuTarget!.form && !fieldKey(field) && visible(field) && safeAction(field))
             .flatMap(field => [field.name, field.id]).filter(name => !!name && name.length <= 256).slice(0, 64) : [];
-          respond({ ready, url: location.href, fields }); return;
+          respond({ ready, url: location.href, fields, markId: menuMark && markKey(menuMark) }); return;
         } finally { host?.style.removeProperty('visibility'); }
       }
       if (message.type === 'fill') {
         host?.style.setProperty('visibility', 'hidden', 'important');
-        const filled = message.url === location.href && message.kind === menuKind && !!menuTarget &&
-          fillControls(menuTarget, menuKind!, message.payload as FillPayload);
-        remove(); respond({ filled });
+        const result = message.url === location.href && message.kind === menuKind && menuTarget
+          ? (menuMark ? fillMarked(marks, menuMark, menuTarget, menuKind!, message.payload as FillPayload) :
+            { filled: fillControls(menuTarget, menuKind!, message.payload as FillPayload) })
+          : { filled: false };
+        remove();
+        if ('needsRemark' in result && result.needsRemark) note('有标记的输入框已变化或不唯一，已跳过这些框。请重新标记。', true);
+        respond(result);
       }
       if (message.type === 'close') { remove(); respond(null); }
     };
     browser.runtime.onMessage.addListener(onMessage);
     ctx.onInvalidated(() => browser.runtime.onMessage.removeListener(onMessage));
-    void refreshFlags().then(pending);
+    void refreshPageSettings().then(pending);
   },
 });

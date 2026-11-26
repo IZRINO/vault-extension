@@ -6,6 +6,7 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { evaluateNativePopup, waitForBuiltInFilters } = require('./browser-fixtures.cjs');
+const { observeOtpMessages } = require('./test-phase-2.cjs');
 
 const root = path.resolve(__dirname, '..');
 const extension = path.resolve(root, process.env.VAULT_EXTENSION_PATH || 'apps/extension/.output/chrome-mv3');
@@ -96,6 +97,7 @@ async function server() {
     if (url.pathname === '/otp') return response.end(html(`<h1>Six-cell OTP</h1><form>${Array.from({ length: 6 }, (_, i) =>
       `<input class="otp" aria-label="Digit ${i + 1}" inputmode="numeric" type="tel" maxlength="1" ${i === 0 ? 'autocomplete="one-time-code"' : ''}>`).join('')}</form>
       <script>document.addEventListener('input',()=>{window.otpReady=[...document.querySelectorAll('.otp')].every(field=>field.value.length===1)})</script>`));
+    if (url.pathname === '/otp-single') return response.end(html('<form><label>One-time code<input autocomplete="one-time-code"></label></form>'));
     if (url.pathname === '/plain') return response.end(html('<form action="/success" method="post"><label>Account<input name="username" autocomplete="username"></label><label>Password<input name="password" type="password" autocomplete="current-password"></label><button>Log in</button></form>'));
     if (url.pathname === '/success') return response.end(html('<h1>Login complete</h1>'));
     if (url.pathname === '/shadow') return response.end(html(`<h1>Open shadow form</h1><div id="shadow"></div><script>
@@ -166,9 +168,9 @@ async function run(name, primary, secondary) {
     await send({ type: 'create', masterPassword: master });
     const origin = `http://login.target.localhost:${primary.address().port}`;
     const local = `http://127.0.0.1:${primary.address().port}`;
-    const add = (title, url, protectedItem = false) => send({ type: 'upsert', itemJson: JSON.stringify({
+    const add = (title, url, protectedItem = false, totpUri = 'JBSWY3DPEHPK3PXP') => send({ type: 'upsert', itemJson: JSON.stringify({
       title, data: { kind: 'login', username: 'fixture-user', password: secret,
-        uris: [{ uri: url }], totpUri: 'JBSWY3DPEHPK3PXP' }, requireReprompt: protectedItem,
+        uris: [{ uri: url }], totpUri }, requireReprompt: protectedItem,
       customFields: [{ name: 'department', value: 'Fixture department', hidden: true }],
     }) });
     await add('Fixture login', origin);
@@ -224,12 +226,32 @@ async function run(name, primary, secondary) {
     await expect(frame.getByText('没有匹配的凭证。', { exact: false })).toBeVisible();
     assert.equal(await page.getByLabel('Password', { exact: true }).inputValue(), '');
 
+    await add('Counter field fixture', origin, false, 'otpauth://hotp/Fixture?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&counter=0');
+    await add('Steam field fixture', origin, false, 'otpauth://steam/Fixture?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=5');
+    const panel = await context.newPage();
+    await panel.goto(`chrome-extension://${id}/sidepanel.html`);
+    await page.bringToFront();
+    const otpPages = [vault, panel];
+    const endTotp = await observeOtpMessages(otpPages);
     await page.goto(origin + '/otp');
     frame = await open(page, page.getByLabel('Digit 1', { exact: true }));
     await confirm(frame); await frame.getByRole('button', { name: /Fixture login/ }).click();
     await expect.poll(() => page.evaluate(() => window.otpReady)).toBe(true);
     assert.match((await page.locator('.otp').evaluateAll(fields => fields.map(field => field.value).join(''))), /^\d{6}$/);
+    const ordinaryPageOtpMessages = { totp: await endTotp() };
     await page.screenshot({ path: path.join(output, `autofill-${name}-otp.png`) });
+    for (const [kind, title] of [['hotp', 'Counter field fixture'], ['steam', 'Steam field fixture']]) {
+      const end = await observeOtpMessages(otpPages);
+      await page.goto(origin + '/otp-single');
+      const input = page.getByLabel('One-time code');
+      frame = await open(page, input);
+      await confirm(frame);
+      await frame.getByRole('button', { name: new RegExp(title) }).click();
+      await expect.poll(() => input.evaluate((field, kind) => kind === 'hotp'
+        ? field.value === '755224' : /^[23456789BCDFGHJKMNPQRTVWXY]{5}$/.test(field.value), kind)).toBe(true);
+      ordinaryPageOtpMessages[kind] = await end();
+    }
+    await panel.close();
 
     await page.goto(origin + '/controlled');
     frame = await open(page, page.getByLabel('Password', { exact: true }));
@@ -261,6 +283,56 @@ async function run(name, primary, secondary) {
     await confirm(frame); await frame.getByRole('button', { name: '确认更新密码', exact: true }).click();
     await expect.poll(async () => (await send({ type: 'get', id: created.id })).data.password).toBe('Changed-Captured-Fixture#2026');
     assert.equal((await send({ type: 'get', id: created.id })).data.passwordHistory[0].password, 'New-Captured-Fixture#2026');
+
+    const captureLogin = async (username, password) => {
+      await page.goto(local + '/plain');
+      await page.getByLabel('Account', { exact: true }).fill(username);
+      await page.getByLabel('Password', { exact: true }).fill(password);
+      await page.getByRole('button', { name: 'Log in', exact: true }).click();
+      await page.waitForURL('**/success');
+      return menu(page);
+    };
+    const addLocal = (title, username, extra = {}) => send({ type: 'upsert', itemJson: JSON.stringify({
+      ...extra, title, data: { kind: 'login', username, password: secret, uris: [{ uri: local }], ...extra.data },
+    }) });
+    for (let i = 0; i < 30; i++) await addLocal('Pinned capture fixture ' + i, 'pinned-' + i, { pinned: true });
+    const checkout = await send({ type: 'list' });
+    const primaryProof = { method: 'master', secret: master };
+    for (const kind of ['totp', 'hotp']) {
+      const setup = `otpauth://${kind}/Fixture?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ${kind === 'hotp' ? '&counter=2' : ''}`;
+      const username = `${kind}-outside-menu`;
+      const metadata = [{ name: 'Vault 迁移来源', value: 'Imported fixture', hidden: true }, { name: 'Extra', value: 'Preserved', hidden: false }];
+      await addLocal(username, username, { data: { totpUri: setup }, requireReprompt: true, customFields: metadata });
+      const { id: loginId } = (await send({ type: 'list' })).find(item => item.title === username);
+      const changed = `Changed fixture password for ${kind}`;
+      frame = await captureLogin(username, changed);
+      await expect(frame.getByRole('heading', { name: '更新网站密码', exact: true })).toBeVisible();
+      assert(!JSON.stringify(await frame.locator('body').innerText()).includes('GEZDGNBV'));
+      await confirm(frame);
+      await frame.getByLabel('主密码', { exact: true }).fill('Wrong fixture master password');
+      await frame.getByRole('button', { name: '确认更新密码', exact: true }).click();
+      await expect(frame.getByRole('alert').filter({ hasText: '主密码验证失败' })).toBeVisible();
+      assert.equal((await send({ type: 'get-edit', id: loginId, proof: primaryProof })).data.password, secret);
+      await frame.getByLabel('主密码', { exact: true }).fill(master);
+      await frame.getByRole('button', { name: '确认更新密码', exact: true }).click();
+      await expect.poll(async () => (await send({ type: 'get', id: loginId, proof: primaryProof })).data.password).toBe(changed);
+      const read = await send({ type: 'get', id: loginId, proof: primaryProof });
+      assert(!Object.hasOwn(read.data, 'totpUri'));
+      assert.deepEqual(read.data.passwordHistory.map(item => item.password), [secret]);
+      const saved = await send({ type: 'get-edit', id: loginId, proof: primaryProof });
+      assert.equal(saved.data.totpUri, setup);
+      assert.deepEqual(saved.customFields, metadata);
+      if (kind === 'hotp') {
+        assert.equal((await send({ type: 'next-hotp', id: loginId, proof: primaryProof })).counter, '2');
+      }
+    }
+    assert.equal((await send({ type: 'list' })).length, checkout.length + 2);
+    await addLocal('Pinned ambiguous', 'totp-outside-menu', { pinned: true });
+    frame = await captureLogin('totp-outside-menu', 'Do not save this ambiguous fixture');
+    await expect(frame.getByRole('alert').filter({ hasText: '有多条同账号凭证' })).toBeVisible();
+    await expect(frame.getByRole('button', { name: '确认更新密码', exact: true })).toHaveCount(0);
+    assert.equal((await send({ type: 'list' })).length, checkout.length + 3);
+
     await page.goto(origin + '/controlled');
     await page.getByLabel('Password', { exact: true }).click();
     await page.keyboard.press('Alt+Shift+L');
@@ -355,7 +427,8 @@ async function run(name, primary, secondary) {
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ browser: name, controlledReact: true, multiStep: true, honeyPotsEmpty: true,
       closedShadow: true, openShadowForms: true, crossFrameConfirmation: true, portIsolation: true,
-      splitOtp: true, protectedFill: true, customVisibleField: true, captureAfterNavigation: true, updatePasswordHistory: true, shortcutAndClose: true,
+      splitOtp: true, ordinaryPageOtpMessages, protectedFill: true, customVisibleField: true, captureAfterNavigation: true, updatePasswordHistory: true,
+      protectedPasswordOnlyCaptureBeyondMenuLimit: true, ambiguousCaptureBlocked: true, shortcutAndClose: true,
       encryptedSitePreferences: true, wildcardScopeAndPortIsolation: true, wildcardNativePopup: true,
       paymentAndIdentity: true, errors }));
   } catch (error) {

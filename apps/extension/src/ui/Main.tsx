@@ -179,8 +179,14 @@ function Workspace({ status, refresh, initialItems, startBackupImport }: Workspa
     if (!value) throw new Error('“' + summary.title + '”还没有填写' + label + '。');
     await copyValue(value);
   });
-  const save = (item: VaultItem) => work(async () => {
-    const existing = items?.find(entry => entry.id === item.id);
+  const currentEditSummary = async (id: string) => {
+    const entry = (await request<ItemSummary[]>({ type: 'list' })).find(item => item.id === id);
+    if (!entry || entry.trashed) throw new Error('条目已删除或移入回收站。当前草稿仍保留，不会覆盖它。');
+    return entry;
+  };
+  const loadLatestEdit = async (id: string) => fetchItem<VaultItem>(await currentEditSummary(id), 'get-edit');
+  const save = async (item: VaultItem) => {
+    const existing = item.id ? await currentEditSummary(item.id) : undefined;
     const verified = existing?.requireReprompt ? await dialogs.proof() : undefined;
     try {
       await request({ type: 'upsert', itemJson: JSON.stringify({ ...item, tags: item.tags.map(tag => tag.trim()).filter(Boolean) }), proof: verified });
@@ -189,7 +195,7 @@ function Workspace({ status, refresh, initialItems, startBackupImport }: Workspa
       await reload();
       if (mounted.current) setNotice('凭证已保存。');
     } finally { if (verified) verified.secret = ''; }
-  });
+  };
   const setTrashed = (item: Pick<ItemSummary, 'id'>, trashed: boolean) => work(async () => {
     await request({ type: 'trash', id: item.id, trashed });
     if (mounted.current) setScreen({ name: 'list' });
@@ -263,7 +269,7 @@ function Workspace({ status, refresh, initialItems, startBackupImport }: Workspa
             otpUsed={() => void reload().catch(fail)}
             setTrashed={trashed => void setTrashed(screen.item, trashed)} remove={() => void remove(screen.item)} />}
           {tab === 'vault' && screen.name === 'edit' && <ItemEditor key={screen.item.id || screen.item.data.kind + String(screen.item.data.subtype)} initial={screen.item}
-            save={item => void save(item)} onDirty={value => { dirty.current = value; }}
+            save={save} loadLatest={loadLatestEdit} onDirty={value => { dirty.current = value; }}
             close={() => void leave().then(ok => { if (ok) setScreen(screen.back ? { name: 'detail', item: screen.back } : { name: 'list' }); })} />}
           {tab === 'generator' && <Generator />}
           {tab === 'audit' && <Audit open={openById} items={items} />}

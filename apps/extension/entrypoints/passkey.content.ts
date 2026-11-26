@@ -16,6 +16,8 @@ export default defineContentScript({
     function negotiate(request: PasskeyRequest | 'capability', signal?: AbortSignal): Promise<PasskeyOutcome | { type: 'capability'; available: boolean }> {
       const id = crypto.randomUUID();
       return new Promise((resolve, reject) => {
+        let phase: 'initial' | 'waiting' | 'interacting' = 'initial';
+        let deadline: ReturnType<typeof setTimeout> | undefined;
         const finish = (outcome?: PasskeyOutcome | { type: 'capability'; available: boolean }, error?: unknown) => {
           clearTimeout(handshake);
           clearTimeout(deadline);
@@ -34,13 +36,19 @@ export default defineContentScript({
           if (event.source !== window || event.origin !== origin || data?.channel !== PASSKEY_CHANNEL ||
               data.direction !== 'receive' || data.id !== id) return;
           if (data.type === 'received') clearTimeout(handshake);
-          else if (['cancel', 'native', 'answer', 'capability'].includes(data.type)) finish(data);
+          else if (request !== 'capability' && request.conditional && data.type === 'waiting' && phase === 'initial') {
+            phase = 'waiting';
+            clearTimeout(deadline);
+          } else if (data.type === 'interaction' && phase === 'waiting') {
+            phase = 'interacting';
+            deadline = setTimeout(abort, 65_000);
+          } else if (['cancel', 'native', 'answer', 'already-registered', 'capability'].includes(data.type)) finish(data);
         };
         const handshake = setTimeout(() => {
           post({ channel: PASSKEY_CHANNEL, direction: 'abort', id }, origin);
           finish({ type: 'native' });
         }, 1300);
-        const deadline = setTimeout(abort, request === 'capability' ? 3200 : request.conditional ? 125_000 : 65_000);
+        deadline = setTimeout(abort, request === 'capability' ? 3200 : 65_000);
         if (signal?.aborted) { abort(); return; }
         signal?.addEventListener('abort', abort, { once: true });
         listen('message', receive);
@@ -65,6 +73,9 @@ export default defineContentScript({
         if (options?.signal?.aborted) throw options.signal.reason;
         if (result.type === 'native') return native();
         if (result.type === 'answer') return browserCredential(result.value, request);
+        if (result.type === 'already-registered' && request.kind === 'register') {
+          throw new DOMException('This credential is already registered.', 'InvalidStateError');
+        }
         throw abortError();
       };
     }

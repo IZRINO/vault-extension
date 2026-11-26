@@ -195,13 +195,14 @@ impl Otp {
         uri
     }
 
-    /// Counter and display changes must never make a used HOTP seed importable again.
+    /// Counter, display and unused time-step changes must not split a HOTP identity.
     pub fn identity(&self) -> String {
         let mut hash = Sha256::new();
         let label = if self.kind == Kind::Hotp { "" } else { &self.label };
         let issuer = if self.kind == Kind::Hotp { "" } else { &self.issuer };
+        let period = if self.kind == Kind::Hotp { 0 } else { self.period };
         for field in [label, issuer, self.kind.as_str(),
-            &format!("{}:{}:{}", self.algorithm as u8, self.digits, self.period)]
+            &format!("{}:{}:{period}", self.algorithm as u8, self.digits)]
         {
             hash.update((field.len() as u64).to_be_bytes());
             hash.update(field.as_bytes());
@@ -348,6 +349,20 @@ mod tests {
         otp.counter = u64::MAX;
         assert_eq!(identity, otp.identity());
         assert!(generate(&otp.canonical_uri(), 0.0, 0).is_err());
+    }
+
+    #[test]
+    fn hotp_identity_ignores_period_but_keeps_code_parameters() {
+        let hotp = |secret: &str, algorithm: &str, digits: u32, period: u64| parse(&format!(
+            "otpauth://hotp/Example?secret={secret}&algorithm={algorithm}&digits={digits}&period={period}&counter=2"
+        )).unwrap().identity();
+        let identity = hotp(SECRET, "SHA1", 6, 30);
+        assert_eq!(identity, hotp(SECRET, "SHA1", 6, 60));
+        assert_ne!(identity, hotp(SECRET, "SHA256", 6, 60));
+        assert_ne!(identity, hotp(SECRET, "SHA1", 8, 60));
+        assert_ne!(identity, hotp("JBSWY3DPEHPK3PXP", "SHA1", 6, 60));
+        let totp = |period| parse(&format!("otpauth://totp/Example?secret={SECRET}&period={period}")).unwrap().identity();
+        assert_ne!(totp(30), totp(60));
     }
 
     #[test]

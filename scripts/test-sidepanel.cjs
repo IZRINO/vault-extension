@@ -105,7 +105,7 @@ async function exerciseClipboard(panel, editedTitle, copyAfterVerification, stop
     };
     const summary = (await send({ type: 'list' })).find(item => item.title === title);
     const proof = { method: 'master', secret: masterPassword };
-    const item = await send({ type: 'get', id: summary.id, proof });
+    const item = await send({ type: 'get-edit', id: summary.id, proof });
     item.data.password = syntheticPassword;
     await send({ type: 'upsert', itemJson: JSON.stringify(item), proof });
   }, editedTitle, multiline, master);

@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import initCore, * as core from '../../../../crates/vault-core/pkg/vault_core.js';
 import initSync, * as wasm from '../../../../crates/vault-sync/pkg/vault_sync.js';
@@ -6,7 +7,8 @@ import type { RemoteAnchor, SessionState, VaultFiles } from '../vault-storage';
 import { createRemoteVault, endpointFingerprint, packSyncFrames, readRemoteVault } from './bootstrap';
 import { nextJournalVersion, type JournalClock } from './journal-device';
 import { runDavSync } from './run';
-import { prepareRestore, restoreHistoryLocally } from './history';
+import { prepareRestore, restoreHistory, restoreHistoryLocally } from './history';
+import { reserveAppend } from './capacity';
 import { WebDavClient, webDavConfig } from './webdav';
 
 function decoded(head: wasm.RemoteHead) {
@@ -232,6 +234,8 @@ function records(local: Side) {
   } finally { engine.free(); }
 }
 const titles = (local: Side) => records(local).map(item => item.title);
+const fixtureId = (n: number) => `${n.toString(16).padStart(14, '0')}_09abcd11_${n.toString(16).padStart(14, '0')}`;
+const fixtureNote = (length: number) => createHash('shake256', { outputLength: length }).update('synthetic note').digest('base64');
 const sync = (local: Side, request: typeof fetch, extras: { write?: boolean; idle?: boolean; signal?: AbortSignal; force?: boolean } = {}) =>
   runDavSync({ ...config, writeVerified: extras.write ?? true }, {
     ...local, forceHead: !!extras.force, compactWhenIdle: !!extras.idle, context: { signal: extras.signal }, authorize: async () => false,
@@ -246,6 +250,316 @@ describe('WebDAV sync with the real Wasm codec', () => {
   beforeAll(async () => {
     await initCore({ module_or_path: await readFile(new URL('../../../../crates/vault-core/pkg/vault_core_bg.wasm', import.meta.url)) });
     await initSync({ module_or_path: await readFile(new URL('../../../../crates/vault-sync/pkg/vault_sync_bg.wasm', import.meta.url)) });
+  });
+
+  it('keeps the directory readable when two devices sync with one WAL slot remaining', async () => {
+    const { dav, open } = await setup();
+    const [a, b] = await Promise.all([open(), open()]);
+    const fixture = structuredClone(a);
+    add(fixture, 'Earlier edit');
+    const writer = crypto.randomUUID();
+    for (let i = 0; i < 749; i++) {
+      const id = fixtureId(2000 + i);
+      const bytes = wasm.wasm_sync_make_batch(a.session.key, a.session.wrap, a.files.head, a.files.snap,
+        a.files.head, a.files.snap, fixture.files.head, fixture.files.snap, id, writer);
+      dav.objects.set(`/dav/vault/wal/${id}.bin`, { bytes: new Uint8Array(bytes), tag: `"seed-${i}"` });
+    }
+    add(a, 'Offline edit A');
+    add(b, 'Offline edit B');
+    const reached = Promise.withResolvers<void>();
+    let observed = 0;
+    const simultaneous: typeof fetch = async (input, init) => {
+      const response = await dav.fetcher(input, init);
+      if (init?.method === 'PROPFIND' && String(input).endsWith('/vault/wal/') && observed < 2) {
+        if (++observed === 2) reached.resolve();
+        await reached.promise;
+      }
+      return response;
+    };
+    await Promise.all([sync(a, simultaneous), sync(b, simultaneous)]);
+    expect([...dav.objects.keys()].filter(path => path.startsWith('/dav/vault/wal/')).length).toBeLessThanOrEqual(750);
+    const joined = await open();
+    expect(titles(joined)).toContain('Earlier edit');
+    const restarted = [structuredClone(a), structuredClone(b)];
+    for (const side of restarted) {
+      for (let retry = 0; retry < 2 && side.pending; retry++) await sync(side, dav.fetcher);
+      expect(side.pending).toBe(false);
+    }
+    await Promise.all(restarted.map(side => sync(side, dav.fetcher)));
+    const expected = ['Earlier edit', 'Offline edit A', 'Offline edit B'];
+    for (const side of [...restarted, await open()]) expect(titles(side).sort()).toEqual(expected);
+  });
+
+  it('does not grant the same last WAL slots to three concurrent devices', async () => {
+    const { dav, open } = await setup();
+    const devices = await Promise.all([open(), open(), open()]);
+    const base = devices[0]!, fixture = structuredClone(base), writer = crypto.randomUUID();
+    add(fixture, 'Existing');
+    for (let i = 0; i < 748; i++) {
+      const id = fixtureId(2000 + i);
+      const bytes = wasm.wasm_sync_make_batch(base.session.key, base.session.wrap, base.files.head, base.files.snap,
+        base.files.head, base.files.snap, fixture.files.head, fixture.files.snap, id, writer);
+      dav.objects.set(`/dav/vault/wal/${id}.bin`, { bytes: new Uint8Array(bytes), tag: `"seed-${i}"` });
+    }
+    const checked = Promise.withResolvers<void>();
+    let observers = 0, largest = 0;
+    await Promise.all(devices.map((device, index) => {
+      add(device, `Offline ${index}`);
+      let listings = 0;
+      const together: typeof fetch = async (url, init) => {
+        const result = await dav.fetcher(url, init);
+        if (init?.method === 'PROPFIND' && String(url).endsWith('/vault/wal/') && ++listings === 2) {
+          if (++observers === devices.length) checked.resolve();
+          await checked.promise;
+        }
+        if (init?.method === 'PUT' && String(url).includes('/vault/wal/')) {
+          largest = Math.max(largest, [...dav.objects.keys()].filter(path => path.includes('/vault/wal/')).length);
+        }
+        return result;
+      };
+      return sync(device, together);
+    }));
+    expect(largest).toBeLessThanOrEqual(750);
+    expect(titles(await open())).toContain('Existing');
+    const restarted = devices.map(device => structuredClone(device));
+    for (const device of restarted) {
+      for (let retry = 0; retry < 4 && device.pending; retry++) await sync(device, dav.fetcher);
+      expect(device.pending).toBe(false);
+    }
+    expect(titles(await open()).sort()).toEqual(['Existing', 'Offline 0', 'Offline 1', 'Offline 2']);
+  });
+
+  it('counts distinct in-flight ancestor bytes once and never grants a future unreadable history', async () => {
+    const dav = server(), client = new WebDavClient(config, {}, dav.fetcher);
+    const permit = (id: number, base: number, size: number) => reserveAppend(client, [], { id: fixtureId(id), bytes: bytes(id) },
+      `snap_${fixtureId(base)}`, size, [], async () => true);
+    const mib = 1024 * 1024;
+    expect(await permit(10, 1, 5 * mib)).toBe('granted');
+    expect(await permit(11, 1, 5 * mib)).toBe('granted');
+    expect(await permit(12, 2, 3 * mib)).toBe('granted');
+    expect(await permit(13, 3, 1)).toBe('snapshot');
+    expect(await permit(14, 4, 8 * mib + 1)).toBe('snapshot');
+  });
+
+  it('keeps a byte-sized margin for a legacy WAL arriving after two new devices check the directory', async () => {
+    const { dav, open } = await setup();
+    const [a, b, legacy] = await Promise.all([open(), open(), open()]);
+    const note = fixtureNote(2 * 1024 * 1024 + 65536);
+    for (const [device, title] of [[a, 'New A'], [b, 'New B'], [legacy, 'Legacy']] as const) {
+      put(device, { title, note, data: { kind: 'login', password: 'fixture secret' } });
+    }
+    const version = nextJournalVersion(undefined, Date.now()), base = legacy.anchor;
+    const delta = new Uint8Array(wasm.wasm_sync_make_batch(legacy.session.key, legacy.session.wrap, base.appliedHead, base.appliedSnap,
+      base.appliedHead, base.appliedSnap, legacy.files.head, legacy.files.snap, version.id, version.state.deviceId));
+    expect(delta.length * 3).toBeGreaterThan(8 * 1024 * 1024);
+    expect(delta.length).toBeLessThan(4 * 1024 * 1024);
+    const checked = Promise.withResolvers<void>();
+    let readers = 0, peak = 0;
+    const observe: typeof fetch = async (url, init) => {
+      const response = await dav.fetcher(url, init);
+      if (init?.method === 'PUT' && String(url).includes('/vault/wal/')) {
+        const size = [...dav.objects].reduce((total, [name, object]) => total + (name.includes('/vault/wal/') ? object.bytes.length : 0), 0);
+        peak = Math.max(peak, size);
+      }
+      return response;
+    };
+    await Promise.all([a, b].map(device => {
+      let listings = 0;
+      return sync(device, async (url, init) => {
+        const response = await observe(url, init);
+        if (init?.method === 'PROPFIND' && String(url).endsWith('/vault/wal/') && ++listings === 2) {
+          if (++readers === 2) {
+            await new WebDavClient(config, {}, observe).put(`wal/${version.id}.bin`, delta, { absent: true });
+            checked.resolve();
+          }
+          await checked.promise;
+        }
+        return response;
+      });
+    }));
+    expect(peak).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(titles(await open())).toContain('Legacy');
+    for (const device of [a, b]) {
+      for (let retry = 0; retry < 4 && device.pending; retry++) await sync(device, observe);
+      expect(device.pending).toBe(false);
+    }
+    expect(peak).toBeLessThanOrEqual(8 * 1024 * 1024);
+    expect(titles(await open()).sort()).toEqual(['Legacy', 'New A', 'New B']);
+  });
+
+  it('joins from the current snapshot without downloading unrelated history over 8 MiB', async () => {
+    const { dav, open } = await setup();
+    const seed = await open();
+    const { key, wrap } = seed.session;
+    let wire = seed.anchor.head;
+    const large = fixtureNote(4 * 1024 * 1024 + 65536);
+    put(seed, { title: 'Existing login', note: large, data: { kind: 'login', password: 'fixture secret' } });
+    const historical: string[] = [];
+    const time = Date.now() + 60_000;
+    for (let index = 0; index < 3; index++) {
+      if (index === 2) put(seed, { ...records(seed)[0]!, note: '' });
+      const id = fixtureId(time + index);
+      const next = wasm.wasm_sync_compact(key, wrap, wire, seed.files.head, seed.files.snap, id);
+      const path = `/dav/vault/snap_${id}.bin`;
+      try {
+        wire = next.head;
+        const snap = new Uint8Array(next.snap);
+        seed.files = { ...seed.files, head: new Uint8Array(decoded(wasm.wasm_sync_authenticate_head(wire, key, wrap)).localHead), snap };
+        dav.objects.set(path, { bytes: snap, tag: `"history-${index}"` });
+        if (index < 2) historical.push(path);
+      } finally { next.free(); }
+    }
+    dav.objects.set('/dav/vault/head.bin', { bytes: new Uint8Array(wire), tag: '"head-with-history"' });
+    expect(historical.reduce((total, path) => total + dav.objects.get(path)!.bytes.length, 0)).toBeGreaterThan(8 * 1024 * 1024);
+    const editor = await open();
+    add(editor, 'Increment for the current snapshot');
+    await sync(editor, dav.fetcher);
+    const before = dav.requests.length;
+    const joined = await open();
+    expect(titles(joined).sort()).toEqual(['Existing login', 'Increment for the current snapshot']);
+    expect(dav.requests.slice(before).filter(row => row.method === 'GET').some(row => historical.includes(row.path))).toBe(false);
+  });
+
+  it('verifies a required older ancestor and stops if it is missing, damaged or over budget', async () => {
+    const { dav, open } = await setup();
+    const [base, editor] = await Promise.all([open(), open()]);
+    add(editor, 'Edit based on older snapshot');
+    await sync(editor, dav.fetcher);
+    const { key, wrap } = base.session;
+    const ancestor = decoded(wasm.wasm_sync_authenticate_head(base.anchor.head, key, wrap));
+    const id = fixtureId(Date.now() + 60_000);
+    // A compactor read before the edit was published; the edit still depends on the prior snapshot.
+    const compacted = wasm.wasm_sync_compact(key, wrap, base.anchor.head, base.files.head, base.files.snap, id);
+    try {
+      dav.objects.set('/dav/vault/head.bin', { bytes: new Uint8Array(compacted.head), tag: '"head-newer"' });
+      dav.objects.set(`/dav/vault/snap_${id}.bin`, { bytes: new Uint8Array(compacted.snap), tag: '"snapshot-newer"' });
+    } finally { compacted.free(); }
+    const path = `/dav/vault/${ancestor.snapshotId}.bin`;
+    const existing = dav.objects.get(path)!;
+    const before = dav.requests.length;
+    expect(titles(await open())).toEqual(['Edit based on older snapshot']);
+    expect(dav.requests.slice(before).some(row => row.path === path && row.method === 'GET')).toBe(true);
+
+    const damaged = new Uint8Array(existing.bytes);
+    damaged[damaged.length - 1] = damaged[damaged.length - 1]! ^ 1;
+    for (const [replacement, error] of [[undefined, 'SyncAncestorRequired'], [damaged, 'CRYPTO_AUTH_FAILED'],
+      [new Uint8Array(8 * 1024 * 1024 + 1), '超过大小限制']] as const) {
+      if (replacement) dav.objects.set(path, { bytes: replacement, tag: '"fixture-unusable-ancestor"' });
+      else dav.objects.delete(path);
+      const start = dav.requests.length;
+      await expect(open().catch(reason => String(reason))).resolves.toContain(error);
+      expect(dav.requests.slice(start).every(row => row.method === 'GET' || row.method === 'PROPFIND')).toBe(true);
+      expect(titles(editor)).toEqual(['Edit based on older snapshot']);
+    }
+  });
+
+  it('fetches the required ancestor directly even with an unrelated large newer history snapshot', async () => {
+    const { dav, open } = await setup();
+    const base = await open(), offline = structuredClone(base);
+    const { key, wrap } = base.session;
+    add(offline, 'Late offline WAL');
+    const version = nextJournalVersion(undefined, Date.now());
+    const delta = wasm.wasm_sync_make_batch(key, wrap, base.files.head, base.files.snap, base.files.head,
+      base.files.snap, offline.files.head, offline.files.snap, version.id, version.state.deviceId);
+    const first = decoded(wasm.wasm_sync_authenticate_head(base.anchor.head, key, wrap)).snapshotId;
+    put(base, { title: 'Other edit', note: fixtureNote(8 * 1024 * 1024 + 65536),
+      data: { kind: 'login', password: 'fixture secret' } });
+    let wire = base.anchor.head;
+    const paths: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      if (i) put(base, { ...records(base)[0]!, note: '' });
+      const id = fixtureId(Date.now() + 60_000 + i);
+      const next = wasm.wasm_sync_compact(key, wrap, wire, base.files.head, base.files.snap, id);
+      try {
+        wire = next.head;
+        base.files = { ...base.files, head: new Uint8Array(decoded(wasm.wasm_sync_authenticate_head(wire, key, wrap)).localHead), snap: new Uint8Array(next.snap) };
+        const path = `/dav/vault/snap_${id}.bin`;
+        paths.push(path);
+        dav.objects.set(path, { bytes: new Uint8Array(next.snap), tag: `"history-${i}"` });
+      } finally { next.free(); }
+    }
+    expect(dav.objects.get(paths[0]!)!.bytes.length).toBeGreaterThan(8 * 1024 * 1024);
+    dav.objects.set('/dav/vault/head.bin', { bytes: new Uint8Array(wire), tag: '"new-head"' });
+    dav.objects.set(`/dav/vault/wal/${version.id}.bin`, { bytes: new Uint8Array(delta), tag: '"late-wal"' });
+    const before = dav.requests.length;
+    expect(titles(await open()).sort()).toEqual(['Late offline WAL', 'Other edit']);
+    const reads = dav.requests.slice(before).filter(row => row.method === 'GET').map(row => row.path);
+    expect(reads).toContain(`/dav/vault/${first}.bin`);
+    expect(reads).not.toContain(paths[0]);
+  });
+
+  it('keeps offline edits pending across an interrupted compaction near the 8 MiB WAL budget', async () => {
+    const { dav, open } = await setup();
+    const editor = await open();
+    const fixture = structuredClone(editor);
+    put(fixture, { title: 'Earlier large note', note: fixtureNote(3 * 1024 * 1024 - 65536),
+      data: { kind: 'login', password: 'fixture secret' } });
+    const writer = crypto.randomUUID();
+    let total = 0;
+    for (const i of [1, 2]) {
+      const id = fixtureId(2000 + i);
+      const bytes = wasm.wasm_sync_make_batch(editor.session.key, editor.session.wrap, editor.files.head, editor.files.snap,
+        editor.files.head, editor.files.snap, fixture.files.head, fixture.files.snap, id, writer);
+      total += bytes.length;
+      dav.objects.set(`/dav/vault/wal/${id}.bin`, { bytes: new Uint8Array(bytes), tag: `"large-seed-${i}"` });
+    }
+    expect(total).toBeGreaterThan(8 * 1024 * 1024 - 256 * 1024);
+    expect(total).toBeLessThanOrEqual(8 * 1024 * 1024);
+    put(editor, { title: 'Pending offline note', note: fixtureNote(256 * 1024),
+      data: { kind: 'login', password: 'fixture secret' } });
+    const lock = new AbortController();
+    const interrupt: typeof fetch = async (input, init) => {
+      const response = await dav.fetcher(input, init);
+      if (init?.method === 'PUT' && String(input).endsWith('/vault/head.bin')) lock.abort();
+      return response;
+    };
+    const before = dav.requests.length;
+    await expect(sync(editor, interrupt, { signal: lock.signal })).rejects.toThrow('已锁定');
+    expect(dav.requests.slice(before).some(row => row.method === 'PUT' && row.path.startsWith('/dav/vault/wal/'))).toBe(false);
+    expect(editor.pending).toBe(true);
+    expect(editor.anchor.pendingCompaction).toBeTruthy();
+    expect(titles(await open())).toEqual(['Earlier large note']);
+    const restarted = structuredClone(editor);
+    const noWrite = dav.requests.length;
+    await expect(sync(restarted, dav.fetcher, { write: false })).resolves.toMatchObject({ kind: 'read-only', pending: true });
+    expect(dav.requests.slice(noWrite).every(row => row.method === 'GET' || row.method === 'PROPFIND')).toBe(true);
+    for (let retry = 0; retry < 2 && restarted.pending; retry++) await sync(restarted, dav.fetcher);
+    expect(restarted.pending).toBe(false);
+    expect(titles(await open()).sort()).toEqual(['Earlier large note', 'Pending offline note']);
+  });
+
+  it('publishes a readable first offline batch larger than half the WAL directory budget', async () => {
+    const { dav, open } = await setup();
+    const editor = await open();
+    put(editor, { title: 'Large first offline batch', note: fixtureNote(3 * 1024 * 1024 + 65536),
+      data: { kind: 'login', password: 'fixture secret' } });
+    const { key, wrap } = editor.session;
+    const before = editor.anchor;
+    const delta = wasm.wasm_sync_make_batch(key, wrap, before.appliedHead, before.appliedSnap,
+      before.appliedHead, before.appliedSnap, editor.files.head, editor.files.snap, fixtureId(Date.now()), crypto.randomUUID());
+    expect(delta.length).toBeGreaterThan(4 * 1024 * 1024);
+    expect(delta.length).toBeLessThan(8 * 1024 * 1024);
+    for (let retry = 0; retry < 2 && editor.pending; retry++) await sync(editor, dav.fetcher);
+    expect(editor.pending).toBe(false);
+    expect(records(await open())).toEqual(records(editor));
+  });
+
+  it('leaves a single WAL over the 8 MiB read budget on the local device', async () => {
+    const { dav, open } = await setup();
+    const editor = await open();
+    const beforeFiles = editor.files;
+    put(editor, { title: 'Too large to append', note: fixtureNote(8 * 1024 * 1024 + 65536),
+      data: { kind: 'login', password: 'fixture secret' } });
+    const sample = wasm.wasm_sync_make_batch(editor.session.key, editor.session.wrap, beforeFiles.head, beforeFiles.snap,
+      beforeFiles.head, beforeFiles.snap, editor.files.head, editor.files.snap, fixtureId(Date.now()), crypto.randomUUID());
+    expect(sample.length).toBeGreaterThan(8 * 1024 * 1024);
+    const synced = dav.requests.length;
+    await expect(sync(editor, dav.fetcher)).resolves.toEqual({ kind: 'deferred', pending: true });
+    expect(dav.requests.slice(synced).every(row => row.method === 'GET' || row.method === 'PROPFIND')).toBe(true);
+    expect(editor.pending).toBe(true);
+    const restarted = structuredClone(editor);
+    expect(titles(restarted)).toEqual(['Too large to append']);
+    expect(titles(await open())).toEqual([]);
   });
 
   it('resumes a committed upload after lock and lets a second install verify it without authorizing writes', async () => {
@@ -279,6 +593,89 @@ describe('WebDAV sync with the real Wasm codec', () => {
     const last = dav.requests.length;
     await sync(b, dav.fetcher, { write: false });
     expect(dav.requests.slice(last).map(row => row.method)).toEqual(['PROPFIND']);
+  });
+
+  it('upgrades a legacy unconfirmed outbox without sending a second copy of its in-flight PUT', async () => {
+    const { dav, open } = await setup();
+    const editor = await open();
+    add(editor, 'Written before upgrade');
+    const version = nextJournalVersion(undefined, Date.now());
+    const { key, wrap } = editor.session, base = editor.anchor;
+    const delta = new Uint8Array(wasm.wasm_sync_make_batch(key, wrap, base.appliedHead, base.appliedSnap,
+      base.appliedHead, base.appliedSnap, editor.files.head, editor.files.snap, version.id, version.state.deviceId));
+    editor.anchor.outbox = { id: version.id, bytes: delta, priorIds: [], source: structuredClone(editor.files) };
+    editor.clock = version.state;
+    const path = `wal/${version.id}.bin`, offered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    // The older client knows only immutable WAL objects, not the new capacity register.
+    const delayed = new WebDavClient(config, {}, async (url, init) => {
+      offered.resolve();
+      await release.promise;
+      return dav.fetcher(url, init);
+    }).put(path, delta, { absent: true });
+    await offered.promise;
+    const restarted = structuredClone(editor), start = dav.requests.length;
+    try {
+      for (let retry = 0; retry < 3 && restarted.pending; retry++) await sync(restarted, dav.fetcher);
+      expect(restarted.pending).toBe(false);
+      expect(titles(await open())).toEqual(['Written before upgrade']);
+      expect(dav.requests.slice(start).filter(row => row.path.endsWith(path) && row.method === 'PUT')).toHaveLength(0);
+    } finally { release.resolve(); await delayed; }
+    await sync(restarted, dav.fetcher, { force: true });
+    expect(titles(await open())).toEqual(['Written before upgrade']);
+    expect(titles(restarted)).toEqual(['Written before upgrade']);
+  });
+
+  it('resolves an unconfirmed grant after further local and remote edits without pinning old history', async () => {
+    const { dav, open } = await setup();
+    const [editor, peer] = await Promise.all([open(), open()]);
+    const first = decoded(wasm.wasm_sync_authenticate_head(editor.anchor.head, editor.session.key, editor.session.wrap)).snapshotId;
+    add(editor, 'Before disconnect');
+    const lock = new AbortController();
+    const interrupt: typeof fetch = async (url, init) => {
+      const response = await dav.fetcher(url, init);
+      if (init?.method === 'PUT' && String(url).endsWith('/wal-budget.bin')) lock.abort();
+      return response;
+    };
+    await expect(sync(editor, interrupt, { signal: lock.signal })).rejects.toThrow('已锁定');
+    expect(editor.pending).toBe(true);
+    expect(titles(await open())).toEqual([]);
+    const restarted = structuredClone(editor);
+    add(restarted, 'Also saved offline');
+    add(peer, 'From another device');
+    await sync(peer, dav.fetcher);
+    for (let retry = 0; retry < 4 && restarted.pending; retry++) await sync(restarted, dav.fetcher);
+    expect(restarted.pending).toBe(false);
+    expect(titles(await open()).sort()).toEqual(['Also saved offline', 'Before disconnect', 'From another device']);
+    for (let i = 0; i < 6; i++) {
+      add(peer, `Later ${i}`);
+      await sync(peer, dav.fetcher);
+      await sync(peer, dav.fetcher, { idle: true });
+    }
+    const info = decoded(wasm.wasm_sync_authenticate_head(peer.anchor.head, peer.session.key, peer.session.wrap));
+    expect(info.history).not.toContain(first);
+    expect(titles(await open())).toHaveLength(9);
+  });
+
+  it('lets peers recover an admitted edit when its device never returns after reserving capacity', async () => {
+    const { dav, open } = await setup();
+    const [gone, active] = await Promise.all([open(), open()]);
+    const genesis = decoded(wasm.wasm_sync_authenticate_head(gone.anchor.head, gone.session.key, gone.session.wrap)).snapshotId;
+    add(gone, 'Still recoverable without this device');
+    const stopped = new AbortController();
+    await expect(sync(gone, async (url, init) => {
+      const result = await dav.fetcher(url, init);
+      if (init?.method === 'PUT' && String(url).endsWith('/wal-budget.bin')) stopped.abort();
+      return result;
+    }, { signal: stopped.signal })).rejects.toThrow('已锁定');
+    for (let i = 0; i < 7; i++) {
+      add(active, `Continued ${i}`);
+      await sync(active, dav.fetcher);
+      await sync(active, dav.fetcher, { idle: true });
+    }
+    expect(titles(await open())).toContain('Still recoverable without this device');
+    const info = decoded(wasm.wasm_sync_authenticate_head(active.anchor.head, active.session.key, active.session.wrap));
+    expect(info.history).not.toContain(genesis);
+    expect(titles(await open())).toHaveLength(8);
   });
 
   it('stores a conflicted credential encrypted, publishes unrelated edits and converges after resolution', async () => {
@@ -573,6 +970,63 @@ describe('WebDAV sync with the real Wasm codec', () => {
       await sync(side, dav.fetcher, { force: true });
       expect(titles(side).sort()).toEqual(['Arrived during compaction', 'Before compaction']);
     }
+  });
+
+  it('keeps the authenticated ancestor of an admitted in-flight WAL across repeated compactions', async () => {
+    const { dav, open } = await setup();
+    const [late, active] = await Promise.all([open(), open()]);
+    add(late, 'Admitted before compaction');
+    const offered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const upload = sync(late, async (url, init) => {
+      if (init?.method === 'PUT' && String(url).includes('/vault/wal/')) {
+        offered.resolve();
+        await release.promise;
+      }
+      return dav.fetcher(url, init);
+    });
+    await Promise.race([offered.promise, upload.then(() => { throw new Error('WAL was not offered'); })]);
+    try {
+      for (let i = 0; i < 6; i++) {
+        add(active, `Other edit ${i}`);
+        await sync(active, dav.fetcher);
+        await sync(active, dav.fetcher, { idle: true });
+      }
+    } finally { release.resolve(); await upload; }
+    expect(titles(await open()).sort()).toEqual(['Admitted before compaction', ...Array.from({ length: 6 }, (_, i) => `Other edit ${i}`)]);
+    await sync(active, dav.fetcher, { idle: true, force: true });
+    expect([...dav.objects.keys()].filter(path => path.includes('/wal/'))).toHaveLength(0);
+    expect(titles(await open())).toHaveLength(7);
+  });
+
+  it('does not let a manual history restore evict the ancestor needed by an admitted WAL', async () => {
+    const { dav, open } = await setup();
+    const active = await open();
+    add(active, 'Present before restore');
+    await sync(active, dav.fetcher);
+    await sync(active, dav.fetcher, { idle: true });
+    const late = await open();
+    add(late, 'Irrevocable in-flight edit');
+    const lock = new AbortController();
+    await expect(sync(late, async (url, init) => {
+      const response = await dav.fetcher(url, init);
+      if (init?.method === 'PUT' && String(url).endsWith('/wal-budget.bin')) lock.abort();
+      return response;
+    }, { signal: lock.signal })).rejects.toThrow('已锁定');
+    for (let i = 0; i < 4; i++) {
+      add(active, `History ${i}`);
+      await sync(active, dav.fetcher);
+      await sync(active, dav.fetcher, { idle: true });
+    }
+    await sync(active, dav.fetcher, { force: true });
+    const info = decoded(wasm.wasm_sync_authenticate_head(active.anchor.head, active.session.key, active.session.wrap));
+    const client = new WebDavClient({ ...config, writeVerified: true }, {}, dav.fetcher);
+    const before = dav.requests.length, reserve = vi.fn(), save = vi.fn();
+    const prepared = await prepareRestore(client, active.anchor, active.session, active.files, info.history[1]!);
+    await expect(restoreHistory(client, active.anchor, active.session, active.files, prepared, active.clock,
+      prepared.preview.stamp, () => {}, reserve, save)).rejects.toThrow('先同步');
+    expect(reserve).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    expect(dav.requests.slice(before).every(row => row.method === 'GET' || row.method === 'PROPFIND')).toBe(true);
   });
 
   it('previews and restores old credentials locally without publishing them, even if ETags reappear', async () => {

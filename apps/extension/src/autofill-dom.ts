@@ -60,15 +60,17 @@ export function safeAction(target: Control): boolean {
   try { return new URL(target.form.action, location.href).origin === location.origin; }
   catch { return false; }
 }
-function setValue(field: Control, value: string): void {
+export function setValue(field: Control, value: string, stillValid?: () => boolean): boolean {
   const prototype = field instanceof HTMLInputElement ? HTMLInputElement.prototype
     : field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLSelectElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(prototype, 'value')!.set!;
   field.focus({ preventScroll: true });
+  if (stillValid && !stillValid()) return false;
   setter.call(field, value);
   field.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertReplacementText', data: null }));
   field.dispatchEvent(new Event('change', { bubbles: true }));
   field.blur();
+  return true;
 }
 export function fillControls(target: Control, kind: FillKind, payload: FillPayload): boolean {
   if (!visible(target) || !safeAction(target) || fillKind(target) !== kind) return false;

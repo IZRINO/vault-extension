@@ -25,7 +25,10 @@ export type PasskeyReply = {
   signature?: string;
   userHandle?: string;
 };
-export type PasskeyOutcome = { type: 'native' | 'cancel' } | { type: 'answer'; value: PasskeyReply };
+type AlreadyRegistered = { type: 'already-registered' };
+export type PasskeyResolution = { type: 'answer'; value: PasskeyReply } | AlreadyRegistered;
+export type PasskeyPerformResult = { type: 'answer'; reply: string; head: number[]; snap: number[] } | AlreadyRegistered;
+export type PasskeyOutcome = { type: 'native' | 'cancel' } | PasskeyResolution;
 export const PASSKEY_CHANNEL = 'vault-passkey-v1';
 export const PASSKEY_PORT = 'vault-passkey-request';
 

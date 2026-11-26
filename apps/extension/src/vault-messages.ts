@@ -17,11 +17,13 @@ export interface MigrationPreview {
   sample: { title: string; kind: string; account: string }[];
   passkeys?: number;
   suspendedPasskeys?: number;
+  suspendedHotps?: number;
   ignoredPasskeys?: number;
   unsupportedPasskeyVersions?: number;
+  unknownHotpCounters?: number;
 }
 export type AuthBackupPreview = MigrationPreview & { missingParts: number; repeatedParts: number };
-export interface MigrationExport { text: string; count: number; skipped: number; skippedPasskeys?: number }
+export interface MigrationExport { text: string; count: number; skipped: number; passkeys?: number; skippedPasskeys?: number; unverifiedRetainedPasskeys?: number }
 export const MAX_OTP_SETUP_LENGTH = 64 * 1024;
 export interface BackupReceipt { vaultId: string; changeCount: number; authorization: string }
 export interface BackupExport { bytes: number[]; receipt: BackupReceipt }
@@ -96,9 +98,12 @@ export type VaultMessage =
   | { type: 'export-migration'; format: MigrationFormat; proof: Proof; encrypted?: boolean; password?: string; confirmPlaintext: boolean }
   | { type: 'autofill-candidates'; url: string; kind: import('./autofill-messages').FillKind; groups: string[][] }
   | { type: 'autofill-current'; url: string; username: string; password: string; groups: string[][] }
+  | { type: 'autofill-save-target'; url: string; username: string }
+  | { type: 'autofill-save'; url: string; username: string; password: string; expected: import('./autofill-messages').CaptureTarget; proof?: Proof }
   | { type: 'autofill-copy-otp'; id: string; url: string; groups: string[][]; proof?: Proof }
   | { type: 'autofill-read'; id: string; url: string; kind: import('./autofill-messages').FillKind; groups: string[][]; fields?: string[]; proof?: Proof }
   | { type: 'set-equivalent-domains'; groups: string[][] }
+  | { type: 'login-mark'; url: string; change?: import('./login-marks').MarkChange }
   | { type: 'autofill-settings' }
   | { type: 'set-autofill-site'; origin: string; flags: Partial<import('./autofill-settings').SiteFlags> }
   | { type: 'status' | 'open' | 'lock' | 'list' | 'audit' | 'remove-pin' | 'remove-prf' }
@@ -154,12 +159,14 @@ export interface VaultItem {
   id: string; title: string; data: { kind: string; [key: string]: unknown };
   note: string; customFields: { name: string; value: string; hidden: boolean }[];
   tags: string[]; pinned: boolean; requireReprompt: boolean; trashed: boolean; revision?: number;
+  editStamp?: string;
   createdAtMs?: number; updatedAtMs?: number;
   trashedAtMs?: number;
 }
 export interface ItemDetailData extends VaultItem {
   otp?: { kind: 'hotp' } | { kind: 'time'; handle?: string };
 }
+export const STALE_EDIT = '条目已在其他窗口更新或同步。你的输入仍保留在当前表单，可载入最新版本后继续。';
 export type Reply<T = unknown> = { ok: true; value: T } | { ok: false; error: string };
 export async function request<T = unknown>(message: VaultMessage): Promise<T> {
   const response: Reply<T> = await browser.runtime.sendMessage({ target: 'vault', ...message });
