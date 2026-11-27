@@ -31,7 +31,7 @@ pnpm install --frozen-lockfile
 pnpm run build
 ```
 
-按上面的安装步骤加载 `apps/extension/.output/chrome-mv3`。已验证的场景与仍需实机确认的限制见[本版工单与验收记录](docs/issue-alignment-audit-2026-11-26.md)。
+按上面的安装步骤加载 `apps/extension/.output/chrome-mv3`。[v0.2.0 升级说明](docs/releases/v0.2.0.md) · [整包同步与网盘验证记录](docs/agents/whole-pack-webdav.md) · [v0.1.0 工单与验收记录](docs/issue-alignment-audit-2026-11-26.md)
 
 ## 开发与反馈
 
