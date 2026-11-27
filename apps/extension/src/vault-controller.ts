@@ -10,7 +10,7 @@ import type { CaptureTarget, FillCandidate, FillKind, FillPayload } from './auto
 import { planMigration, type MigrationBatch } from './migration';
 import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTABLE_FORMATS, STALE_EDIT, type AuthBackupPreview, type MigrationExport, type MigrationPreview } from './vault-messages';
 import type { QrScan } from './vault-messages';
-import { DavRequestGate, davClockOffset, davStatus, observeDavClock, openSavedDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
+import { clearDavWriteProof, DavRequestGate, davClockOffset, davStatus, observeDavClock, openSavedDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
 import { adoptDevice, nextJournalVersion, type JournalClock } from './sync/journal-device';
 import { endpointFingerprint, HEAD_LIMIT, packSyncFrames, readRemoteVault, type RemoteHeadInfo, type ReplayOutput } from './sync/bootstrap';
 import { proveLegacyWritesInVault, WebDavClient, webDavConfig, type WebDavConfig } from './sync/webdav';
@@ -37,6 +37,11 @@ type Rotation = { head: number[]; wrap: number[]; keyEpoch: number };
 type Mutation = { head_bytes: Uint8Array; snap_bytes: Uint8Array; count: number; free(): void };
 type DavSyncMessage = Extract<VaultMessage, { type: 'webdav-sync' | 'webdav-scheduled' }>;
 const packChanged = new Error('本机密码库刚有变更，请在下一次检查继续同步。');
+function provedPackConnection(config: WebDavConfig, transport: PackTransport): WebDavConfig {
+  const mode = transport.verifiedWriteMode;
+  if (mode !== 'move' && mode !== 'put') throw new Error('网盘写入方式尚未通过验证，密码库目录仍只读。');
+  return { ...config, writeVerified: true, packWriteMode: mode === 'move' ? mode : undefined };
+}
 const notifyDavPending = () => { void browser.runtime.sendMessage({ target: 'vault-event', type: 'webdav-pending' }).catch(() => undefined); };
 
 async function digestHex(bytes: Uint8Array<ArrayBuffer>) {
@@ -534,7 +539,7 @@ export class VaultController {
         const files = edited ? { ...existing!, packRules: rulesUnchanged ? view.rules : await sealPackRules(session, localRules) }
           : applyPackFiles({ ...existing, vaultId: version.vaultId, keyEpoch, head: view.head, snap: view.snap,
             updatedAtMs: Date.now(), changesSinceBackup: existing?.changesSinceBackup ?? 0 }, view);
-        await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, initialized.offsetSeconds, check);
+        await saveDavConnection(provedPackConnection(config, transport), session, files.vaultId, initialized.offsetSeconds, check);
         await store.saveRemoteAnchor(anchor, files, clock, !existing);
         check();
         this.files = files;
@@ -586,7 +591,7 @@ export class VaultController {
       check();
       const files = applyPackFiles({ ...existing, vaultId, keyEpoch, head: view.head, snap: view.snap,
         updatedAtMs: Date.now(), changesSinceBackup: existing?.changesSinceBackup ?? 0 }, view);
-      await saveDavConnection({ ...config, writeVerified: true }, session, vaultId, initialized.offsetSeconds, check);
+      await saveDavConnection(provedPackConnection(config, transport), session, vaultId, initialized.offsetSeconds, check);
       await store.saveRemoteAnchor(newPackAnchor(endpoint, listing, version, view, head, 'applied'), files, journal.state, !existing);
       check();
       this.files = files;
@@ -784,7 +789,7 @@ export class VaultController {
     let writeVerified = false;
     if (session && state.saved && !state.paused && !anchor.localRestoreHeld) {
       check();
-      const config = await openSavedDav(session, files.vaultId);
+      const config = await openSavedDav(session, files.vaultId, anchor.pack ? 'pack' : 'legacy');
       try { writeVerified = config.writeVerified === true && anchor.endpoint === await endpointFingerprint(config.url); }
       finally { config.password = ''; config.username = ''; }
     }
@@ -850,7 +855,7 @@ export class VaultController {
     if (state.paused) return { kind: 'paused', pending: anchor.pack ? hasPendingPackWork(anchor) :
       !!anchor.draftCount || await store.hasPendingWal(files.vaultId) };
     check();
-    const config = await openSavedDav(session, files.vaultId);
+    const config = await openSavedDav(session, files.vaultId, anchor.pack ? 'pack' : 'legacy');
     const signal = this.davAbort.signal;
     const connection = this.davRequests.context(config, { check, signal });
     if (anchor.pack) {
@@ -1023,7 +1028,7 @@ export class VaultController {
     if (!anchor) throw new Error('请先连接远端密码库。');
     await requireDavHealthy();
     check();
-    const config = await openSavedDav(session, files.vaultId);
+    const config = await openSavedDav(session, files.vaultId, anchor.pack ? 'pack' : 'legacy');
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
       const context = this.davRequests.context(config, { check, signal: this.davAbort.signal });
@@ -1134,12 +1139,13 @@ export class VaultController {
     await this.verifyMaster({ method: 'master', secret: message.masterPassword }, check);
     await requireDavHealthy();
     check();
-    const config = await openSavedDav(session, files.vaultId);
+    const config = await openSavedDav(session, files.vaultId, anchor.pack ? 'pack' : 'legacy');
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
       const context = this.davRequests.context(config, { check, signal: this.davAbort.signal });
       if (anchor.pack) this.packRevision++;
-      if (config.writeVerified) await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, check);
+      clearDavWriteProof(config);
+      await saveDavConnection(config, session, files.vaultId, undefined, check);
       if (anchor.pack) {
         const material = await packMaterial(session);
         try {
@@ -1151,7 +1157,7 @@ export class VaultController {
           check();
           await transport.verifyWrites(material, version);
           check();
-          await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, context.check);
+          await saveDavConnection(provedPackConnection(config, transport), session, files.vaultId, undefined, context.check);
           this.davRequests.reset();
           if (anchor.localRestoreHeld)
             await store.saveRemoteAnchor({ ...anchor, localRestoreHeld: undefined }, files, undefined, false, false);

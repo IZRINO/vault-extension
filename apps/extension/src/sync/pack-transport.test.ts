@@ -41,6 +41,9 @@ function server(root = '/dav/') {
         if (!folders.has(new URL('..', new URL(path, cfg.url)).pathname)) return new Response(null, { status: 409 });
         folders.add(path);
         return new Response(null, { status: 201 });
+      case 'HEAD':
+        if (!file) return new Response(null, { status: 404 });
+        return new Response(null, { headers: { ETag: file.etag, 'Content-Length': String(file.bytes.length) } });
       case 'GET':
         if (!file) return new Response(null, { status: 404 });
         if (headers.get('If-None-Match') === file.etag) return new Response(null, { status: 304 });
@@ -63,7 +66,105 @@ function server(root = '/dav/') {
   return { fetcher, files, folders, requests };
 }
 
+// This service accepts a second conditional PUT, as observed on Koofr.
+// MOVE's destination protection is independent of the PUT behavior.
+function replacingPutServer(root = '/dav/Koofr/') {
+  const dav = server(root);
+  const moves: { source: string; destination: string; status: number }[] = [];
+  let nextTag = 0;
+  const behavior = { replaceOnMove: false, noMove: false, loseReplyTo: '', ignoreIfMatchDelete: false };
+  const request: typeof fetch = async (input, init) => {
+    const url = new URL(String(input)), location = url.pathname, headers = new Headers(init?.headers);
+    if (init?.method === 'DELETE' && behavior.ignoreIfMatchDelete) {
+      if (!dav.files.has(location)) return new Response(null, { status: 404 });
+      dav.files.delete(location);
+      return new Response(null, { status: 204 });
+    }
+    if (init?.method === 'PUT' && headers.get('If-None-Match') === '*') {
+      headers.delete('If-None-Match');
+      return dav.fetcher(input, { ...init, headers });
+    }
+    if (init?.method !== 'MOVE') return dav.fetcher(input, init);
+    const destination = new URL(headers.get('Destination')!);
+    expect(destination.origin).toBe(url.origin);
+    expect(destination.pathname.slice(0, destination.pathname.lastIndexOf('/'))).toBe(location.slice(0, location.lastIndexOf('/')));
+    expect(headers.get('Overwrite')).toBe('F');
+    const source = dav.files.get(location), previous = dav.files.get(destination.pathname);
+    const status = behavior.noMove ? 405 : !source ? 404 : source.etag !== headers.get('If-Match') ? 412 :
+      previous && !behavior.replaceOnMove ? 412 : previous ? 204 : 201;
+    moves.push({ source: location, destination: destination.pathname, status });
+    if (status === 201 || status === 204) {
+      dav.files.set(destination.pathname, { bytes: source!.bytes.slice(), etag: `"moved-${++nextTag}"` });
+      dav.files.delete(location);
+      if (destination.pathname === behavior.loseReplyTo) {
+        behavior.loseReplyTo = '';
+        throw new TypeError('Lost MOVE response');
+      }
+    }
+    return new Response(null, { status });
+  };
+  return { ...dav, behavior, moves, request };
+}
+
 describe('WebDAV encrypted packs', () => {
+  it('preserves another writer’s initial package if it appears after the preflight GET', async () => {
+    const dav = replacingPutServer();
+    const genesis = await preparePackVersion({ ...genesisInput, packageEncoding: 'json' }, payload);
+    const path = `${koofrFolder}packages/p_${genesis.id}.json`;
+    const other = { bytes: new TextEncoder().encode('{"ciphertext":"AQIDBA=="}'), etag: '"existing-concurrent-pack"' };
+    let raced = false;
+    const request: typeof fetch = (target, init) => {
+      const destination = new Headers(init?.headers).get('Destination');
+      if (!raced && ((init?.method === 'PUT' && new URL(String(target)).pathname === path) ||
+          (init?.method === 'MOVE' && destination && new URL(destination).pathname === path))) {
+        raced = true;
+        dav.files.set(path, other);
+      }
+      return dav.request(target, init);
+    };
+    await expect(new PackTransport(koofr, {}, request).create(material, genesis, payload)).rejects.toBeInstanceOf(PackIntegrityError);
+    expect(raced).toBe(true);
+    expect(dav.files.get(path)).toBe(other);
+    expect(dav.files.has(koofrFolder + 'pack-root.txt')).toBe(false);
+  });
+
+  it('resumes a staged Koofr JSON pack and publishes a successor without replacing either device’s data', async () => {
+    const dav = replacingPutServer();
+    const genesis = await preparePackVersion({ ...genesisInput, packageEncoding: 'json' }, payload);
+    const childBytes = Uint8Array.of(11, 22);
+    const child = await preparePackVersion({ ...genesisInput, head: undefined, packageEncoding: 'json',
+      id: 'b'.repeat(32), parents: [genesis.id] }, childBytes);
+    const root = `${koofrFolder}pack-root.txt`, staged = `${koofrFolder}packages/p_${genesis.id}.json`;
+    for (const dir of ['', 'versions/', 'packages/']) dav.folders.add(koofrFolder + dir);
+    const original = { bytes: new TextEncoder().encode('{"ciphertext":"/wCLQg=="}'), etag: '"staged-by-previous-client"' };
+    dav.files.set(staged, original);
+    const writer = new PackTransport(koofr, {}, dav.request);
+    await writer.create(material, genesis, payload);
+    await writer.publish(material, child, childBytes);
+    expect(dav.files.get(staged)).toBe(original);
+    const published = [root, `${koofrFolder}packages/p_${child.id}.json`, `${koofrFolder}versions/v_${child.id}.txt`];
+    expect(dav.moves.filter(move => published.includes(move.destination) && move.status === 201).map(move => move.destination)).toEqual(published);
+    expect(dav.requests.filter(row => row.method === 'PUT' && published.includes(row.path))).toEqual([]);
+    const peer = new PackTransport(koofr, {}, dav.request);
+    const listing = await peer.list(material, vaultId);
+    expect(listing.tips.map(v => v.id)).toEqual([child.id]);
+    await expect(peer.download(listing.tips[0]!)).resolves.toEqual(childBytes);
+  });
+
+  it('enables Koofr uploads when DELETE ignores If-Match but MOVE keeps an existing file', async () => {
+    const dav = replacingPutServer();
+    dav.behavior.ignoreIfMatchDelete = true;
+    const genesis = await preparePackVersion({ ...genesisInput, packageEncoding: 'json' }, payload);
+    const writer = new PackTransport(koofr, {}, dav.request);
+    await writer.create(material, genesis, payload);
+    expect(writer.verifiedWriteMode).toBe('move');
+    const names = [...dav.files.keys()];
+    expect(names.some(name => name.includes('pack_verify_'))).toBe(false);
+    expect(names).toContain(`${koofrFolder}pack-root.txt`);
+    expect(dav.moves.some(move => move.destination === `${koofrFolder}pack-root.txt` && move.status === 201)).toBe(true);
+    expect(dav.requests.some(row => row.method === 'PUT' && row.path === `${koofrFolder}pack-root.txt`)).toBe(false);
+  });
+
   it('publishes a Koofr package and probes as JSON and reads back the original ciphertext', async () => {
     const dav = server('/dav/Koofr/');
     const packagePath = `${koofrFolder}packages/p_${genesisId}.json`;
@@ -112,7 +213,8 @@ describe('WebDAV encrypted packs', () => {
     const failed = new PackTransport(koofr, {}, badRead).create(material, genesis, payload);
     await expect(failed).rejects.toBeInstanceOf(PackIntegrityError);
     await expect(failed).rejects.toThrow(error);
-    expect(dav.requests.filter(row => row.method === 'PUT' || row.method === 'DELETE')).toEqual([{ method: 'PUT', path: packagePath }]);
+    expect(dav.requests.filter(row => row.path === packagePath && row.method === 'PUT')).toHaveLength(1);
+    expect(dav.requests.some(row => row.path === `${koofrFolder}pack-root.txt` && row.method === 'PUT')).toBe(false);
     await expect(reader.joinCandidates()).resolves.toEqual([]);
 
     await new PackTransport(koofr, {}, dav.fetcher).create(material, genesis, payload);
@@ -170,7 +272,7 @@ describe('WebDAV encrypted packs', () => {
     expect(reader.stats.packageDownloadBytes).toBe(wire.length);
   });
 
-  it('reads back the real package before proving writes in the selected directory and committing genesis', async () => {
+  it('proves writes in the selected directory, then stages and reads back the real package before committing genesis', async () => {
     const dav = server();
     const genesis = await genesisVersion();
     const writer = new PackTransport(cfg, {}, dav.fetcher);
@@ -180,10 +282,10 @@ describe('WebDAV encrypted packs', () => {
     const packageRead = dav.requests.findIndex((row, at) => at > packageWrite && row.path === packagePath && row.method === 'GET');
     const firstProbeWrite = dav.requests.findIndex(row => row.path.startsWith('/dav/vault/pack_verify_') && row.method === 'PUT');
     const rootWrite = dav.requests.findIndex(row => row.path === '/dav/vault/pack-root.txt' && row.method === 'PUT');
-    expect(packageWrite).toBeGreaterThan(-1);
+    expect(firstProbeWrite).toBeGreaterThan(-1);
+    expect(packageWrite).toBeGreaterThan(firstProbeWrite);
     expect(packageRead).toBeGreaterThan(packageWrite);
-    expect(firstProbeWrite).toBeGreaterThan(packageRead);
-    expect(rootWrite).toBeGreaterThan(firstProbeWrite);
+    expect(rootWrite).toBeGreaterThan(packageRead);
     expect(dav.requests.every(request => request.path.startsWith('/dav/vault/'))).toBe(true);
     expect([...dav.files.keys()].sort()).toEqual(['/dav/vault/pack-root.txt', packagePath]);
     const start = dav.requests.length;
@@ -279,7 +381,7 @@ describe('WebDAV encrypted packs', () => {
       await expect(new PackTransport(cfg, {}, request).list(material, vaultId, known)).rejects.toBeInstanceOf(PackIntegrityError);
     });
 
-  it('reports signed and actual lengths before writing any probes when the first real pack reads back empty', async () => {
+  it('reports signed and actual lengths and publishes no root when the first real pack reads back empty', async () => {
     const dav = server(), genesis = await genesisVersion();
     const packagePath = `/dav/vault/packages/p_${genesis.id}.bin`;
     const request: typeof fetch = async (input, init) => {
@@ -288,7 +390,8 @@ describe('WebDAV encrypted packs', () => {
       return response;
     };
     await expect(new PackTransport(cfg, {}, request).create(material, genesis, payload)).rejects.toThrow(/4 字节.*0 字节/);
-    expect(dav.requests.filter(row => row.method === 'PUT' || row.method === 'DELETE')).toEqual([{ method: 'PUT', path: packagePath }]);
+    expect(dav.requests.filter(row => row.path === packagePath && row.method === 'PUT')).toHaveLength(1);
+    expect(dav.requests.some(row => row.path === '/dav/vault/pack-root.txt' && row.method === 'PUT')).toBe(false);
     expect([...dav.files.keys()]).toEqual([packagePath]);
   });
 
@@ -411,7 +514,7 @@ describe('WebDAV encrypted packs', () => {
     await expect(writer.create(material, genesis, payload)).rejects.toThrow(/HTTP 405/);
     expect(dav.requests.some(row => row.method === 'PUT' && /^\/dav\/vault\/pack_verify_.*\.txt$/.test(row.path))).toBe(true);
     expect(dav.requests.some(row => row.method === 'PUT' && row.path === '/dav/vault/pack-root.txt')).toBe(false);
-    expect([...dav.files.keys()]).toEqual([`/dav/vault/packages/p_${genesis.id}.bin`]);
+    expect([...dav.files.keys()]).toEqual([]);
   });
 
   it('requires the proof endpoint to list both sibling records alongside the last committed version', async () => {
@@ -430,7 +533,7 @@ describe('WebDAV encrypted packs', () => {
     await expect(new PackTransport(cfg, {}, request).create(material, genesis, payload))
       .rejects.toThrow(/独立版本记录/);
     expect(dav.requests.some(row => row.path === '/dav/vault/pack-root.txt' && row.method === 'PUT')).toBe(false);
-    expect([...dav.files.keys()]).toEqual([`/dav/vault/packages/p_${genesis.id}.bin`]);
+    expect([...dav.files.keys()]).toEqual([]);
   });
 
   it('uses only the root and one directory query at idle when known records have stable strong versions', async () => {
@@ -508,7 +611,7 @@ describe('WebDAV encrypted packs', () => {
     await expect(writer.create(material, genesis, payload)).rejects.toThrow(/已有文件/);
     expect(dav.requests.some(row => row.path === '/dav/vault/pack-root.txt' && row.method === 'PUT')).toBe(false);
     expect(dav.files.get(legacyPath)).toEqual({ bytes: Uint8Array.of(42), etag: '"legacy"' });
-    expect([...dav.files.keys()]).toEqual([`/dav/vault/packages/p_${genesis.id}.bin`, legacyPath]);
+    expect([...dav.files.keys()]).toEqual([legacyPath]);
   });
 
   it('uses one root claim when two vaults create in the same directory simultaneously', async () => {

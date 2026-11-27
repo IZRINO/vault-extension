@@ -14,7 +14,7 @@ export interface WebDavInput {
   confirmHttp?: boolean;
 }
 
-export interface WebDavConfig { url: string; username: string; password: string; writeVerified?: boolean }
+export interface WebDavConfig { url: string; username: string; password: string; writeVerified?: boolean; packWriteMode?: 'move' }
 export type DavStopStatus = 401 | 403 | 429;
 export type DavProbe = { kind: 'empty' | 'existing' | 'incomplete' | 'missing'; offsetSeconds: number | null; writeAllowed: false; format?: 'pack' };
 export interface DavEntry { name: string; collection: boolean; etag?: string; bytes?: number }
@@ -27,6 +27,7 @@ export interface DavContext {
 }
 
 export interface DavObject { bytes: Uint8Array<ArrayBuffer>; etag?: string }
+type PutCondition = { absent: true } | { match: string };
 export const davSnapshotName = /^snap_[0-9a-f]{14}_[0-9a-f]{8}_[0-9a-f]{14}\.bin$/;
 export const davWalName = /^[0-9a-f]{14}_[0-9a-f]{8}_[0-9a-f]{14}\.bin$/;
 export const davPackRecordName = /^v_[0-9a-f]{32}\.txt$/;
@@ -53,6 +54,7 @@ const unexpected = (response: Response) => new WebDavHttpError(response.status);
 export class WebDavContentError extends Error {}
 export class WebDavLimitError extends WebDavContentError {}
 export class WebDavNetworkError extends Error {}
+const incompleteMoveRead = (status: number) => new WebDavContentError(`移动校验未收到完整文件响应（HTTP ${status}）。`);
 
 class WebDavReadError extends WebDavContentError {
   constructor(readonly declared: number, readonly received: number, hint = '') {
@@ -279,15 +281,82 @@ export class WebDavClient {
     return { bytes, etag: strongTag(response.headers.get('ETag')) };
   }
 
-  async put(name: string, bytes: Uint8Array<ArrayBuffer>, condition: { absent: true } | { match: string }) {
+  private async conditionalPut(name: string, bytes: Uint8Array<ArrayBuffer>, condition: PutCondition) {
     if (!davObjectPath(name) || ('match' in condition && !strongTag(condition.match))) throw malformed();
     const contentType = name.endsWith('.json') ? 'application/json; charset=utf-8'
       : name.endsWith('.txt') ? 'text/plain; charset=utf-8' : 'application/octet-stream';
     const response = await this.send(name, 'PUT', { 'Content-Type': contentType,
       ...('match' in condition ? { 'If-Match': condition.match } : { 'If-None-Match': '*' }) }, bytes);
     discard(response);
+    return response;
+  }
+
+  async put(name: string, bytes: Uint8Array<ArrayBuffer>, condition: PutCondition) {
+    const response = await this.conditionalPut(name, bytes, condition);
     if (response.status === 412) return false;
     if (![200, 201, 204].includes(response.status)) throw unexpected(response);
+    return true;
+  }
+
+  private async moveFileExists(name: string) {
+    const response = await this.send(name, 'HEAD', {});
+    discard(response);
+    checkDav(this.context);
+    if (response.status === 404) return false;
+    if (response.status !== 200) throw response.ok ? incompleteMoveRead(response.status) : unexpected(response);
+    return true;
+  }
+
+  private async verifyMoveBytes(name: string, bytes: Uint8Array<ArrayBuffer>) {
+    try {
+      const object = await this.get(name, bytes.length);
+      checkDav(this.context);
+      if (!object || object === 'unchanged' || !sameBytes(object.bytes, bytes))
+        throw new WebDavContentError('网盘移动时读回的文件与预期内容不符。');
+      return object.etag;
+    } catch (error) {
+      if (error instanceof WebDavHttpError && error.status >= 200 && error.status < 300) throw incompleteMoveRead(error.status);
+      throw error;
+    }
+  }
+
+  async createByMove(name: string, bytes: Uint8Array<ArrayBuffer>,
+    onRetainedSource?: (name: string, etag: string) => void): Promise<boolean> {
+    const slash = name.lastIndexOf('/') + 1, directory = name.slice(0, slash), file = name.slice(slash);
+    const permitted = name === DAV_PACK_ROOT || (!directory && davPackProbeName.test(file)) ||
+      (directory === 'versions/' && (davPackRecordName.test(file) || isDavPackProbeIn(file, directory))) ||
+      (directory === 'packages/' && (davPackPackageName.test(file) || isDavPackProbeIn(file, directory)));
+    if (!permitted) throw malformed();
+    const source = `${directory}pack_verify_${crypto.randomUUID().replaceAll('-', '')}${file.slice(file.lastIndexOf('.'))}`;
+    const occupied = () => new WebDavContentError('网盘的临时文件名已被占用。');
+    if (source === name || await this.moveFileExists(source)) throw occupied();
+    const upload = await this.conditionalPut(source, bytes, { absent: true });
+    checkDav(this.context);
+    if (upload.status !== 201) {
+      if (upload.status === 412) throw occupied();
+      if (upload.ok) throw new WebDavContentError(`网盘未确认新建临时文件（HTTP ${upload.status}）。`);
+      throw unexpected(upload);
+    }
+    const etag = await this.verifyMoveBytes(source, bytes);
+    if (!etag) throw new WebDavContentError('临时文件缺少强版本标签（ETag）。');
+    const response = await this.send(source, 'MOVE', {
+      Destination: new URL(name, this.config.url).href, Overwrite: 'F', 'If-Match': etag,
+    });
+    discard(response);
+    checkDav(this.context);
+    if (response.status === 412) {
+      // If-Match on the source can also fail. A 412 alone does not prove a competing creation.
+      if (await this.verifyMoveBytes(source, bytes) !== etag || !await this.moveFileExists(name))
+        throw new WebDavContentError('网盘拒绝移动，但无法验证原临时文件和已存在的目标。');
+      onRetainedSource?.(source, etag);
+      return false;
+    }
+    if (response.status !== 201) {
+      if (response.ok) throw new WebDavContentError(`网盘未确认独占创建移动目标（HTTP ${response.status}）。`);
+      throw unexpected(response);
+    }
+    if (await this.moveFileExists(source)) throw new WebDavContentError('网盘报告移动成功，但临时文件仍然存在。');
+    await this.verifyMoveBytes(name, bytes);
     return true;
   }
 

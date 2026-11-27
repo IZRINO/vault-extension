@@ -237,7 +237,34 @@ function buildGraph(root: PackVersion, versions: PackVersion[], known: readonly 
   return { versions: ordered, tips };
 }
 
-async function provePackWrites(config: WebDavConfig, context: DavContext, request: typeof fetch, encoding: PackVersion['packageEncoding']) {
+type PackWriteMode = 'put' | 'move';
+const proofFailure = (details: string) => new Error(`网盘未通过整包写入验证。${details}密码库目录仍只读。`);
+class PutDidNotProtectDestination extends Error {}
+
+async function provePackWrites(config: WebDavConfig, context: DavContext, request: typeof fetch, encoding: PackVersion['packageEncoding'],
+  previous?: PackWriteMode): Promise<PackWriteMode> {
+  if (previous !== 'move') {
+    try {
+      await provePackMethod(config, context, request, encoding, 'put');
+      return 'put';
+    } catch (error) {
+      if (!(error instanceof PutDidNotProtectDestination)) throw error;
+    }
+  }
+  try {
+    await provePackMethod(config, context, request, encoding, 'move');
+    return 'move';
+  } catch (error) {
+    if (error instanceof WebDavContentError)
+      throw proofFailure(`网盘未能用 MOVE 安全创建文件。${error.message}`);
+    if (error instanceof WebDavHttpError && [405, 501].includes(error.status))
+      throw proofFailure(`网盘拒绝了禁止覆盖的 MOVE（HTTP ${error.status}）。`);
+    throw error;
+  }
+}
+
+async function provePackMethod(config: WebDavConfig, context: DavContext, request: typeof fetch,
+  encoding: PackVersion['packageEncoding'], mode: PackWriteMode) {
   let stopped: WebDavStop | undefined;
   let canClean = true;
   const client = new WebDavClient(config, { ...context,
@@ -248,9 +275,14 @@ async function provePackWrites(config: WebDavConfig, context: DavContext, reques
       return context.stop?.(status);
     },
   }, request);
-  const failure = (details: string) => new Error(`网盘未通过整包写入验证。${details}密码库目录仍只读。`);
-  const duplicate = () => failure('网盘允许重复创建已有测试文件，可能覆盖其他设备的写入。');
+  const failure = proofFailure;
+  const duplicate = () => mode === 'put' ? new PutDidNotProtectDestination() :
+    failure('网盘未能通过禁止覆盖的 MOVE 保留已有测试文件。');
   const probes = new Map<string, { expected: Uint8Array<ArrayBuffer>; limit: number; etag?: string }>();
+  const create = (path: string, bytes: Uint8Array<ArrayBuffer>) => mode === 'put' ?
+    client.put(path, bytes, { absent: true }) : client.createByMove(path, bytes, (source, etag) => {
+      probes.set(source, { expected: bytes, limit: bytes.length, etag });
+    });
   const text = () => encoder.encode(`Vault WebDAV pack test ${crypto.randomUUID()}\n`);
   const sample = () => crypto.getRandomValues(new Uint8Array(32));
   const packageExt = packageExtension(encoding);
@@ -267,7 +299,7 @@ async function provePackWrites(config: WebDavConfig, context: DavContext, reques
         throw error;
       }
     };
-    if (await read() !== undefined || !await client.put(name, expected, { absent: true }))
+    if (await read() !== undefined || !await create(name, expected))
       throw failure('网盘报告同名测试文件已存在。');
     // A lost initial PUT response leaves an unowned object; never clean it by name alone.
     const owned = { expected, limit, etag: undefined as string | undefined };
@@ -280,7 +312,7 @@ async function provePackWrites(config: WebDavConfig, context: DavContext, reques
     if (!first.etag) throw failure('网盘未返回探针的强版本标签（ETag）。');
     owned.etag = first.etag;
     try {
-      if (await client.put(name, alternate, { absent: true })) {
+      if (await create(name, alternate)) {
         owned.expected = alternate;
         owned.etag = undefined;
         throw duplicate();
@@ -291,7 +323,10 @@ async function provePackWrites(config: WebDavConfig, context: DavContext, reques
     }
     const after = await read();
     if (!after || after === 'unchanged' || after.etag !== first.etag || !equals(after.bytes, expected)) throw duplicate();
-    if (await client.delete(name, `"never-${id}"`)) {
+    // Koofr deletes even when If-Match is wrong, so sending this probe would remove the
+    // file and could never pass. Exclusive MOVE already refused the second create.
+    // Versions are merged before a later upload; concurrent sync is not expected.
+    if (!config.url.startsWith(davPresets.koofr) && await client.delete(name, `"never-${id}"`)) {
       canClean = false;
       throw failure('网盘允许用错误版本标签删除测试文件。');
     }
@@ -349,8 +384,11 @@ async function provePackWrites(config: WebDavConfig, context: DavContext, reques
     await probe(right.id, 'packages/', encodePackage(another, encoding));
     const commits = await Promise.allSettled([probe(left.id, 'versions/', records[1]!), probe(right.id, 'versions/', records[2]!)]);
     const rejected = commits.find(result => result.status === 'rejected');
-    if (rejected) throw stopped ?? rejected.reason;
-    if (await client.put(recordProbePath(left), records[1]!, { absent: true })) throw duplicate();
+    if (rejected) {
+      const serious = commits.find(result => result.status === 'rejected' && !(result.reason instanceof PutDidNotProtectDestination));
+      throw stopped ?? (serious?.status === 'rejected' ? serious.reason : rejected.reason);
+    }
+    if (await create(recordProbePath(left), records[1]!)) throw duplicate();
     await discover([root, left, right]);
     for (const [name, object] of probes) {
       await remove(name, object.etag!, object.limit);
@@ -386,12 +424,12 @@ async function readMetadata<T>(request: Promise<T>, knownRecord = false): Promis
 export class PackTransport {
   readonly stats = { metadataBytes: 0, packageDownloadBytes: 0, packageUploadBytes: 0 };
   private readonly client: WebDavClient;
-  private writeAllowed: boolean;
+  private writeMode?: PackWriteMode;
   private verified = new Map<string, PackVersion>();
   private verifiedBytes = 0;
 
   constructor(private readonly config: WebDavConfig, private readonly context: DavContext, private readonly request = fetch) {
-    this.writeAllowed = config.writeVerified === true;
+    if (config.writeVerified === true) this.writeMode = config.packWriteMode === 'move' ? 'move' : 'put';
     this.client = new WebDavClient(config, { ...context, observeRead: (path, bytes) => {
       if (path.startsWith('packages/') && path !== 'packages/') this.stats.packageDownloadBytes += bytes;
       else this.stats.metadataBytes += bytes;
@@ -402,6 +440,8 @@ export class PackTransport {
   get newPackageEncoding(): PackVersion['packageEncoding'] {
     return this.config.url.startsWith(davPresets.koofr) ? 'json' : undefined;
   }
+
+  get verifiedWriteMode() { return this.writeMode; }
 
   private async root(allowLegacy: boolean, hasKnown = false, knownRoot?: PackVersion) {
     // A previously authenticated root supplies the directory identity. Check it
@@ -534,29 +574,42 @@ export class PackTransport {
     return ciphertext;
   }
 
-  private async stage(version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>) {
+  private async createFile(name: string, bytes: Uint8Array<ArrayBuffer>, mode: PackWriteMode) {
+    if (mode === 'put') return this.client.put(name, bytes, { absent: true });
+    try { return await this.client.createByMove(name, bytes); }
+    catch (error) {
+      if (error instanceof WebDavContentError) throw new PackIntegrityError(error.message, { cause: error });
+      throw error;
+    }
+  }
+
+  private async stage(version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>, mode: PackWriteMode) {
     // A timeout or partial startup may leave the uniquely named package behind.
     // Read it before issuing an exclusive PUT, even if PROPFIND missed it.
     if (await this.readPackage(version)) return;
     const wire = encodePackage(ciphertext, version.packageEncoding);
-    if (await this.client.put(packagePath(version), wire, { absent: true }))
+    if (await this.createFile(packagePath(version), wire, mode)) {
       this.stats.packageUploadBytes += wire.length;
+      // MOVE has already compared the destination to this verified wire representation.
+      if (mode === 'move') return;
+    }
     await this.download(version);
   }
 
   async verifyWrites(material: Uint8Array, version: PackVersion) {
-    this.writeAllowed = false;
+    const previous = this.writeMode;
+    this.writeMode = undefined;
     const folder = await this.client.list();
     if (!folder || !rootLayout(folder.entries)) throw malformed();
     await this.list(material, version.vaultId, [version]);
     await this.download(version);
-    await provePackWrites(this.config, this.context, this.request, version.packageEncoding);
-    this.writeAllowed = true;
+    this.writeMode = await provePackWrites(this.config, this.context, this.request, version.packageEncoding, previous);
     return true;
   }
 
   async publish(material: Uint8Array, version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>) {
-    if (!this.writeAllowed) throw new Error('网盘尚未通过整包写入验证，密码库目录仍只读。');
+    const mode = this.writeMode;
+    if (!mode) throw new Error('网盘尚未通过整包写入验证，密码库目录仍只读。');
     if (!version.parents.length) throw malformed();
     versionData(version);
     await this.checkPackage(version, ciphertext, 'local');
@@ -571,9 +624,9 @@ export class PackTransport {
     // Reserve room for other devices that are already preparing independent commits.
     if (listing.versions.length + WRITE_RESERVE >= MAX_VERSIONS ||
         this.verifiedBytes + record.length + WRITE_RESERVE * MAX_RECORD_BYTES > MAX_TOTAL_RECORD_BYTES) throw bounded();
-    await this.stage(version, ciphertext);
+    await this.stage(version, ciphertext, mode);
     const path = recordPath(version.id);
-    await this.client.put(path, record, { absent: true });
+    await this.createFile(path, record, mode);
     const committed = await readMetadata(this.client.get(path, MAX_RECORD_BYTES), true);
     if (!committed || committed === 'unchanged' || !equals(committed.bytes, record))
       throw new PackIntegrityError('无法认证刚发布的整包版本记录。已保留本机修改。');
@@ -590,7 +643,9 @@ export class PackTransport {
     if (genesis.parents.length || !genesis.head) throw malformed();
     const bytes = await encodeRecord(material, genesis);
     await this.checkPackage(genesis, ciphertext, 'local');
-    const proof = () => provePackWrites(this.config, this.context, this.request, genesis.packageEncoding);
+    const previousMode = this.writeMode;
+    this.writeMode = undefined;
+    const proof = () => provePackWrites(this.config, this.context, this.request, genesis.packageEncoding, previousMode);
     const checkChildren = async (entries: readonly DavEntry[], requireBoth: boolean) => {
       const has = (name: string) => entries.some(entry => entry.collection && entry.name === name);
       if (requireBoth || has('versions')) {
@@ -617,8 +672,7 @@ export class PackTransport {
       return { folder, committed: false };
     };
     const confirmExisting = async (offsetSeconds: number | null) => {
-      if (!this.writeAllowed) await proof();
-      this.writeAllowed = true;
+      this.writeMode = previousMode ?? await proof();
       return { offsetSeconds };
     };
     let before = await inspect();
@@ -641,18 +695,18 @@ export class PackTransport {
       if (prepared.committed) return confirmExisting(prepared.folder!.offsetSeconds);
       await checkChildren(prepared.folder?.entries ?? [], true);
     }
-    await this.stage(genesis, ciphertext);
-    await proof();
+    const mode = await proof();
     const after = await inspect();
     if (after.committed) {
-      this.writeAllowed = true;
+      this.writeMode = mode;
       return { offsetSeconds: after.folder!.offsetSeconds };
     }
     if (!after.folder) throw malformed();
     const versions = await this.client.list('versions/');
     if (!versions || packContents(versions.entries, 'versions/').length) throw occupied();
+    await this.stage(genesis, ciphertext, mode);
     let uncertain: unknown;
-    try { await this.client.put(DAV_PACK_ROOT, bytes, { absent: true }); }
+    try { await this.createFile(DAV_PACK_ROOT, bytes, mode); }
     catch (error) {
       if (!uncertainWrite(error)) throw error;
       uncertain = error;
@@ -662,7 +716,7 @@ export class PackTransport {
     if (current === 'unchanged' || !equals(current.bytes, bytes)) throw occupied();
     const committed = await this.client.list();
     if (!committed || !rootLayout(committed.entries)) throw malformed();
-    this.writeAllowed = true;
+    this.writeMode = mode;
     return { offsetSeconds: committed.offsetSeconds };
   }
 }

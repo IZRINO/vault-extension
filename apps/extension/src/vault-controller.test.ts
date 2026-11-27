@@ -209,7 +209,7 @@ const davListing = (path: string, date?: number) => new Response(`<multistatus x
   '<prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>',
   { status: 207, headers: date === undefined ? {} : { Date: new Date(date).toUTCString() } });
 
-async function linkedPack() {
+async function linkedPack(packWriteMode?: 'move') {
   const controller = await unlocked();
   const session = state.session!, files = state.files!, config = webDavConfig(packInput);
   const remote = wasm_sync_create_genesis(session.key, session.wrap, files.head, files.snap, '00000000000001_01020304_00000000000001');
@@ -225,7 +225,7 @@ async function linkedPack() {
   state.packAnchor = { vaultId: files.vaultId, endpoint: await endpointFingerprint(config.url), head, snap: files.snap, objects: [],
     appliedHead: files.head, appliedSnap: files.snap, hasRecords: false, pack: { base: root.id, known: [root], dirty: false,
       baseRules: new Uint8Array(), baseConflicts: new Uint8Array(), siteRules: 'applied' } };
-  await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, () => {});
+  await saveDavConnection({ ...config, writeVerified: true, packWriteMode }, session, files.vaultId, undefined, () => {});
   return controller;
 }
 
@@ -531,8 +531,66 @@ describe('real WASM + background session integration', () => {
     } finally { release.resolve(); await controller.lock(); request.mockRestore(); }
   });
 
-  it('revokes writing on a short published root in history, including an ongoing sync and a reopened worker', async () => {
+  it('reopens an exclusive MOVE proof without giving an older extension a conditional PUT proof', async () => {
+    const controller = await linkedPack('move');
+    try {
+      const { key, wrap } = state.session!;
+      const seal = state.local.webDavSealed as { bytes: number[] };
+      const decoded = JSON.parse(wasm_open_webdav(key, wrap, new Uint8Array(seal.bytes)));
+      expect(decoded).toMatchObject({ packWriteMode: 'move', writeVerified: false });
+      await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({ format: 'pack', writeVerified: true });
+    } finally { await controller.lock(); }
+  });
+
+  it('keeps a legacy vault with pending edits read-only when the connection proved only exclusive MOVE', async () => {
+    const controller = await linkedPack('move');
+    const anchor = state.packAnchor!;
+    state.packAnchor = { ...anchor, pack: undefined, checkedAt: Date.now(), draftCount: 1 };
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => davListing('/pack/wal/'));
+    try {
+      const reopened = new VaultController();
+      await expect(reopened.handle({ type: 'webdav-status' })).resolves.toMatchObject({ linked: true, writeVerified: false });
+      await expect(reopened.handle({ type: 'webdav-scheduled' })).resolves.toEqual({ kind: 'read-only', pending: true });
+      expect(request.mock.calls.map(([url, init]) => [new URL(String(url)).pathname, init?.method])).toEqual([['/pack/wal/', 'PROPFIND']]);
+    } finally { await controller.lock(); request.mockRestore(); }
+  });
+
+  it.each([
+    { packWriteMode: 'future', writeVerified: true },
+    { packWriteMode: 'move', writeVerified: true },
+    { packWriteMode: 'move' },
+  ])('treats unknown or ambiguous sealed write permissions as read-only (%j)', async permission => {
     const controller = await linkedPack();
+    const { key, wrap } = state.session!;
+    const config = { ...webDavConfig(packInput), ...permission };
+    state.local.webDavSealed = { vaultId: fixture.vaultId, bytes: Array.from(wasm_seal_webdav(key, wrap, JSON.stringify(config))) };
+    try {
+      await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({ saved: true, writeVerified: false });
+    } finally { await controller.lock(); }
+  });
+
+  it.each(['failed revalidation', 'saved connection settings', 'resaving the current connection'])('clears the persisted MOVE proof after %s', async change => {
+    const controller = await linkedPack('move');
+    const { key, wrap } = state.session!;
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      change === 'failed revalidation' ? new Response(null, { status: 503 }) : davListing('/pack/'));
+    try {
+      if (change === 'failed revalidation')
+        await expect(controller.handle({ type: 'webdav-enable-write', masterPassword: password })).rejects.toThrow(/503/);
+      else if (change === 'saved connection settings')
+        await expect(controller.handle({ type: 'webdav-test', input: packInput, remember: true })).resolves.toMatchObject({ writeAllowed: false });
+      else
+        await expect(controller.handle({ type: 'webdav-test', remember: true })).resolves.toMatchObject({ writeAllowed: false });
+      const seal = state.local.webDavSealed as { bytes: number[] };
+      const config = JSON.parse(wasm_open_webdav(key, wrap, new Uint8Array(seal.bytes)));
+      expect(config.writeVerified).toBe(false);
+      expect(config).not.toHaveProperty('packWriteMode');
+      await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({ writeVerified: false });
+    } finally { await controller.lock(); request.mockRestore(); }
+  });
+
+  it.each(['put', 'move'] as const)('revokes %s writing on a short published root in history, including an ongoing sync and a reopened worker', async mode => {
+    const controller = await linkedPack(mode === 'move' ? mode : undefined);
     const pack = state.packAnchor!.pack!;
     const cipher = Uint8Array.of(3, 5, 8);
     const version = await preparePackVersion({ id: 'b'.repeat(32), vaultId: fixture.vaultId, parents: [pack.base],
@@ -549,6 +607,9 @@ describe('real WASM + background session integration', () => {
       await started.promise;
       await expect(controller.handle({ type: 'webdav-history' })).rejects.toThrow(/700 字节.*0 字节/);
       await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({ pending: true, writeVerified: false });
+      const { key, wrap } = state.session!;
+      const seal = state.local.webDavSealed as { bytes: number[] };
+      expect(JSON.parse(wasm_open_webdav(key, wrap, new Uint8Array(seal.bytes)))).not.toHaveProperty('packWriteMode');
       release.resolve();
       await syncing;
       expect(request.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(['/pack/pack-root.txt', '/pack/pack-root.txt']);

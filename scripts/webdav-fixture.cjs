@@ -1,25 +1,35 @@
 const { createServer } = require('node:http');
 const { once } = require('node:events');
 
-async function webdavFixture() {
+async function webdavFixture(options = {}) {
   const objects = new Map();
   const folders = new Set(['/dav/', '/dav/scratch/']);
+  if (options.koofrTls) folders.add('/dav/Koofr/');
   const requests = [];
   const transfers = [];
   let generation = 0;
   const state = { failWal: false, rejectNextHeadWrite: false, password: 'fixture-app-password', stopNextProbe: undefined,
-    packCommitFailure: undefined, beforePackCommit: undefined, beforePackList: undefined, failRootPut: false, rootAttempts: [] };
+    packCommitFailure: undefined, beforePackCommit: undefined, beforePackList: undefined, failRootPut: false, rootAttempts: [],
+    ignorePutAbsent: false, move: undefined };
   const row = (path, folder, obj = objects.get(path)) => `<D:response><D:href>${path}</D:href><D:propstat>` +
     `<D:prop><D:resourcetype>${folder ? '<D:collection/>' : ''}</D:resourcetype>` +
     (obj ? `<D:getetag>${obj.tag}</D:getetag><D:getcontentlength>${obj.bytes.length}</D:getcontentlength>` : '') +
     '</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>';
-  const server = createServer(async (req, res) => {
+  const serve = options.koofrTls ? handler => require('node:https').createServer(options.koofrTls, handler) : createServer;
+  const server = serve(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const path = url.pathname;
     if (!/^\/dav\/[a-zA-Z0-9_./-]*$/.test(path) || url.search) { res.writeHead(404).end(); return; }
+    if (options.koofrTls && (req.headers.host !== 'app.koofr.net' || !path.startsWith('/dav/Koofr/'))) {
+      res.writeHead(404).end(); return;
+    }
     requests.push({ method: req.method, path, ifMatch: req.headers['if-match'] });
     const transfer = { method: req.method, path, uploadBytes: 0, downloadBytes: 0 };
     transfers.push(transfer);
+    if (options.koofrTls) {
+      transfer.ifNoneMatch = req.headers['if-none-match'];
+      res.once('finish', () => { transfer.status = res.statusCode; });
+    }
     const auth = 'Basic ' + Buffer.from('fixture-user:' + state.password).toString('base64');
     if (req.headers.authorization !== auth) { res.writeHead(401).end(); return; }
     if (req.method === 'PROPFIND') {
@@ -43,6 +53,10 @@ async function webdavFixture() {
       const parent = path.slice(0, path.lastIndexOf('/', path.length - 2) + 1);
       if (!folders.has(parent)) { res.writeHead(409).end(); return; }
       folders.add(path); res.writeHead(201).end();
+    } else if (req.method === 'HEAD') {
+      const existing = objects.get(path);
+      if (!existing) res.writeHead(404).end();
+      else res.writeHead(200, { ETag: existing.tag, 'Content-Length': existing.bytes.length }).end();
     } else if (req.method === 'GET') {
       const existing = objects.get(path);
       if (!existing) res.writeHead(404).end();
@@ -51,6 +65,28 @@ async function webdavFixture() {
         transfer.downloadBytes = existing.bytes.length;
         res.writeHead(200, { ETag: existing.tag, 'Content-Length': existing.bytes.length }).end(existing.bytes);
       }
+    } else if (req.method === 'MOVE' && state.move) {
+      req.resume();
+      const origin = `${options.koofrTls ? 'https' : 'http'}://${req.headers.host}`;
+      let target;
+      try { target = new URL(req.headers.destination, origin); }
+      catch { res.writeHead(400).end(); return; }
+      const directory = path.slice(0, path.lastIndexOf('/') + 1);
+      if (target.origin !== origin || target.search || target.hash || target.pathname === path ||
+        target.pathname.slice(0, target.pathname.lastIndexOf('/') + 1) !== directory || !folders.has(directory)) {
+        res.writeHead(409).end(); return;
+      }
+      transfer.destination = target.pathname;
+      transfer.overwrite = req.headers.overwrite;
+      const source = objects.get(path);
+      if (!source) { res.writeHead(404).end(); return; }
+      if (req.headers['if-match'] && req.headers['if-match'] !== source.tag) { res.writeHead(412).end(); return; }
+      const existing = objects.has(target.pathname);
+      transfer.destinationExisted = existing;
+      if (existing && transfer.overwrite === 'F' && state.move === 'enforce') { res.writeHead(412).end(); return; }
+      objects.set(target.pathname, { bytes: source.bytes, tag: `"fixture-${++generation}"` });
+      objects.delete(path);
+      res.writeHead(existing && state.move !== 'ignore' ? 204 : 201).end();
     } else if (req.method === 'PUT' || req.method === 'DELETE') {
       if (req.method === 'PUT' && state.failWal && path.includes('/wal/')) { req.resume(); res.writeHead(503).end(); return; }
       const bytes = [];
@@ -69,7 +105,9 @@ async function webdavFixture() {
       const match = req.headers['if-match'];
       const absent = req.headers['if-none-match'] === '*';
       const existing = objects.get(path); // Compare and commit against the state after the request body arrives.
-      if ((match && match !== existing?.tag) || (absent && existing)) { res.writeHead(412).end(); return; }
+      if ((match && match !== existing?.tag) || (absent && existing && !(state.ignorePutAbsent && req.method === 'PUT'))) {
+        res.writeHead(412).end(); return;
+      }
       if (!match && (!absent || req.method === 'DELETE')) { res.writeHead(400).end(); return; }
       if (state.rejectNextHeadWrite && req.method === 'PUT' && match && path === '/dav/vault/head.bin') {
         state.rejectNextHeadWrite = false;
@@ -89,7 +127,7 @@ async function webdavFixture() {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   return {
-    state, requests, transfers, objects, folders,
+    state, requests, transfers, objects, folders, port: server.address().port,
     config: { provider: 'custom', base: `http://127.0.0.1:${server.address().port}/dav/`, folder: 'vault',
       username: 'fixture-user', password: state.password, confirmHttp: true },
     close: () => new Promise(resolve => server.close(resolve)),

@@ -26,14 +26,14 @@ const recordPath = /^\/dav\/vault\/versions\/v_[0-9a-f]{32}\.txt$/;
 const proofPath = /^\/dav\/vault\/(?:versions\/|packages\/)?pack_verify_[0-9a-f]{32}\.(bin|txt)$/;
 const records = dav => [...dav.objects.keys()].filter(key => recordPath.test(key));
 
-async function openBrowser(name, resources, priorProfile) {
+async function openBrowser(name, resources, priorProfile, { install = extension, args = [] } = {}) {
   const profile = priorProfile || await fs.mkdtemp(path.join(os.tmpdir(), 'vault-pack-sync-'));
   if (!priorProfile) resources.profiles.add(profile);
   const context = await chromium.launchPersistentContext(profile, {
     executablePath: browsers[name],
     headless: name !== 'helium' && process.env.VAULT_HEADED !== '1',
     viewport: { width: 400, height: 600 },
-    args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`],
+    args: [`--disable-extensions-except=${install}`, `--load-extension=${install}`, ...args],
   });
   resources.contexts.add(context);
   const worker = context.serviceWorkers().find(worker => worker.url().endsWith('/background.js')) ||
@@ -96,7 +96,7 @@ async function joinFromUi(device, config, method, secret, use) {
   assert.equal(await device.send({ type: 'webdav-site-rules' }), null);
 }
 
-async function enableFromUi(device) {
+async function enableFromUi(device, masterPassword = master) {
   const { view } = device;
   await view.getByRole('button', { name: '设置', exact: true }).click();
   await view.getByRole('button', { name: /^网盘连接/ }).click();
@@ -104,7 +104,7 @@ async function enableFromUi(device) {
   await view.getByRole('button', { name: '验证写入能力', exact: true }).click();
   await expect(view.getByLabel('当前主密码', { exact: true })).toBeVisible();
   await assertNoManualTestDirectory(view);
-  await view.getByLabel('当前主密码', { exact: true }).fill(master);
+  await view.getByLabel('当前主密码', { exact: true }).fill(masterPassword);
   await view.getByRole('button', { name: '验证并启用网盘写入', exact: true }).click();
   await expect(view.getByText('网盘当前只读。上传本机变更前需验证写入。', { exact: true })).toHaveCount(0);
   assert.equal((await status(device)).writeVerified, true);
@@ -554,4 +554,5 @@ async function run() {
   }
 }
 
-run().catch(error => { console.error(error); process.exitCode = 1; });
+module.exports = { openBrowser, enableFromUi };
+if (require.main === module) run().catch(error => { console.error(error); process.exitCode = 1; });

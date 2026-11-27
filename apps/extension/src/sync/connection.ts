@@ -41,6 +41,11 @@ export async function showConflictBadge(count: number) {
   await restoreDavBadge();
 }
 
+export function clearDavWriteProof(config: WebDavConfig) {
+  config.writeVerified = false;
+  delete config.packWriteMode;
+}
+
 async function pauseDav(status: DavStopStatus) {
   await browser.storage.local.set({ webDavPaused: status });
   await showBadge(true).catch(() => undefined);
@@ -64,7 +69,7 @@ export class DavRequestGate {
     }
     const endpoint = shared;
     const startedReadOnly = endpoint.readOnly;
-    if (endpoint.readOnly) config.writeVerified = false;
+    if (endpoint.readOnly) clearDavWriteProof(config);
     const current = () => {
       if (operation.signal?.aborted) throw new Error('密码库已锁定，已停止 WebDAV 请求。');
       if (this.endpoints.get(url) !== endpoint) throw new Error('网盘连接已变更，请重新检查。');
@@ -80,6 +85,7 @@ export class DavRequestGate {
         const seal = readOnlySeals.get(config);
         if (!seal) throw new Error('无法恢复只读连接，请重新测试并保存网盘设置。');
         endpoint.readOnly = true;
+        clearDavWriteProof(config);
         return browser.storage.local.set({ webDavSealed: seal });
       },
       stop: (status: DavStopStatus) => {
@@ -105,7 +111,12 @@ export async function restoreDavBadge() {
 
 async function sealDavSettings(config: WebDavConfig, session: SessionState, vaultId: string,
   offset: number | null | undefined, existing: LocalData) {
-  const bytes = await derive<number[]>('seal-webdav', [session.key, session.wrap, JSON.stringify(config)]);
+  // v0.2.0 reads only writeVerified and uses direct conditional PUT. A proof
+  // of exclusive MOVE must therefore leave that older capability false.
+  const { url, username, password, writeVerified, packWriteMode } = config;
+  const sealed = { url, username, password, writeVerified: writeVerified === true && packWriteMode === undefined,
+    ...(writeVerified === true && packWriteMode === 'move' ? { packWriteMode } : {}) };
+  const bytes = await derive<number[]>('seal-webdav', [session.key, session.wrap, JSON.stringify(sealed)]);
   const sameVault = existing.webDavSealed?.vaultId === vaultId;
   const clock: ClockSample = offset === undefined && sameVault && existing.webDavClock ? existing.webDavClock :
     { offset: offset ?? null, observedAt: Date.now(), enabled: sameVault && existing.webDavClock?.enabled === true };
@@ -140,7 +151,7 @@ export async function observeDavClock(vaultId: string, offset: number | null, ob
   await browser.storage.local.set({ webDavClock: { offset, observedAt, enabled: state.webDavClock?.enabled === true } });
 }
 
-export async function openSavedDav(state: SessionState, vaultId: string): Promise<WebDavConfig> {
+export async function openSavedDav(state: SessionState, vaultId: string, protocol: 'pack' | 'legacy' = 'pack'): Promise<WebDavConfig> {
   const { webDavSealed } = await read();
   if (!webDavSealed || webDavSealed.vaultId !== vaultId) throw new Error('尚未保存这个密码库的网盘设置。');
   if (!Array.isArray(webDavSealed.bytes) || webDavSealed.bytes.length > 9216 ||
@@ -152,7 +163,9 @@ export async function openSavedDav(state: SessionState, vaultId: string): Promis
   const base = `${target.origin}/${parts.join('/')}`;
   const valid = webDavConfig({ provider: 'custom', base, folder, username: config.username, password: config.password, confirmHttp: true });
   if (valid.url !== config.url) throw new Error('加密的网盘地址无效。');
-  const saved = { ...valid, writeVerified: config.writeVerified === true };
+  const move = protocol === 'pack' && config.packWriteMode === 'move' && config.writeVerified === false;
+  const saved: WebDavConfig = { ...valid, writeVerified: move || config.packWriteMode === undefined && config.writeVerified === true,
+    ...(move ? { packWriteMode: 'move' } : {}) };
   if (saved.writeVerified) {
     // Keep the sealed fallback ready before any network request. A lock may
     // erase the session key immediately after an integrity failure is observed.
@@ -160,7 +173,7 @@ export async function openSavedDav(state: SessionState, vaultId: string): Promis
     let cached = sessionFallbacks.get(state);
     if (!cached || cached.seal.vaultId !== vaultId || cached.source.length !== source.length ||
         !cached.source.every((byte, index) => byte === source[index])) {
-      const bytes = await derive<number[]>('seal-webdav', [state.key, state.wrap, JSON.stringify({ ...saved, writeVerified: false })]);
+      const bytes = await derive<number[]>('seal-webdav', [state.key, state.wrap, JSON.stringify({ ...valid, writeVerified: false })]);
       cached = { source, seal: { vaultId, bytes } };
       sessionFallbacks.set(state, cached);
     }
@@ -206,6 +219,7 @@ export async function testDav(input: WebDavInput | undefined, remember: boolean,
     if (probe.kind !== 'empty' && probe.kind !== 'existing' && !(input && probe.kind === 'missing' && !paused))
       return { probe, resumed: false };
     if (remember) {
+      clearDavWriteProof(config);
       const update = await sealDavSettings(config, session!, vaultId!, probe.offsetSeconds, stored);
       context.check();
       if (probe.kind === 'missing' && previousUrl && gate.stopped(previousUrl)) return { probe, resumed: false };
