@@ -436,6 +436,7 @@ pub fn wasm_sync_restore_content(
 pub struct PackImport {
     head: Vec<u8>,
     snap: Vec<u8>,
+    conflicts: Vec<u8>,
     added: u32,
     updated: u32,
     skipped: u32,
@@ -448,6 +449,8 @@ impl PackImport {
     #[wasm_bindgen(getter)]
     pub fn snap(&self) -> Vec<u8> { self.snap.clone() }
     #[wasm_bindgen(getter)]
+    pub fn conflicts(&self) -> Vec<u8> { self.conflicts.clone() }
+    #[wasm_bindgen(getter)]
     pub fn added(&self) -> u32 { self.added }
     #[wasm_bindgen(getter)]
     pub fn updated(&self) -> u32 { self.updated }
@@ -455,7 +458,12 @@ impl PackImport {
     pub fn skipped(&self) -> u32 { self.skipped }
 }
 
-fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64) -> Result<PackImport, VaultError> {
+#[cfg(test)]
+fn merge_pack(current: &mut VaultSnapshot, incoming: VaultSnapshot, now: u64) -> Result<PackImport, VaultError> {
+    merge_backup(current, incoming, now, &mut crate::conflict::Staged::default())
+}
+
+fn merge_backup(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64, staged: &mut crate::conflict::Staged) -> Result<PackImport, VaultError> {
     use crate::merge::CounterLedger;
     restore_counters(current, &mut incoming, true)?;
     // Preserve the original live owner, including when an imported row has a different item ID.
@@ -467,11 +475,20 @@ fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64
         _ => None,
     }).collect();
     let mut matched = std::collections::BTreeSet::new();
-    let mut result = PackImport { head: Vec::new(), snap: Vec::new(), added: 0, updated: 0, skipped: 0 };
+    let mut repaired = std::collections::BTreeSet::new();
+    let held: std::collections::BTreeSet<_> = staged.rows.iter().flat_map(crate::conflict::Conflict::affected_ids)
+        .chain(staged.drafts.keys().map(String::as_str)).collect();
+    let mut result = PackImport { head: Vec::new(), snap: Vec::new(), conflicts: Vec::new(), added: 0, updated: 0, skipped: 0 };
     for mut row in std::mem::take(&mut incoming.items) {
         row.normalize_derived_fields();
         if let Some((index, existing)) = current.items.iter_mut().enumerate().find(|(_, item)| !row.id.is_empty() && item.id == row.id) {
             matched.insert(index);
+            // An older client may already have committed this exact restore with its old marker.
+            if !row.trashed && !held.contains(row.id.as_str()) && staged.tombstones.contains(&row.id) &&
+                crate::merge::same(Some(existing), Some(&row)) {
+                staged.tombstones.remove(&row.id);
+                repaired.insert(index);
+            }
             if !existing.trashed && let (CredentialData::Login(old), CredentialData::Login(new)) = (&mut existing.data, &row.data) {
                 if old.totp_uri != new.totp_uri
                     && let Some(uri) = crate::merge::highest_hotp(old.totp_uri.as_deref(), new.totp_uri.as_deref())
@@ -491,6 +508,8 @@ fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64
             result.skipped += 1;
         } else {
             if row.id.trim_ascii().is_empty() { row.id = generate_uuid_v4()?; }
+            if held.contains(row.id.as_str()) { return Err(VaultError::InvalidInput("SyncConflict".into())); }
+            staged.tombstones.remove(&row.id);
             current.items.push(row);
             result.added += 1;
         }
@@ -506,7 +525,8 @@ fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64
             item.updated_at_ms = item.updated_at_ms.max(now);
             item.revision = item.revision.saturating_add(1);
             result.updated += 1;
-        } else if matched.contains(&index) { result.skipped += 1; }
+        } else if repaired.contains(&index) { result.updated += 1; }
+        else if matched.contains(&index) { result.skipped += 1; }
     }
     Ok(result)
 }
@@ -514,17 +534,20 @@ fn merge_pack(current: &mut VaultSnapshot, mut incoming: VaultSnapshot, now: u64
 #[wasm_bindgen]
 pub fn wasm_sync_import_pack(
     session_key: Vec<u8>, wrap: Vec<u8>, head: &[u8], snap: &[u8], pack: Vec<u8>, password: String, now: f64, confirm: bool,
+    staged: Option<Vec<u8>>,
 ) -> Result<PackImport, JsValue> {
     let (session_key, wrap, pack, password) = (Zeroizing::new(session_key), Zeroizing::new(wrap), Zeroizing::new(pack), Zeroizing::new(password));
     let (id, epoch, keys) = super::keys(&session_key, &wrap)?;
     let mut current = super::verified_snapshot(&keys, &id, epoch, head, snap)?;
     let incoming = vault_core::sync_codec::import_vaultpack(&pack, password.as_bytes())?;
-    let mut result = merge_pack(&mut current, incoming, now as u64)?;
+    let mut staged = crate::conflict::Staged::open(&keys, &id, staged.as_deref().unwrap_or_default())?;
+    let mut result = merge_backup(&mut current, incoming, now as u64, &mut staged)?;
     if confirm && result.added + result.updated > 0 {
         current.hlc_timestamp = current.hlc_timestamp.max(now as u64).saturating_add(1);
         let output = materialize(&keys, head, current)?;
         result.head = output.head;
         result.snap = output.snap;
+        result.conflicts = staged.seal(&keys, &id)?;
     }
     Ok(result)
 }

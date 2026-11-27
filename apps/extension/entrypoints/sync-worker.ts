@@ -1,9 +1,9 @@
 import init, { wasm_make_local_wal, wasm_verify_local_wal, wasm_sync_authenticate_head, wasm_sync_create_genesis,
   wasm_sync_history_metadata, wasm_sync_unlock_head, wasm_sync_verify_recovery, wasm_sync_verify_snapshot, wasm_sync_replay, wasm_sync_make_batch,
   wasm_sync_reconcile, wasm_sync_adopt, wasm_sync_write_guard, wasm_sync_conflicts, wasm_sync_conflict_stamp, wasm_sync_preview_resolutions,
-  wasm_sync_resolve, wasm_sync_guard_staged, wasm_sync_pack_merge, wasm_sync_pack_inspect, wasm_sync_pack_restore, wasm_sync_pack_resolve,
+  wasm_sync_resolve, wasm_sync_guard_staged, wasm_sync_pack_merge, wasm_sync_pack_inspect, wasm_sync_pack_restore, wasm_sync_pack_resolve, wasm_sync_pack_adopt,
   wasm_sync_compact, wasm_sync_publish_wrap, wasm_sync_rebase_wrap, wasm_sync_same_wrap, wasm_sync_restore_content, wasm_sync_devices, wasm_sync_device_change, wasm_sync_import_pack,
-  type Genesis, type Replayed, type RemoteHead } from '../../../crates/vault-sync/pkg/vault_sync.js';
+  wasm_sync_pack_edit, type Genesis, type Replayed, type RemoteHead } from '../../../crates/vault-sync/pkg/vault_sync.js';
 
 function headOutput(head: RemoteHead) {
   try {
@@ -54,7 +54,7 @@ export default defineUnlistedScript(() => {
         value = replayOutput(wasm_sync_restore_content(...data.args as Parameters<typeof wasm_sync_restore_content>));
       } else if (data.operation === 'sync:import-pack') {
         const result = wasm_sync_import_pack(...data.args as Parameters<typeof wasm_sync_import_pack>);
-        try { value = { head: Array.from(result.head), snap: Array.from(result.snap),
+        try { value = { head: Array.from(result.head), snap: Array.from(result.snap), conflicts: Array.from(result.conflicts),
           added: result.added, updated: result.updated, skipped: result.skipped }; }
         finally { result.free(); }
       } else if (data.operation === 'sync:devices') {
@@ -75,6 +75,9 @@ export default defineUnlistedScript(() => {
         value = replayOutput(wasm_sync_reconcile(...data.args as Parameters<typeof wasm_sync_reconcile>));
       } else if (data.operation === 'sync:pack-merge') {
         value = replayOutput(wasm_sync_pack_merge(...data.args as Parameters<typeof wasm_sync_pack_merge>));
+      } else if (data.operation === 'sync:pack-edit') {
+        const result = wasm_sync_pack_edit(...data.args as Parameters<typeof wasm_sync_pack_edit>);
+        try { value = result ? { head: Array.from(result.head), snap: Array.from(result.snap) } : null; } finally { result?.free(); }
       } else if (data.operation === 'sync:pack-inspect') {
         const pack = wasm_sync_pack_inspect(...data.args as Parameters<typeof wasm_sync_pack_inspect>);
         try { value = { count: pack.count, conflictCount: pack.conflict_count, draftCount: pack.draft_count }; }
@@ -83,6 +86,8 @@ export default defineUnlistedScript(() => {
         value = replayOutput(wasm_sync_pack_restore(...data.args as Parameters<typeof wasm_sync_pack_restore>));
       } else if (data.operation === 'sync:pack-resolve') {
         value = replayOutput(wasm_sync_pack_resolve(...data.args as Parameters<typeof wasm_sync_pack_resolve>));
+      } else if (data.operation === 'sync:pack-adopt') {
+        value = replayOutput(wasm_sync_pack_adopt(...data.args as Parameters<typeof wasm_sync_pack_adopt>));
       } else if (data.operation === 'sync:adopt') {
         value = replayOutput(wasm_sync_adopt(...data.args as Parameters<typeof wasm_sync_adopt>));
       } else if (data.operation === 'sync:conflicts') {
@@ -109,7 +114,7 @@ export default defineUnlistedScript(() => {
       const conflict = typeof error === 'string' && error.includes('SyncConflict');
       const ancestor = typeof error === 'string' && error.match(/\bSyncAncestorRequired:[1-9]\d{0,15}\b/)?.[0];
       const message = data.operation === 'sync:unlock-head' ? '无法验证网盘密码库，请核对该库自己的主密码或恢复码。' :
-        data.operation === 'sync:import-pack' ? '无法读取此备份，请核对文件密码和 .vaultpack 文件是否完整。' :
+        data.operation === 'sync:import-pack' && !conflict ? '无法读取此备份，请核对文件密码和 .vaultpack 文件是否完整。' :
         data.operation === 'sync:local-wal' ? '同步日志无法保存，本次操作未完成。' :
         typeof error === 'string' && error.includes('InvalidResolutionAdjustment') ? '请填写有效的名称，并缩短超出长度限制的字段。' :
         typeof error === 'string' && error.includes('SyncUnresolvedHistory') ? '此历史版本仍有条目等待裁决。请选择其他版本。' :

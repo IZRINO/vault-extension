@@ -66,7 +66,7 @@ fn reconcile(
             {
                 let queue = drafts.entry(id).or_default();
                 if !queue.iter().any(|draft| merge::same(draft.base.as_ref(), start) && merge::same(draft.ours.as_ref(), local)) {
-                    queue.push(Draft { base: start.cloned(), ours: local.cloned() });
+                    queue.push(Draft { base: start.cloned(), ours: local.cloned(), source: None });
                 }
             }
             if let Some(item) = theirs { result.items.push(item.clone()); }
@@ -111,7 +111,7 @@ fn reconcile(
                 different_secrets(local, item) && login_scopes(item).iter().any(|scope| scopes.contains(scope)));
             if paired.contains(&row.id) || held.contains(&row.id) || visible.contains_key(row.id.as_str()) || (!release_drafts && !has_match)
             {
-                drafts.entry(row.id).or_default().insert(0, Draft { base: None, ours: row.ours });
+                drafts.entry(row.id).or_default().insert(0, Draft { base: None, ours: row.ours, source: None });
             } else {
                 prior_sources.insert(row.id.clone(), (row.labels().0.to_owned(),
                     row.matches().map(|(item, label)| (item.id.clone(), label.to_owned())).collect::<BTreeMap<_, _>>()));
@@ -148,7 +148,7 @@ fn reconcile(
                 fields: vec!["$duplicate".into()], receipt: None, sources: Some((ours_source, their_source)), additional: matches.collect() });
         } else if !candidates.is_empty() || (is_recovered && !release_drafts) {
             hidden.insert(id.into());
-            drafts.entry(id.into()).or_default().insert(0, Draft { base: None, ours: Some(row.clone()) });
+            drafts.entry(id.into()).or_default().insert(0, Draft { base: None, ours: Some(row.clone()), source: None });
         }
     }
     drafts.retain(|_, queue| !queue.is_empty());

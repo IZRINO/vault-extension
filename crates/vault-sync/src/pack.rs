@@ -6,9 +6,17 @@ use vault_core::model::{VaultItem, VaultSnapshot};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+#[path = "pack_duplicates.rs"]
+mod duplicates;
+
+#[cfg(test)]
+#[path = "pack_join_tests.rs"]
+mod join_tests;
+
 struct PackState<'a> {
     items: BTreeMap<&'a str, &'a VaultItem>,
     conflicts: BTreeMap<&'a str, &'a Conflict>,
+    waiting: BTreeSet<&'a str>,
     staged: &'a Staged,
 }
 
@@ -19,26 +27,44 @@ impl<'a> PackState<'a> {
             return Err(batch::invalid());
         }
         let mut conflicts = BTreeMap::new();
+        let mut affected = BTreeSet::new();
         for row in &staged.rows {
-            if row.receipt.is_some() || !row.additional.is_empty() ||
+            if row.receipt.is_some() || !affected.insert(row.id.as_str()) { return Err(batch::invalid()); }
+            if row.fields == ["$duplicate"] {
+                duplicates::validate(row, &items, &mut affected)?;
+                if staged.tombstones.contains(&row.id) { return Err(batch::invalid()); }
+            } else if !row.additional.is_empty() || row.fields.iter().any(|field| field == "$duplicate") ||
                 row.base.iter().chain(&row.ours).chain(&row.theirs).any(|item| item.id != row.id) ||
-                !merge::same(items.get(row.id.as_str()).copied(), row.theirs.as_ref()) ||
-                conflicts.insert(row.id.as_str(), row).is_some()
-            {
+                !merge::same(items.get(row.id.as_str()).copied(), row.theirs.as_ref()) {
                 return Err(batch::invalid());
             }
+            conflicts.insert(row.id.as_str(), row);
         }
-        if staged.drafts.keys().any(|id| !conflicts.contains_key(id.as_str())) {
-            return Err(batch::invalid());
+        let mut waiting = BTreeSet::new();
+        for (id, drafts) in &staged.drafts {
+            if affected.contains(id.as_str()) { continue; }
+            let Some(first) = drafts.first().filter(|draft| draft.base.is_none()).and_then(|draft| draft.ours.as_ref()) else {
+                return Err(batch::invalid());
+            };
+            if first.id != *id || items.contains_key(id.as_str()) || staged.tombstones.contains(id) ||
+                !staged.rows.iter().any(|row| row.ours.iter().chain(row.matches().map(|(item, _)| item))
+                    .any(|candidate| duplicates::matches(first, candidate))) { return Err(batch::invalid()); }
+            waiting.insert(id.as_str());
         }
-        Ok(Self { items, conflicts, staged })
+        Ok(Self { items, conflicts, waiting, staged })
     }
 
     fn row(&self, id: &str) -> Entry<'a> {
+        let pending = self.conflicts.get(id).copied();
+        let duplicate = pending.filter(|row| row.fields == ["$duplicate"]);
+        let drafts = self.staged.drafts.get(id).map_or(&[][..], Vec::as_slice);
+        let (waiting, drafts) = if self.waiting.contains(id) { (drafts[0].ours.as_ref(), &drafts[1..]) } else { (None, drafts) };
         Entry {
-            item: self.items.get(id).copied(),
-            conflict: self.conflicts.get(id).copied(),
-            drafts: self.staged.drafts.get(id).map_or(&[], Vec::as_slice),
+            // A duplicate holds an existing credential off-screen. It is still an
+            // ancestor of that identity if another branch has resolved the review.
+            item: self.items.get(id).copied().or_else(|| duplicate.and_then(|row| row.ours.as_ref())).or(waiting),
+            conflict: pending.filter(|row| row.fields != ["$duplicate"]),
+            drafts,
             deleted: self.staged.tombstones.contains(id),
         }
     }
@@ -80,11 +106,11 @@ fn merged_drafts(base: &[Draft], ours: &[Draft], theirs: &[Draft]) -> Vec<Draft>
     output
 }
 
-fn hold_edit(drafts: &mut Vec<Draft>, shown: &Conflict, base: Option<&VaultItem>, item: Option<&VaultItem>) {
+fn hold_edit(drafts: &mut Vec<Draft>, shown: &Conflict, base: Option<&VaultItem>, item: Option<&VaultItem>, source: &str) {
     if [base, shown.ours.as_ref(), shown.theirs.as_ref()].into_iter().any(|known| merge::same(known, item)) {
         return;
     }
-    let draft = Draft { base: base.cloned(), ours: item.cloned() };
+    let draft = Draft { base: base.cloned(), ours: item.cloned(), source: Some(source.into()) };
     if !drafts.iter().any(|other| same_draft(&draft, other)) { drafts.push(draft); }
 }
 
@@ -97,11 +123,12 @@ fn conflict_row(
 }
 
 fn revisit_drafts(
-    id: &str, item: &mut Option<VaultItem>, stage: &mut Staged, drafts: Vec<Draft>,
+    id: &str, item: &mut Option<VaultItem>, stage: &mut Staged, drafts: Vec<Draft>, source: &str,
 ) -> Result<(), VaultError> {
-    let sources = ("待合并设备", "已合并版本");
+    let mut current_source = source.to_owned();
     let mut drafts = drafts.into_iter();
     while let Some(draft) = drafts.next() {
+        let sources = (draft.source.as_deref().unwrap_or("待合并设备"), current_source.as_str());
         let (base, ours, theirs) = (draft.base.as_ref(), draft.ours.as_ref(), item.as_ref());
         let merged = merge::item(base, ours, theirs, &merge::Choices::new(), sources)?;
         if !merged.contested.is_empty() {
@@ -109,13 +136,16 @@ fn revisit_drafts(
             if drafts.len() > 0 { stage.drafts.insert(id.into(), drafts.collect()); }
             return Ok(());
         }
+        if !merge::same(merged.item.as_ref(), theirs) {
+            current_source = if merge::same(merged.item.as_ref(), ours) { sources.0 } else { "已合并版本" }.to_owned();
+        }
         *item = merged.item;
     }
     Ok(())
 }
 
 fn staged_versions(staged: &Staged) -> impl Iterator<Item = &VaultItem> {
-    staged.rows.iter().flat_map(|row| row.base.iter().chain(&row.ours).chain(&row.theirs))
+    staged.rows.iter().flat_map(|row| row.base.iter().chain(&row.ours).chain(row.matches().map(|(item, _)| item)))
         .chain(staged.drafts.values().flatten().flat_map(|draft| draft.base.iter().chain(&draft.ours)))
 }
 
@@ -124,7 +154,9 @@ fn apply_counters(ledger: &merge::CounterLedger, snapshot: &mut VaultSnapshot, s
     ledger.apply(&mut snapshot.items, Some(&preferred))?;
     let visible = batch::indexed(snapshot)?;
     for row in &mut staged.rows {
-        row.theirs = visible.get(row.id.as_str()).map(|item| (*item).clone());
+        for shown in row.theirs.iter_mut().chain(row.additional.iter_mut().map(|(item, _)| item)) {
+            *shown = (*visible.get(shown.id.as_str()).ok_or_else(batch::invalid)?).clone();
+        }
     }
     Ok(())
 }
@@ -155,6 +187,9 @@ fn merge_packs(
     sources: (&str, &str),
 ) -> Result<(VaultSnapshot, Staged), VaultError> {
     let (base_state, our_state, their_state) = (PackState::new(base)?, PackState::new(ours)?, PackState::new(theirs)?);
+    let base_authors = device::Provenance::read(&base.0.sync_provenance)?;
+    let our_authors = device::Provenance::read(&ours.0.sync_provenance)?;
+    let their_authors = device::Provenance::read(&theirs.0.sync_provenance)?;
     let ids: BTreeSet<_> = [&base_state, &our_state, &their_state].into_iter().flat_map(|view|
         view.items.keys().copied().chain(view.conflicts.keys().copied())
             .chain(view.staged.drafts.keys().map(String::as_str)).chain(view.staged.tombstones.iter().map(String::as_str))
@@ -165,10 +200,31 @@ fn merge_packs(
     output.hlc_timestamp = output.hlc_timestamp.max(theirs.0.hlc_timestamp);
     output.device_registry = device::merge(&base.0.device_registry, &ours.0.device_registry, &theirs.0.device_registry)?;
     let mut staged = Staged::default();
+    let label = |id: &str, local: bool| if local { our_authors.source(&ours.0.device_registry, id, sources.0) }
+        else { their_authors.source(&theirs.0.device_registry, id, sources.1) };
+    let reviews = duplicates::carry(&base_state, &our_state, &their_state, &mut output, &mut staged, &label);
     for id in ids {
+        if reviews.held.contains(id) { continue; }
+        let local_label = our_authors.source(&ours.0.device_registry, id, sources.0);
+        let remote_label = their_authors.source(&theirs.0.device_registry, id, sources.1);
+        let sources = (local_label.as_str(), remote_label.as_str());
         let base = base_state.row(id);
         let ours = our_state.row(id).with_history(base);
         let theirs = their_state.row(id).with_history(base);
+        if let Some(&local) = reviews.resolved_locally.get(id) {
+            let resolved = if local { ours } else { theirs };
+            let drafts = merged_drafts(base.drafts, ours.drafts, theirs.drafts);
+            if resolved.conflict.is_some() {
+                resolved.save(id, &mut output, &mut staged);
+                if !drafts.is_empty() { staged.drafts.insert(id.into(), drafts); }
+            } else {
+                let mut item = resolved.item.cloned();
+                revisit_drafts(id, &mut item, &mut staged, drafts, if local { sources.0 } else { sources.1 })?;
+                if item.is_none() { staged.tombstones.insert(id.into()); }
+                output.items.extend(item);
+            }
+            continue;
+        }
         if ours.same(theirs) || ours.same(base) {
             theirs.save(id, &mut output, &mut staged);
             continue;
@@ -185,10 +241,11 @@ fn merge_packs(
         };
         if let Some((active, display, alternate)) = keep_conflict {
             if let Some(other) = alternate.conflict {
-                hold_edit(&mut drafts, active, other.base.as_ref(), other.ours.as_ref());
-                hold_edit(&mut drafts, active, other.base.as_ref(), other.theirs.as_ref());
+                hold_edit(&mut drafts, active, other.base.as_ref(), other.ours.as_ref(), other.labels().0);
+                hold_edit(&mut drafts, active, other.base.as_ref(), other.theirs.as_ref(), other.labels().1);
             } else {
-                hold_edit(&mut drafts, active, base.item, alternate.item);
+                hold_edit(&mut drafts, active, base.item, alternate.item,
+                    if theirs.conflict.is_some() { sources.0 } else { sources.1 });
             }
             display.save(id, &mut output, &mut staged);
             if drafts.is_empty() { staged.drafts.remove(id); } else { staged.drafts.insert(id.into(), drafts); }
@@ -198,7 +255,7 @@ fn merge_packs(
             // One branch resolved the shared conflict. Revisit concurrent edits held by the other.
             let resolved = if ours.conflict.is_some() { theirs } else { ours };
             let mut item = resolved.item.cloned();
-            revisit_drafts(id, &mut item, &mut staged, drafts)?;
+            revisit_drafts(id, &mut item, &mut staged, drafts, if ours.conflict.is_some() { sources.1 } else { sources.0 })?;
             if item.is_none() && (resolved.deleted || base.item.is_some()) { staged.tombstones.insert(id.into()); }
             output.items.extend(item);
             continue;
@@ -218,10 +275,12 @@ fn merge_packs(
             staged.rows.push(conflict_row(id, ancestor, ours.item, theirs.item, merged.contested, sources));
         }
     }
+    duplicates::find_new(&base_state, &our_state, &their_state, &mut output, &mut staged, reviews.waiting, &label)?;
+    output.items.sort_by(|a, b| a.id.cmp(&b.id));
     let counter_versions = [base, ours, theirs].into_iter().flat_map(|(snapshot, staged)| snapshot.items.iter().chain(staged_versions(staged)));
     let counters = merge::CounterLedger::collect(counter_versions)?;
+    crate::pack_changes::merge_authors(&base_authors, (&our_state.items, &our_authors), (&their_state.items, &their_authors), &mut output);
     apply_counters(&counters, &mut output, &mut staged)?;
-    device::Provenance::read(&output.sync_provenance)?.store(&mut output);
     Ok((output, staged))
 }
 
@@ -269,6 +328,33 @@ fn materialize(keys: &VaultKeyHierarchy, vault: &str, template: &[u8], snapshot:
 }
 
 #[wasm_bindgen]
+pub fn wasm_sync_pack_adopt(
+    source_key: Vec<u8>, source_wrap: Vec<u8>, source_head: &[u8], source: &[u8],
+    target_key: Vec<u8>, target_wrap: Vec<u8>, target_head: &[u8], target: &[u8], staged: &[u8],
+) -> Result<Replayed, JsValue> {
+    let (source_key, source_wrap, target_key, target_wrap) = (Zeroizing::new(source_key), Zeroizing::new(source_wrap),
+        Zeroizing::new(target_key), Zeroizing::new(target_wrap));
+    let (source_id, source_epoch, source_keys) = crate::keys(&source_key, &source_wrap)?;
+    let (target_id, target_epoch, target_keys) = crate::keys(&target_key, &target_wrap)?;
+    if source_id == target_id { return Err(batch::invalid().into()); }
+    let mut source = read_snapshot(&source_keys, &source_id, source_epoch, source_head, source)?;
+    let target = read_snapshot(&target_keys, &target_id, target_epoch, target_head, target)?;
+    let target_stage = Staged::open(&target_keys, &target_id, staged)?;
+    // Cross-vault adoption shares no credential ancestor. Carry only source credentials
+    // into the target's namespace, retaining the target's identity, registry and review state.
+    let mut base = target.clone();
+    base.items.clear();
+    base.sync_provenance.clear();
+    let mut incoming = base.clone();
+    incoming.items = std::mem::take(&mut source.items);
+    incoming.hlc_timestamp = source.hlc_timestamp;
+    let empty = Staged::default();
+    let (after, pending) = merge_packs((&base, &empty), (&incoming, &empty), (&target, &target_stage),
+        ("本机", "网盘快照（来源未知）"))?;
+    Ok(materialize(&target_keys, &target_id, target_head, after, &pending)?)
+}
+
+#[wasm_bindgen]
 pub fn wasm_sync_pack_merge(
     key: Vec<u8>, wrap: Vec<u8>,
     base_head: &[u8], base: &[u8], our_head: &[u8], ours: &[u8], their_head: &[u8], theirs: &[u8],
@@ -296,21 +382,32 @@ fn update_tombstones(staged: &mut Staged, before: impl IntoIterator<Item = Strin
 fn restore_pack(
     mut current: VaultSnapshot, mut history: VaultSnapshot, mut staged: Staged, history_stage: &Staged,
 ) -> Result<(VaultSnapshot, Staged), VaultError> {
-    let view = PackState::new((&current, &staged))?;
+    PackState::new((&current, &staged))?;
     PackState::new((&history, history_stage))?;
     if !history_stage.rows.is_empty() || !history_stage.drafts.is_empty() {
         return Err(VaultError::InvalidInput("SyncUnresolvedHistory".into()));
     }
     remote::restore_counters(&current, &mut history, false)?;
     // Retain every row that still awaits review, including a deletion shown in place of an item.
-    let held: BTreeSet<_> = view.conflicts.keys().map(|id| (*id).to_owned()).chain(staged.drafts.keys().cloned()).collect();
+    let held: BTreeSet<_> = staged.rows.iter().flat_map(Conflict::affected_ids).map(str::to_owned)
+        .chain(staged.drafts.keys().cloned()).collect();
     history.items.retain(|item| !held.contains(item.id.as_str()));
+    let mut authors = device::Provenance::read(&current.sync_provenance)?;
+    let historical = device::Provenance::read(&history.sync_provenance)?;
+    let current_items = batch::indexed(&current)?;
+    for item in &history.items {
+        if let Some(writer) = historical.writers.get(&item.id) {
+            authors.writers.insert(item.id.clone(), writer.clone());
+        } else if !merge::same(Some(item), current_items.get(item.id.as_str()).copied()) {
+            authors.writers.remove(&item.id);
+        }
+    }
     let before = current.items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
     history.items.extend(current.items.drain(..).filter(|item| held.contains(item.id.as_str())));
     current.items = std::mem::take(&mut history.items);
     current.items.sort_by(|a, b| a.id.cmp(&b.id));
     current.hlc_timestamp = current.hlc_timestamp.max(history.hlc_timestamp);
-    device::Provenance::read(&current.sync_provenance)?.store(&mut current);
+    authors.store(&mut current);
     update_tombstones(&mut staged, before, &current.items);
     Ok((current, staged))
 }
@@ -332,22 +429,32 @@ pub fn wasm_sync_pack_restore(
 fn resolve_pack(
     current: VaultSnapshot, staged: Staged, rules: &str, time: u64,
 ) -> Result<(VaultSnapshot, Staged), VaultError> {
-    PackState::new((&current, &staged))?;
+    let waiting: BTreeSet<_> = PackState::new((&current, &staged))?.waiting.into_iter().map(str::to_owned).collect();
+    let known = duplicates::reviewed_sources([&staged]);
     let counters = merge::CounterLedger::collect(current.items.iter().chain(staged_versions(&staged)))?;
-    let before = current.items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    let mut before = current.items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+    let hidden: Vec<_> = staged.rows.iter().filter(|row| row.fields == ["$duplicate"]).map(|row| row.id.clone()).collect();
     let (mut snapshot, mut staged, _) = conflict::resolve_staged(current, staged, rules, time)?;
     let mut items: BTreeMap<_, _> = snapshot.items.drain(..).map(|item| (item.id.clone(), item)).collect();
-    let active: BTreeSet<_> = staged.rows.iter().map(|row| row.id.clone()).collect();
-    for (id, drafts) in std::mem::take(&mut staged.drafts) {
+    let active: BTreeSet<_> = staged.rows.iter().flat_map(Conflict::affected_ids).map(str::to_owned).collect();
+    before.extend(hidden.into_iter().filter(|id| !active.contains(id)));
+    for (id, mut drafts) in std::mem::take(&mut staged.drafts) {
         if active.contains(&id) {
             staged.drafts.insert(id, drafts);
         } else {
             let mut item = items.remove(&id);
-            revisit_drafts(&id, &mut item, &mut staged, drafts)?;
+            if waiting.contains(&id) { item = drafts.remove(0).ours; }
+            revisit_drafts(&id, &mut item, &mut staged, drafts, "已合并版本")?;
             if let Some(item) = item { items.insert(id, item); }
         }
     }
     snapshot.items = items.into_values().collect();
+    if !waiting.is_empty() {
+        let authors = device::Provenance::read(&snapshot.sync_provenance)?;
+        let names: BTreeMap<_, _> = snapshot.items.iter().map(|item| (item.id.clone(),
+            known.get(&item.id).cloned().unwrap_or_else(|| authors.source(&snapshot.device_registry, &item.id, "来源未知")))).collect();
+        duplicates::review(&mut snapshot, &mut staged, &waiting, &BTreeSet::new(), &waiting, &|id, _| names[id].clone())?;
+    }
     apply_counters(&counters, &mut snapshot, &mut staged)?;
     staged.rows.sort_by(|a, b| a.id.cmp(&b.id));
     update_tombstones(&mut staged, before, &snapshot.items);
@@ -466,6 +573,7 @@ mod tests {
         let rules = r#"[{"id":"a","mode":"ours"}]"#;
         let (reviewed, pending) = resolve_pack(combined, pending, rules, 10).unwrap();
         assert_eq!(pending.rows[0].ours.as_ref().unwrap().title, "Title C");
+        assert_eq!(pending.rows[0].labels().0, "C");
         assert_eq!(pending.rows[0].theirs.as_ref().unwrap().title, "Title A");
         let (resolved, pending) = resolve_pack(reviewed, pending, rules, 11).unwrap();
         assert!(pending.rows.is_empty());

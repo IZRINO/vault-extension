@@ -108,6 +108,99 @@ function server(honor = true, acceptStaleMethod?: 'PUT' | 'DELETE') {
 }
 
 describe('first WebDAV vault', () => {
+  const createFixture = async () => ({ snapshotId: snapshot, head: bytes(1), snap: bytes(2) });
+  const koofr = webDavConfig({ provider: 'koofr', base: '', folder: 'vault', username: 'fixture', password: 'fixture' });
+  const koofrScratch = '/dav/Koofr/scratch/';
+
+  it.each([201, 202])('detects a Koofr duplicate create with HTTP %i before writing binary data and removes its own text probe', async duplicateStatus => {
+    const dav = server(false);
+    dav.folders.add(koofrScratch);
+    const textWrites: string[] = [];
+    const request: typeof fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const response = await dav.fetcher(input, init);
+      if (init?.method === 'PUT' && path.endsWith('.txt')) {
+        expect(new Headers(init.headers).get('Content-Type')).toBe('text/plain; charset=utf-8');
+        expect(new Headers(init.headers).get('If-None-Match')).toBe('*');
+        const data = dav.objects.get(path)!.bytes;
+        expect(data.length).toBeLessThan(64);
+        expect(data.every(byte => byte === 10 || byte >= 32 && byte <= 126)).toBe(true);
+        textWrites.push(new TextDecoder().decode(data));
+        if (textWrites.length === 2) return new Response(null, { status: duplicateStatus });
+      }
+      if (init?.method === 'GET' && path.endsWith('.bin') && response.ok)
+        return new Response(null, { headers: { 'Content-Length': '32', ETag: '"binary"' } });
+      return response;
+    };
+    await expect(createRemoteVault(koofr, 'scratch', {}, createFixture, request))
+      .rejects.toThrow(/允许重复创建.*可能覆盖其他设备.*请使用支持条件写入的 WebDAV/);
+    expect(textWrites).toHaveLength(2);
+    expect(textWrites[0]).not.toBe(textWrites[1]);
+    expect(dav.requests.filter(row => row.method === 'DELETE')).toHaveLength(1);
+    expect(dav.requests.some(row => row.path.endsWith('.bin') || row.method === 'MKCOL')).toBe(false);
+    expect(dav.folders.has('/dav/Koofr/vault/')).toBe(false);
+    expect(dav.objects.size).toBe(0);
+  });
+
+  it('still requires binary readback after Koofr proves exclusive text creation', async () => {
+    const dav = server();
+    dav.folders.add(koofrScratch);
+    let textRemoved = false;
+    const request: typeof fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const response = await dav.fetcher(input, init);
+      if (init?.method === 'GET' && path.endsWith('.txt') && response.status === 404) textRemoved = true;
+      if (init?.method === 'GET' && path.endsWith('.bin') && response.ok) {
+        expect(textRemoved).toBe(true);
+        return new Response(null, { headers: { 'Content-Length': '32', ETag: response.headers.get('ETag')! } });
+      }
+      return response;
+    };
+    await expect(createRemoteVault(koofr, 'scratch', {}, createFixture, request)).rejects.toThrow(/首次读回.*32 字节.*0 字节/);
+    expect(textRemoved).toBe(true);
+    expect([...dav.objects.keys()]).toEqual([expect.stringMatching(/\/scratch\/verify_[0-9a-f]{32}\.bin$/)]);
+    expect(dav.folders.has('/dav/Koofr/vault/')).toBe(false);
+  });
+
+  it.each(['body', 'tag'] as const)('reports a 412 that changed the original Koofr text probe %s', async changed => {
+    const dav = server();
+    dav.folders.add(koofrScratch);
+    const request: typeof fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const response = await dav.fetcher(input, init);
+      if (path.endsWith('.txt') && init?.method === 'PUT' && response.status === 412) {
+        const original = dav.objects.get(path)!;
+        if (changed === 'tag') original.tag = '"other"';
+        else if (init.body instanceof Uint8Array) original.bytes = new Uint8Array(init.body);
+      }
+      return response;
+    };
+    await expect(createRemoteVault(koofr, 'scratch', {}, createFixture, request))
+      .rejects.toThrow(/允许重复创建.*请使用支持条件写入的 WebDAV/);
+    expect(dav.objects.size).toBe(0);
+    expect(dav.requests.some(row => row.path.endsWith('.bin') || row.method === 'MKCOL')).toBe(false);
+  });
+
+  it('leaves a previously unfinished probe untouched when the Koofr scratch directory is not empty', async () => {
+    const dav = server();
+    dav.folders.add(koofrScratch);
+    const path = `${koofrScratch}verify_${'0'.repeat(32)}.txt`;
+    dav.objects.set(path, { bytes: bytes(7), tag: '"previous"' });
+    await expect(createRemoteVault(koofr, 'scratch', {}, createFixture, dav.fetcher)).rejects.toThrow('空测试目录');
+    expect(dav.requests.every(row => row.method === 'PROPFIND')).toBe(true);
+    expect(dav.objects.get(path)).toEqual({ bytes: bytes(7), tag: '"previous"' });
+  });
+
+  it.each(['https://app.koofr.net.example/dav/Koofr/', 'https://app.koofr.net/dav/Koofr-backup/'])
+    ('keeps the binary-only proof outside the Koofr preset at %s', async base => {
+      const dav = server();
+      dav.folders.add(new URL('scratch/', base).pathname);
+      const other = webDavConfig({ provider: 'custom', base, folder: 'vault', username: 'fixture', password: 'fixture' });
+      const result = await createRemoteVault(other, 'scratch', {}, createFixture, dav.fetcher);
+      expect(result.head.bytes).toEqual(bytes(1));
+      expect(dav.requests.some(row => row.path.endsWith('.txt'))).toBe(false);
+    });
+
   it('only creates objects below the selected child after conditional write proof, not in the account root', async () => {
     const dav = server();
     const create = () => Promise.resolve({ snapshotId: snapshot, head: bytes(11), snap: bytes(22) });
@@ -122,21 +215,90 @@ describe('first WebDAV vault', () => {
     expect(dav.objects.get('/dav/vault/head.bin')?.bytes).toEqual(bytes(11));
   });
 
-  it('does not create a collection on servers that return ETags but ignore stale conditions', async () => {
+  it('explains when the server accepts a duplicate create and keeps the vault directory untouched', async () => {
     const dav = server(false);
-    await expect(createRemoteVault(config, 'scratch', {}, async () => ({
-      snapshotId: snapshot, head: bytes(1), snap: bytes(2),
-    }), dav.fetcher)).rejects.toThrow('条件写');
+    await expect(createRemoteVault(config, 'scratch', {}, createFixture, dav.fetcher)).rejects.toThrow(/条件写.*重复创建/);
     expect(dav.requests.filter(row => row.path.startsWith('/dav/vault/') && row.method !== 'PROPFIND')).toEqual([]);
     expect(dav.folders.has('/dav/vault/')).toBe(false);
   });
 
-  it.each(['PUT', 'DELETE'] as const)('requires the scratch server to reject an actually stale ETag for %s', async method => {
+  it('reports different bytes on the first readback and leaves the replacement file intact', async () => {
+    const dav = server();
+    let replacement: Uint8Array<ArrayBuffer> | undefined;
+    const request: typeof fetch = async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (!replacement && init?.method === 'GET' && path.startsWith('/dav/scratch/verify_')) {
+        replacement = dav.objects.get(path)!.bytes.slice();
+        replacement[0] = replacement[0]! ^ 0xff;
+        dav.objects.set(path, { bytes: replacement, tag: '"replacement"' });
+      }
+      return dav.fetcher(input, init);
+    };
+    await expect(createRemoteVault(config, 'scratch', {}, createFixture, request)).rejects.toThrow(/首次读回.*内容.*不符/);
+    expect([...dav.objects.values()]).toEqual([{ bytes: replacement, tag: '"replacement"' }]);
+    expect(dav.folders.has('/dav/vault/')).toBe(false);
+  });
+
+  it('keeps the received byte count in the first-readback error if the transfer is truncated', async () => {
+    const dav = server();
+    const request: typeof fetch = async (input, init) => {
+      const response = await dav.fetcher(input, init);
+      if (init?.method === 'GET' && response.ok) return new Response(null, { headers: {
+        'Content-Length': '32', ETag: response.headers.get('ETag')!,
+      } });
+      return response;
+    };
+    await expect(createRemoteVault(config, 'scratch', {}, createFixture, request)).rejects.toThrow(/首次读回.*32 字节.*0 字节/);
+    expect(dav.requests.some(row => row.method === 'DELETE')).toBe(false);
+    expect(dav.folders.has('/dav/vault/')).toBe(false);
+  });
+
+  it.each([401, 403, 429])('stops without a cleanup request after HTTP %i on the probe readback', async status => {
+    const dav = server();
+    const stop = vi.fn();
+    const request: typeof fetch = async (input, init) => {
+      const response = await dav.fetcher(input, init);
+      return init?.method === 'GET' ? new Response(null, { status }) : response;
+    };
+    await expect(createRemoteVault(config, 'scratch', { stop }, createFixture, request)).rejects.toMatchObject({ status });
+    expect(stop).toHaveBeenCalledExactlyOnceWith(status);
+    expect(dav.requests.filter(row => row.method === 'GET')).toHaveLength(1);
+    expect(dav.requests.at(-1)?.method).toBe('GET');
+  });
+
+  it('reports a missing strong version tag on the updated probe without removing it', async () => {
+    const dav = server();
+    let updated = false;
+    const request: typeof fetch = async (input, init) => {
+      const response = await dav.fetcher(input, init);
+      if (init?.method === 'PUT' && new Headers(init.headers).has('If-Match') && response.ok) updated = true;
+      if (updated && init?.method === 'GET' && response.ok) response.headers.set('ETag', 'W/"weak"');
+      return response;
+    };
+    await expect(createRemoteVault(config, 'scratch', {}, createFixture, request)).rejects.toThrow(/更新后读回.*强版本标签/);
+    expect(dav.objects.size).toBe(1);
+    expect(dav.folders.has('/dav/vault/')).toBe(false);
+  });
+
+  it.each([
+    ['PUT', /条件写.*过期版本标签.*覆盖/],
+    ['DELETE', /条件写.*过期版本标签.*删除/],
+  ] as const)('reports when the scratch server accepts an actually stale ETag for %s', async (method, expected) => {
     const dav = server(true, method);
-    await expect(createRemoteVault(config, 'scratch', {}, async () => ({
-      snapshotId: snapshot, head: bytes(1), snap: bytes(2),
-    }), dav.fetcher)).rejects.toThrow('条件写');
+    await expect(createRemoteVault(config, 'scratch', {}, createFixture, dav.fetcher)).rejects.toThrow(expected);
     expect(dav.requests.filter(row => row.path.startsWith('/dav/vault/') && row.method !== 'PROPFIND')).toEqual([]);
+    expect(dav.folders.has('/dav/vault/')).toBe(false);
+  });
+
+  it('reports a file still present at the final readback and never publishes the vault', async () => {
+    const dav = server();
+    const request: typeof fetch = async (input, init) => {
+      const file = dav.objects.get(new URL(String(input)).pathname);
+      if (file && init?.method === 'DELETE' && new Headers(init.headers).get('If-Match') === file.tag)
+        return new Response(null, { status: 204 });
+      return dav.fetcher(input, init);
+    };
+    await expect(createRemoteVault(config, 'scratch', {}, createFixture, request)).rejects.toThrow(/删除后复查.*测试文件/);
     expect(dav.folders.has('/dav/vault/')).toBe(false);
   });
 

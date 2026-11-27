@@ -6,6 +6,9 @@ mod device;
 mod journal;
 mod merge;
 mod pack;
+mod pack_changes;
+#[cfg(test)]
+mod pack_source_tests;
 mod reconcile;
 mod remote;
 pub use reconcile::*;
@@ -13,6 +16,7 @@ pub use remote::*;
 pub use conflict::*;
 pub use device::*;
 pub use pack::*;
+pub use pack_changes::wasm_sync_pack_edit;
 
 use vault_core::crypto::{SecretKey, VaultKeyHierarchy};
 use vault_core::error::VaultError;

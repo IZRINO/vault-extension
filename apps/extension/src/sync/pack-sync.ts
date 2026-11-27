@@ -3,13 +3,15 @@ import type { RemoteAnchor, SessionState, VaultFiles } from '../vault-storage';
 import type { RemoteHeadInfo, ReplayOutput } from './bootstrap';
 import { openPackContent, sealPackContent, type PackContent } from './pack-content';
 import { mergePackRules, openPackRules } from './pack-settings';
-import { newPackVersionId, preparePackVersion, type PackListing, type PackTransport, type PackVersion } from './pack-transport';
+import { newPackVersionId, preparePackVersion, sameVersion, type PackListing, type PackTransport, type PackVersion } from './pack-transport';
 import type { SyncResult } from './run';
 
 export interface WholePackState {
   base: string;
   known: PackVersion[];
   dirty: boolean;
+  /** The most recent sync check failed. Never persist untrusted remote error text. */
+  checkFailed?: boolean;
   siteRules: 'pending' | 'applied' | 'skipped';
   baseRules: Uint8Array;
   baseConflicts: Uint8Array;
@@ -27,6 +29,15 @@ const missingBase = () => new Error('没有可验证的共同版本。本机编�
 const invalidWrap = () => new Error('远端主密码包装存在分歧，请重新验证。本机编辑仍保留。');
 const nothing = new Uint8Array();
 export const equalPackBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
+
+export function hasPendingPackWork(anchor: RemoteAnchor) {
+  const state = anchor.pack!;
+  if (state.dirty || state.outbox || state.integrated?.length || state.ruleConflicts || state.checkFailed ||
+      anchor.conflictCount || anchor.draftCount || anchor.observedHead) return true;
+  // The acknowledged local publication is only settled if it is the sole known tip.
+  const parents = new Set(state.known.flatMap(version => version.parents));
+  return state.known.some(version => version.id !== state.base && !parents.has(version.id));
+}
 
 export async function packMaterial(session: SessionState) {
   const raw = await derive<number[]>('sync-pack-material', [session.key, session.wrap]);
@@ -238,9 +249,7 @@ export async function runWholeSync(options: WholeSyncOptions): Promise<SyncResul
       listing = await transport.list(material, files.vaultId, [...state.known, version]);
       check();
     } else {
-      if (found.sha256 !== version.sha256 || found.bytes !== version.bytes || found.keyEpoch !== version.keyEpoch ||
-          found.createdAt !== version.createdAt || found.parents.join(',') !== version.parents.join(',') ||
-          !equalPackBytes(found.head ?? nothing, version.head ?? nothing)) throw missingBase();
+      if (!sameVersion(found, version)) throw missingBase();
       await transport.download(found);
       check();
     }
@@ -312,7 +321,8 @@ export async function runWholeSync(options: WholeSyncOptions): Promise<SyncResul
   check();
   const identity = { id: newPackVersionId(), vaultId: files.vaultId };
   const ciphertext = await sealPackContent(material, identity, view);
-  const version = await preparePackVersion({ ...identity, parents: tipIds, keyEpoch: files.keyEpoch, createdAt: Date.now(), head }, ciphertext);
+  const version = await preparePackVersion({ ...identity, packageEncoding: listing.root.packageEncoding,
+    parents: tipIds, keyEpoch: files.keyEpoch, createdAt: Date.now(), head }, ciphertext);
   check();
   const ready = applyPackView({ ...anchor, pack: { ...state, known: graph.versions, dirty: false, outbox: { version, ciphertext } } }, view);
   const nextFiles = applyPackFiles(files, view);

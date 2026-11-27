@@ -9,11 +9,17 @@ import initEnte, { wasm_export_ente_auth, wasm_parse_ente_auth } from '../../../
 import initAudit, { wasm_audit_snapshot } from '../../../crates/vault-audit/pkg/vault_audit.js';
 import initOtp, { wasm_otp_at, wasm_totp_at, wasm_validate_totp } from '../../../crates/vault-otp/pkg/vault_otp.js';
 import initPreferences, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav,
-  wasm_sign_authorization, wasm_verify_authorization } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
-import initSync, { wasm_make_local_wal, wasm_sync_import_pack, wasm_sync_verify_recovery, wasm_verify_local_wal } from '../../../crates/vault-sync/pkg/vault_sync.js';
+  wasm_sign_authorization, wasm_verify_authorization, wasm_sync_pack_material, wasm_sync_pack_record_sign } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
+import { wasm_sync_authenticate_head, wasm_sync_create_genesis, wasm_sync_verify_snapshot } from '../../../crates/vault-sync/pkg/vault_sync.js';
+import initSync, { wasm_make_local_wal, wasm_sync_conflicts, wasm_sync_devices, wasm_sync_device_change, wasm_sync_guard_staged, wasm_sync_import_pack,
+  wasm_sync_pack_edit, wasm_sync_pack_merge, wasm_sync_verify_recovery, wasm_verify_local_wal } from '../../../crates/vault-sync/pkg/vault_sync.js';
 import { prepareBrowserCsv } from './browser-csv';
 import { isVaultPage } from './sender-policy';
 import { endpointFingerprint } from './sync/bootstrap';
+import { saveDavConnection } from './sync/connection';
+import { preparePackVersion } from './sync/pack-transport';
+import { openPackContent } from './sync/pack-content';
+import { savePackSetup } from './vault-storage';
 import { webDavConfig } from './sync/webdav';
 import { VaultController } from './vault-controller';
 import { AutofillController } from './autofill-controller';
@@ -29,15 +35,24 @@ const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, se
   pauseAudit: undefined as ((signal: AbortSignal | undefined) => Promise<void>) | undefined,
   pauseSessionClear: undefined as Promise<void> | undefined, idleState: 'active' as 'active' | 'locked',
   failSave: false, pendingWal: [] as JournalCommit[], legacy: false, local: {} as Record<string, unknown>,
+  packAnchor: undefined as RemoteAnchor | undefined,
+  packClock: undefined as JournalCommit['state'] | undefined,
   observedKeyUpdate: undefined as { observedHead: Uint8Array; observedKeyEpoch: number } | undefined,
   remoteVaultId: undefined as string | undefined, remotePoll: undefined as Pick<RemoteAnchor, 'endpoint' | 'objects' | 'checkedAt'> | undefined }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
   loadPackSetup: async () => undefined,
-  loadRemoteAnchor: async (vaultId: string) => structuredClone(state.observedKeyUpdate ??
+  savePackSetup: vi.fn(),
+  loadRemoteAnchor: async (vaultId: string) => structuredClone(state.packAnchor ?? state.observedKeyUpdate ??
     (state.remoteVaultId === vaultId ? { vaultId, ...state.remotePoll } : undefined)),
-  loadJournal: async () => ({ clock: structuredClone(state.pendingWal.at(-1)?.state), legacy: state.legacy }),
+  loadJournal: async () => ({ clock: structuredClone(state.packClock ?? state.pendingWal.at(-1)?.state), legacy: state.legacy }),
   hasPendingWal: async () => state.pendingWal.length > 0,
+  saveRemoteAnchor: async (anchor: RemoteAnchor, files: VaultFiles, clock?: JournalCommit['state']) => {
+    if (state.failSave) throw new Error('Test disk write failed');
+    state.packAnchor = structuredClone(anchor);
+    state.files = structuredClone(files);
+    if (clock) state.packClock = structuredClone(clock);
+  },
   saveVaultFiles: async (files: VaultFiles, change?: JournalCommit) => {
     if (state.failSave) throw new Error('Test disk write failed');
     state.files = structuredClone(files);
@@ -59,11 +74,32 @@ vi.mock('./vault-core', () => ({ loadVaultCore: async () => wasm, randomBytes: (
 vi.mock('./bridge', () => ({
   offscreen: vi.fn(),
   derive: async (operation: string, args: unknown[], signal?: AbortSignal) => {
+    if (operation === 'sync-pack-material') return Array.from(wasm_sync_pack_material(...args as Parameters<typeof wasm_sync_pack_material>));
+    if (operation === 'sync:authenticate-head') {
+      const head = wasm_sync_authenticate_head(...args as Parameters<typeof wasm_sync_authenticate_head>);
+      try { return { vaultId: head.vault_id, keyEpoch: head.key_epoch, localHead: Array.from(head.local_head) }; } finally { head.free(); }
+    }
+    if (operation === 'sync:genesis') {
+      const genesis = wasm_sync_create_genesis(...args as Parameters<typeof wasm_sync_create_genesis>);
+      try { return { head: Array.from(genesis.head), snap: Array.from(genesis.snap) }; } finally { genesis.free(); }
+    }
     if (operation === 'sync:local-wal') return Array.from(wasm_make_local_wal(...args as Parameters<typeof wasm_make_local_wal>));
     if (operation === 'sync:verify-recovery') return wasm_sync_verify_recovery(...args as Parameters<typeof wasm_sync_verify_recovery>);
+    if (operation === 'sync:guard-staged') return wasm_sync_guard_staged(...args as Parameters<typeof wasm_sync_guard_staged>);
+    if (operation === 'sync:devices') return wasm_sync_devices(...args as Parameters<typeof wasm_sync_devices>);
+    if (operation === 'sync:pack-edit') {
+      const result = wasm_sync_pack_edit(...args as Parameters<typeof wasm_sync_pack_edit>);
+      try { return result ? { head: Array.from(result.head), snap: Array.from(result.snap) } : null; } finally { result?.free(); }
+    }
+    if (operation === 'sync:device-change') {
+      const result = wasm_sync_device_change(...args as Parameters<typeof wasm_sync_device_change>);
+      try { return { head: Array.from(result.head), snap: Array.from(result.snap), conflicts: Array.from(result.conflicts), count: result.count,
+        conflictCount: result.conflict_count, draftCount: result.draft_count }; } finally { result.free(); }
+    }
     if (operation === 'sync:import-pack') {
       const result = wasm_sync_import_pack(...args as Parameters<typeof wasm_sync_import_pack>);
-      try { return { head: Array.from(result.head), snap: Array.from(result.snap), added: result.added, updated: result.updated, skipped: result.skipped }; }
+      try { return { head: Array.from(result.head), snap: Array.from(result.snap), conflicts: Array.from(result.conflicts),
+        added: result.added, updated: result.updated, skipped: result.skipped }; }
       finally { result.free(); }
     }
     if (operation === 'sign-authorization') return Array.from(wasm_sign_authorization(...args as Parameters<typeof wasm_sign_authorization>));
@@ -151,6 +187,8 @@ beforeEach(() => {
   state.observedKeyUpdate = undefined;
   state.remoteVaultId = undefined;
   state.remotePoll = undefined;
+  state.packAnchor = undefined;
+  state.packClock = undefined;
   state.settings = { autoLockMinutes: 15, pinFailures: 0 };
   vi.stubGlobal('browser', { alarms: { get: async () => undefined, create: vi.fn(), clear: vi.fn() }, runtime: { sendMessage: async () => undefined },
     idle: { queryState: async () => state.idleState },
@@ -165,6 +203,31 @@ afterEach(() => {
   vi.useRealTimers();
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
+
+const packInput = { provider: 'custom', base: 'https://dav.example.test/', folder: 'pack', username: 'fixture', password: 'fixture' } as const;
+const davListing = (path: string, date?: number) => new Response(`<multistatus xmlns="DAV:"><response><href>${path}</href><propstat>` +
+  '<prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>',
+  { status: 207, headers: date === undefined ? {} : { Date: new Date(date).toUTCString() } });
+
+async function linkedPack() {
+  const controller = await unlocked();
+  const session = state.session!, files = state.files!, config = webDavConfig(packInput);
+  const remote = wasm_sync_create_genesis(session.key, session.wrap, files.head, files.snap, '00000000000001_01020304_00000000000001');
+  const head = remote.head;
+  remote.free();
+  const root = await preparePackVersion({ id: 'a'.repeat(32), parents: [], vaultId: files.vaultId, createdAt: 1,
+    keyEpoch: files.keyEpoch, head }, Uint8Array.of(1));
+  const fields = [1, root.id, root.vaultId, [], root.sha256, root.bytes, root.createdAt, root.keyEpoch, btoa(String.fromCharCode(...head))];
+  const key = wasm_sync_pack_material(session.key, session.wrap);
+  const mac = btoa(String.fromCharCode(...wasm_sync_pack_record_sign(key, root.vaultId, new TextEncoder().encode(JSON.stringify(fields)))));
+  key.fill(0);
+  root.recordAuth = { etag: '"genesis"', mac };
+  state.packAnchor = { vaultId: files.vaultId, endpoint: await endpointFingerprint(config.url), head, snap: files.snap, objects: [],
+    appliedHead: files.head, appliedSnap: files.snap, hasRecords: false, pack: { base: root.id, known: [root], dirty: false,
+      baseRules: new Uint8Array(), baseConflicts: new Uint8Array(), siteRules: 'applied' } };
+  await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, () => {});
+  return controller;
+}
 
 describe('webpage password capture with the encrypted vault', () => {
   const url = 'https://example-bank.com/login';
@@ -448,6 +511,175 @@ describe('real WASM + background session integration', () => {
       await controller.lock();
       fetchMock.mockRestore();
     }
+  });
+
+  it.each([401, 403, 429])('stops an already-running pack sync when a second operation receives HTTP %s', async status => {
+    const controller = await linkedPack();
+    const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      if (init?.method === 'GET') { started.resolve(); await release.promise; return new Response(null, { status: 304 }); }
+      return String(url).endsWith('/versions/') ? davListing('/pack/versions/') : new Response(null, { status });
+    });
+    try {
+      const syncing = controller.handle({ type: 'webdav-sync' }).catch(error => error);
+      await started.promise;
+      await expect(controller.handle({ type: 'webdav-test' })).rejects.toThrow();
+      release.resolve();
+      await syncing;
+      expect(request.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(['/pack/pack-root.txt', '/pack/']);
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ paused: status, writeVerified: false });
+    } finally { release.resolve(); await controller.lock(); request.mockRestore(); }
+  });
+
+  it('revokes writing on a short published root in history, including an ongoing sync and a reopened worker', async () => {
+    const controller = await linkedPack();
+    const pack = state.packAnchor!.pack!;
+    const cipher = Uint8Array.of(3, 5, 8);
+    const version = await preparePackVersion({ id: 'b'.repeat(32), vaultId: fixture.vaultId, parents: [pack.base],
+      createdAt: 2, keyEpoch: 1 }, cipher);
+    pack.outbox = { ciphertext: cipher, version };
+    const before = structuredClone({ files: state.files, outbox: pack.outbox });
+    const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const request = vi.spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(async () => { started.resolve(); await release.promise; return new Response(null, { status: 304 }); })
+      .mockResolvedValueOnce(new Response(null, { headers: { 'Content-Length': '700' } }))
+      .mockImplementation(async () => davListing('/pack/versions/'));
+    try {
+      const syncing = controller.handle({ type: 'webdav-sync' }).catch(error => error);
+      await started.promise;
+      await expect(controller.handle({ type: 'webdav-history' })).rejects.toThrow(/700 字节.*0 字节/);
+      await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({ pending: true, writeVerified: false });
+      release.resolve();
+      await syncing;
+      expect(request.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(['/pack/pack-root.txt', '/pack/pack-root.txt']);
+      expect({ files: state.files, outbox: state.packAnchor?.pack?.outbox }).toEqual(before);
+    } finally { release.resolve(); await controller.lock(); request.mockRestore(); }
+  });
+
+  it.each(['HTTP 503', 'interrupted transfer', 'newer record format'])('retains the write proof and pending edits after %s', async fault => {
+    const controller = await linkedPack();
+    state.packAnchor!.pack!.dirty = true;
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      if (fault === 'HTTP 503') return new Response(null, { status: 503 });
+      if (fault === 'newer record format') return Response.json([[3, 'future fields'], 'future signature']);
+      return new Response(new ReadableStream<Uint8Array>({ start(stream) {
+        stream.enqueue(Uint8Array.of(91)); stream.error(new TypeError('network interrupted'));
+      } }), { headers: { 'Content-Length': '700' } });
+    });
+    try {
+      await expect(controller.handle({ type: 'webdav-sync' })).rejects.toThrow();
+      await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({ pending: true, writeVerified: true });
+      expect(request).toHaveBeenCalledTimes(1);
+    } finally { await controller.lock(); request.mockRestore(); }
+  });
+
+  it('reports a damaged local outbox without revoking the remote write proof or replacing the outbox', async () => {
+    const controller = await linkedPack();
+    const pack = state.packAnchor!.pack!;
+    const version = await preparePackVersion({ id: 'b'.repeat(32), vaultId: fixture.vaultId, parents: [pack.base],
+      createdAt: 2, keyEpoch: 1 }, Uint8Array.of(1, 2));
+    pack.outbox = { version, ciphertext: Uint8Array.of(0, 1) };
+    const before = structuredClone(pack.outbox);
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_, init) =>
+      init?.method === 'GET' ? new Response(null, { status: 304 }) : davListing('/pack/versions/'));
+    try {
+      await expect(controller.handle({ type: 'webdav-sync' })).rejects.toThrow(/本机待发布/);
+      expect(request.mock.calls.map(([, init]) => init?.method)).toEqual(['GET', 'PROPFIND']);
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ writeVerified: true, pending: true });
+      expect(state.packAnchor!.pack!.outbox).toEqual(before);
+    } finally { await controller.lock(); request.mockRestore(); }
+  });
+
+  it.each(['short directory response', 'repeated member', 'unavailable directory entry'] as const)(
+    'distinguishes failure to authenticate a versions listing from a temporary error for %s', async fault => {
+      const controller = await linkedPack();
+      const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_, init) => {
+        if (init?.method === 'GET') return new Response(null, { status: 304 });
+        const own = '<response><href>/pack/versions/</href><propstat><prop><resourcetype><collection/></resourcetype>' +
+          '</prop><status>HTTP/1.1 200 OK</status></propstat></response>';
+        const skipped = '<response><href>/pack/versions/unavailable</href><status>HTTP/1.1 503 Unavailable</status></response>';
+        const body = `<multistatus xmlns="DAV:">${own}${fault === 'repeated member' ? own : fault === 'unavailable directory entry' ? skipped : ''}</multistatus>`;
+        return new Response(body, { status: 207, headers: fault === 'short directory response' ? { 'Content-Length': String(body.length + 20) } : {} });
+      });
+      try {
+        await expect(controller.handle({ type: 'webdav-sync' })).rejects.toThrow();
+        await expect(new VaultController().handle({ type: 'webdav-status' })).resolves.toMatchObject({
+          writeVerified: fault === 'unavailable directory entry',
+        });
+      } finally { await controller.lock(); request.mockRestore(); }
+    });
+
+  it.each(['switch', 'lock'] as const)('ignores a late stop from a retired connection after %s', async action => {
+    const controller = await linkedPack();
+    const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      if (init?.method === 'GET') { started.resolve(); await release.promise; return new Response(null, { status: 401 }); }
+      return davListing(new URL(String(url)).pathname);
+    });
+    try {
+      const syncing = controller.handle({ type: 'webdav-sync' }).catch(error => error);
+      await started.promise;
+      if (action === 'lock') await controller.lock();
+      else await controller.handle({ type: 'webdav-test', input: { ...packInput, folder: 'new-target' }, remember: true });
+      release.resolve();
+      await syncing;
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ paused: undefined });
+      expect(request).toHaveBeenCalledTimes(action === 'lock' ? 1 : 2);
+    } finally { release.resolve(); await controller.lock(); request.mockRestore(); }
+  });
+
+  it.each([207, 404])('keeps a stop on the old connection when its reply arrives during an HTTP %s switch', async status => {
+    const controller = await linkedPack();
+    const polling = Promise.withResolvers<void>(), releasePoll = Promise.withResolvers<void>();
+    const testing = Promise.withResolvers<void>(), releaseTest = Promise.withResolvers<void>();
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      if (init?.method === 'GET') { polling.resolve(); await releasePoll.promise; return new Response(null, { status: 429 }); }
+      testing.resolve(); await releaseTest.promise;
+      return status === 404 ? new Response(null, { status }) : davListing(new URL(String(url)).pathname);
+    });
+    try {
+      const sync = controller.handle({ type: 'webdav-sync' }).catch(error => error);
+      await polling.promise;
+      const test = controller.handle({ type: 'webdav-test', input: { ...packInput, folder: 'new-target' }, remember: true });
+      await testing.promise;
+      releasePoll.resolve();
+      await vi.waitFor(() => expect(state.local.webDavPaused).toBe(429));
+      releaseTest.resolve();
+      await Promise.all([sync, test]);
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ paused: status === 404 ? 429 : undefined, writeVerified: false });
+    } finally { releasePoll.resolve(); releaseTest.resolve(); await controller.lock(); request.mockRestore(); }
+  });
+
+  it('refreshes an opted-in clock from the current pack versions directory and ignores late samples after switching', async () => {
+    let now = 1_800_000_005_000;
+    state.settings.autoLockMinutes = 240;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const controller = await linkedPack();
+    const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let delay = false;
+    const request = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (init?.method === 'GET') return new Response(null, { status: 304 });
+      if (delay && path === '/pack/versions/') { started.resolve(); await release.promise; }
+      return davListing(path, now + (path === '/second/' ? 72 : 45) * 1000);
+    });
+    try {
+      await expect(controller.handle({ type: 'webdav-scheduled', reason: 'interval' })).resolves.toEqual({ kind: 'unchanged', pending: false });
+      await controller.handle({ type: 'webdav-clock', enabled: true });
+      now += 29 * 60_000;
+      await controller.handle({ type: 'webdav-scheduled', reason: 'interval' });
+      now += 2 * 60_000;
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ compensation: true, offsetSeconds: 45 });
+      now += 31 * 60_000;
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ compensation: true, offsetSeconds: null });
+      delay = true;
+      const syncing = controller.handle({ type: 'webdav-scheduled', reason: 'interval' }).catch(error => error);
+      await started.promise;
+      await controller.handle({ type: 'webdav-test', input: { ...packInput, folder: 'second' }, remember: true });
+      release.resolve();
+      await syncing;
+      await expect(controller.handle({ type: 'webdav-status' })).resolves.toMatchObject({ offsetSeconds: 72 });
+    } finally { release.resolve(); await controller.lock(); request.mockRestore(); clock.mockRestore(); }
   });
 
   it.each([403, 429])('restarts linked polling after a non-Koofr HTTP %s without replacing a valid password', async status => {
@@ -960,6 +1192,98 @@ describe('real WASM + background session integration', () => {
     await expect(controller.handle({ type: 'get', id: saved!.id, proof: pin })).resolves.toMatchObject({ title: item.title });
     expect(state.files!.changesSinceBackup).toBe(1);
   });
+  it('attributes existing credentials to the device that creates a new pack and pairs them with the authenticated genesis head', async () => {
+    const controller = await unlocked();
+    Object.assign(browser.runtime, { getPlatformInfo: async () => ({ os: 'win', arch: 'x86-64' }), getManifest: () => ({ version: '1' }) });
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('Saved before linking')) });
+    const [{ id }] = await controller.handle({ type: 'list' }) as [ItemSummary];
+    const input = { provider: 'custom', base: 'https://dav.example.test/', folder: 'fixture', username: 'desktop', password: 'fixture' } as const;
+    // Inspect the real prepared ciphertext before the first request to the DAV server.
+    vi.mocked(savePackSetup).mockRejectedValueOnce(new Error('fixture disk boundary'));
+    await expect(controller.handle({ type: 'webdav-create', input, masterPassword: password, deviceName: 'Origin desktop' }))
+      .rejects.toThrow('fixture disk boundary');
+    const [, setup] = vi.mocked(savePackSetup).mock.calls.at(-1)!;
+    const { key, wrap } = state.session!;
+    const view = await openPackContent(new Uint8Array(wasm_sync_pack_material(key, wrap)), setup.version, setup.ciphertext);
+    const other = new wasm.WasmVaultEngine();
+    const remote = wasm_sync_authenticate_head(setup.version.head!, key, wrap);
+    try {
+      other.restore_from_session(key, wrap, fixture.head, fixture.snap);
+      const alternate = other.upsert_item_json(JSON.stringify({ ...record('Offline candidate'), id }), Date.now());
+      const empty = new Uint8Array();
+      try {
+        const fork = wasm_sync_pack_merge(key, wrap, fixture.head, fixture.snap, alternate.head_bytes, alternate.snap_bytes,
+          view.head, view.snap, empty, empty, view.conflicts);
+        try { expect(JSON.parse(wasm_sync_conflicts(key, wrap, fork.conflicts, false))).toMatchObject([{ theirs: { source: 'Origin desktop' } }]); }
+        finally { fork.free(); }
+      } finally { alternate.free(); }
+      expect(wasm_sync_verify_snapshot(key, wrap, remote.local_head, view.snap)).toBe(1);
+      expect(view.head).toEqual(remote.local_head);
+    } finally { remote.free(); other.free(); }
+  });
+
+  it('keeps the identity of a first edit on a joined device and shows its registered name in a remote review', async () => {
+    const controller = await unlocked(), empty = new Uint8Array();
+    Object.assign(browser.runtime, { getPlatformInfo: async () => ({ os: 'win', arch: 'x86-64' }), getManifest: () => ({ version: '1' }) });
+    state.packAnchor = { vaultId: fixture.vaultId, endpoint: 'test', head: fixture.head, snap: empty, objects: [],
+      appliedHead: fixture.head, appliedSnap: fixture.snap, checkedAt: 1, hasRecords: false,
+      pack: { base: 'fixture', known: [], dirty: false, siteRules: 'applied', baseRules: empty, baseConflicts: empty } };
+    await controller.handle({ type: 'upsert', itemJson: JSON.stringify(record('First joined edit')) });
+    const devices = () => controller.handle({ type: 'webdav-devices' }) as Promise<{ active?: string; registered: boolean }>;
+    const before = await devices();
+    expect(before.active).toMatch(/^[0-9a-f-]{36}$/);
+    await controller.handle({ type: 'webdav-device-change', action: 'register', name: 'Travel laptop', proof });
+    expect(await devices()).toMatchObject({ active: before.active, registered: true });
+    const [{ id }] = (await controller.handle({ type: 'list' }) as [ItemSummary]);
+    const { key, wrap } = state.session!;
+    const other = new wasm.WasmVaultEngine();
+    try {
+      other.restore_from_session(key, wrap, fixture.head, fixture.snap);
+      const alternative = other.upsert_item_json(JSON.stringify({ ...record('Offline edit'), id }), Date.now());
+      try {
+        const merged = wasm_sync_pack_merge(key, wrap, fixture.head, fixture.snap, alternative.head_bytes, alternative.snap_bytes,
+          state.files!.head, state.files!.snap, empty, empty, empty);
+        try { expect(JSON.parse(wasm_sync_conflicts(key, wrap, merged.conflicts, false))).toMatchObject([{ theirs: { source: 'Travel laptop' } }]); }
+        finally { merged.free(); }
+      } finally { alternative.free(); }
+    } finally { other.free(); }
+  });
+
+  it('publishes an explicitly restored .vaultpack entry and keeps the other permanent deletion reviewable', async () => {
+    const controller = await unlocked();
+    const add = (title: string) => controller.handle({ type: 'upsert', itemJson: JSON.stringify(record(title)) });
+    await add('Backed up');
+    const filePassword = 'Fixture-backup#2026';
+    const { bytes } = await controller.handle({ type: 'export', password: filePassword, proof }) as BackupExport;
+    await add('Stay deleted');
+    const original = structuredClone(state.files!);
+    const rows = await controller.handle({ type: 'list' }) as ItemSummary[];
+    for (const { id } of rows) await controller.handle({ type: 'trash', id, trashed: true });
+    await controller.handle({ type: 'empty-trash', expectedIds: rows.map(row => row.id) });
+    const { key, wrap } = state.session!;
+    const empty = new Uint8Array();
+    function merge(base: VaultFiles, local: VaultFiles, remote: VaultFiles, stages = [empty, empty, empty] as Uint8Array[]) {
+      const result = wasm_sync_pack_merge(key, wrap, base.head, base.snap, local.head, local.snap, remote.head, remote.snap,
+        stages[0]!, stages[1]!, stages[2]!);
+      try { return { files: { ...local, head: result.head, snap: result.snap }, conflicts: result.conflicts, count: result.count }; }
+      finally { result.free(); }
+    }
+    const published = merge(original, state.files!, original);
+    state.packAnchor = { vaultId: original.vaultId, endpoint: 'fixture', head: published.files.head, snap: empty, objects: [],
+      appliedHead: published.files.head, appliedSnap: published.files.snap, checkedAt: 1, hasRecords: true, conflicts: published.conflicts,
+      pack: { base: 'fixture', known: [], dirty: false, siteRules: 'applied', baseRules: empty, baseConflicts: published.conflicts } };
+    const input = { bytes, password: filePassword, proof };
+    const preview = await controller.handle({ type: 'preview-vaultpack', ...input }) as VaultPackPreview;
+    expect(preview.added).toBe(1);
+    expect(await controller.handle({ type: 'import', ...input, stamp: preview.stamp })).toBe(1);
+    const next = merge(published.files, state.files!, published.files,
+      [published.conflicts, state.packAnchor.conflicts!, published.conflicts]);
+    expect(next.count).toBe(1);
+    const offline = merge(fixture, original, next.files, [empty, empty, next.conflicts]);
+    const conflicts = JSON.parse(wasm_sync_conflicts(key, wrap, offline.conflicts, false));
+    expect(conflicts).toMatchObject([{ id: rows.find(row => row.title === 'Stay deleted')!.id, fields: ['$item'] }]);
+  });
+
   it('imports a backup with the linked target recovery code without changing target identity or granting export', async () => {
     const source = await unlocked();
     const backupPassword = 'Separate-Pack-Password#2026';

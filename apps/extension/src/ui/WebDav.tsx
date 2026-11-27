@@ -18,7 +18,7 @@ const probeText: Record<DavProbe['kind'], string> = {
   empty: '已连接，目标目录为空。只读测试未创建任何文件。',
   existing: '找到已有密码库。连接测试没有下载或更改凭证。',
   incomplete: '目录非空，但没有找到完整的密码库。请核对目录或检查远端文件。',
-  missing: '目标目录还不存在。只有完成写入验证并确认建库后，才会创建。',
+  missing: '目标目录还不存在。确认建库时会创建目录并在其中验证写入。',
 };
 const syncText: Record<SyncResult['kind'], string> = {
   synced: '同步完成。',
@@ -61,7 +61,6 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const [method, setMethod] = useState<'master' | 'recovery'>('master');
   const [secret, setSecret] = useState('');
   const [confirm, setConfirm] = useState('');
-  const [scratchFolder, setScratchFolder] = useState('');
   const [deviceName, setDeviceName] = useState<string>();
   const [fromSaved, setFromSaved] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult>();
@@ -197,7 +196,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const create = () => run(async () => {
     if (onboarding && !resumingGenesis && secret !== confirm) throw new Error('两次主密码输入不一致。');
     const kit = await request<EmergencyKit | undefined>({ type: 'webdav-create', input: fromSaved ? undefined : input,
-      scratchFolder, masterPassword: secret, deviceName });
+      masterPassword: secret, deviceName });
     setSecret(''); setPassword(''); setConfirm(''); setResult(undefined);
     if (kit) onCreated?.(kit);
     else await refresh?.();
@@ -215,7 +214,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   });
   const enable = () => run(async () => {
     try {
-      await request({ type: 'webdav-enable-write', scratchFolder, masterPassword: secret });
+      await request({ type: 'webdav-enable-write', masterPassword: secret });
       setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
       setVerifyWrites(false); setSyncResult(undefined);
     } finally { setSecret(''); }
@@ -300,11 +299,13 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     {status?.siteRulesApplied && !!status.siteRuleConflicts && <button className="btn" type="button" disabled={busy} onClick={() => void run(loadRuleConflicts)}>
       处理 {status.siteRuleConflicts} 项关联域名冲突</button>}
     {status?.linked && verifyWrites && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void enable(); }}>
-      <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy} />
       <SecretField label="当前主密码" value={secret} onChange={setSecret} required maxLength={1024} disabled={busy} autoComplete="current-password" />
       <button className="btn btn-primary" disabled={busy}>验证并启用网盘写入</button>
     </form>}
-    {syncDisplay && <p className={syncDisplay === 'synced' || syncDisplay === 'unchanged' ? 'banner banner-ok' : 'banner banner-warn'}
+    {status?.checkFailed && !status.paused && <p className="banner banner-warn" role="status">
+      上次同步检查失败，本机修改已保留。点「立即同步」查看原因。若版本无法验证，请核对网盘历史或更新扩展。
+    </p>}
+    {!status?.checkFailed && syncDisplay && <p className={syncDisplay === 'synced' || syncDisplay === 'unchanged' ? 'banner banner-ok' : 'banner banner-warn'}
       role="status">{syncText[syncDisplay]}</p>}
     {latestResult?.kind === 'confirm-deletion' && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void sync(true); }}>
       <p className="hint">移除 {latestResult.removed} 条有效凭证（{latestResult.before} → {latestResult.after} 条）。</p>
@@ -351,8 +352,6 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     </form>}
     {!status?.linked && !status?.paused && (resumingGenesis || result?.kind === 'empty' || result?.kind === 'missing') && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void create(); }}>
       {!resumingGenesis && <TextField label="本机名称" value={deviceName ?? ''} onChange={setDeviceName} maxLength={80} disabled={busy} />}
-      <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy}
-        hint="与同步目录同级，必须已存在且为空。只在此目录读写随机测试文件。" />
       <SecretField label={onboarding && !resumingGenesis ? '新主密码' : '当前主密码'} value={secret} onChange={setSecret} required
         minLength={onboarding ? 12 : undefined} maxLength={1024} disabled={busy} autoComplete={onboarding && !resumingGenesis ? 'new-password' : 'current-password'} />
       {onboarding && !resumingGenesis && <SecretField label="再次输入主密码" value={confirm} onChange={setConfirm} required disabled={busy}

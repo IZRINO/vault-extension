@@ -17,6 +17,10 @@ pub(crate) struct Provenance {
 }
 
 impl Provenance {
+    pub(crate) fn source(&self, devices: &[DeviceMetadata], item_id: &str, fallback: &str) -> String {
+        source(devices, self.writers.get(item_id).map(String::as_str), fallback)
+    }
+
     pub(crate) fn read(bytes: &[u8]) -> Result<Self, VaultError> {
         let mut out = Self::default();
         if bytes.is_empty() { return Ok(out); }

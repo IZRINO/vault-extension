@@ -85,14 +85,14 @@ export type VaultMessage =
   | { type: 'webdav-status' }
   | { type: 'webdav-test'; input?: import('./sync/webdav').WebDavInput; remember?: boolean }
   | { type: 'webdav-clock'; enabled: boolean }
-  | { type: 'webdav-create'; input?: import('./sync/webdav').WebDavInput; scratchFolder: string; masterPassword: string; deviceName?: string }
+  | { type: 'webdav-create'; input?: import('./sync/webdav').WebDavInput; masterPassword: string; deviceName?: string }
   | { type: 'webdav-join'; input: import('./sync/webdav').WebDavInput; method: 'master' | 'recovery'; secret: string }
   | { type: 'webdav-site-rules' }
   | { type: 'webdav-site-rules-choice'; use: boolean; stamp: string }
   | { type: 'webdav-rule-conflicts' }
   | { type: 'webdav-rule-conflict-choice'; stamp: string; index: number; choice: 'first' | 'second' }
   | { type: 'webdav-merge'; input: import('./sync/webdav').WebDavInput; method: 'master' | 'recovery'; secret: string; proof: Proof; stamp?: string }
-  | { type: 'webdav-enable-write'; scratchFolder: string; masterPassword: string }
+  | { type: 'webdav-enable-write'; masterPassword: string }
   | { type: 'webdav-update-key'; password: string }
   | { type: 'webdav-sync'; confirmation?: { stamp: string; proof: Proof } }
   | { type: 'webdav-conflicts'; reveal?: Proof }

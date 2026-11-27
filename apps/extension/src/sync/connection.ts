@@ -1,15 +1,17 @@
 import { derive } from '../bridge';
 import type { SessionState } from '../vault-storage';
 import { endpointFingerprint } from './bootstrap';
-import { davPresets, probeWebDav, webDavConfig, type DavContext, type DavProbe, type DavStopStatus, type WebDavConfig, type WebDavInput } from './webdav';
+import { davPresets, probeWebDav, webDavConfig, WebDavStop, type DavContext, type DavProbe, type DavStopStatus, type WebDavConfig, type WebDavInput } from './webdav';
 
 interface Seal { vaultId: string; bytes: number[] }
+const readOnlySeals = new WeakMap<WebDavConfig, Seal>();
+const sessionFallbacks = new WeakMap<SessionState, { source: number[]; seal: Seal }>();
 interface ClockSample { offset: number | null; observedAt: number; enabled: boolean }
 interface LocalData { webDavSealed?: Seal; webDavPaused?: DavStopStatus | null; webDavClock?: ClockSample; webDavConflicts?: number }
 export interface DavConnectionStatus {
   saved: boolean; paused?: DavStopStatus; offsetSeconds: number | null; clockExpiresAt?: number; compensation: boolean;
   linked?: boolean; writeVerified?: boolean; conflicts?: number; drafts?: number; localRestoreHeld?: boolean; format?: 'pack'; pending?: boolean;
-  siteRulesPending?: boolean; siteRulesApplied?: boolean; siteRuleConflicts?: number;
+  siteRulesPending?: boolean; siteRulesApplied?: boolean; siteRuleConflicts?: number; checkFailed?: boolean;
 }
 const keys: (keyof LocalData)[] = ['webDavSealed', 'webDavPaused', 'webDavClock', 'webDavConflicts'];
 const maxClockAge = 30 * 60 * 1000;
@@ -39,9 +41,56 @@ export async function showConflictBadge(count: number) {
   await restoreDavBadge();
 }
 
-export async function pauseDav(status: DavStopStatus) {
+async function pauseDav(status: DavStopStatus) {
   await browser.storage.local.set({ webDavPaused: status });
   await showBadge(true).catch(() => undefined);
+}
+
+// Share a stop immediately, before storage or badge updates yield. Replacing a
+// connection retires its request contexts, including replies already in flight.
+export class DavRequestGate {
+  private readonly endpoints = new Map<string, { stopped?: WebDavStop; readOnly?: boolean }>();
+  constructor(private readonly onPause: () => void) {}
+
+  reset() { this.endpoints.clear(); }
+  stopped(url: string) { return !!this.endpoints.get(url)?.stopped; }
+
+  context(config: WebDavConfig, operation: DavContext, retry = false, persist = true) {
+    const url = config.url;
+    let shared = this.endpoints.get(url);
+    if (!shared || (retry && shared.stopped)) {
+      shared = {};
+      this.endpoints.set(url, shared);
+    }
+    const endpoint = shared;
+    const startedReadOnly = endpoint.readOnly;
+    if (endpoint.readOnly) config.writeVerified = false;
+    const current = () => {
+      if (operation.signal?.aborted) throw new Error('密码库已锁定，已停止 WebDAV 请求。');
+      if (this.endpoints.get(url) !== endpoint) throw new Error('网盘连接已变更，请重新检查。');
+      if (endpoint.stopped) throw endpoint.stopped;
+    };
+    return { ...operation, check: () => {
+      current();
+      if (startedReadOnly !== endpoint.readOnly) throw new Error('网盘已恢复只读，请重新检查。');
+      operation.check?.();
+    },
+      revokeWriting: () => {
+        current();
+        const seal = readOnlySeals.get(config);
+        if (!seal) throw new Error('无法恢复只读连接，请重新测试并保存网盘设置。');
+        endpoint.readOnly = true;
+        return browser.storage.local.set({ webDavSealed: seal });
+      },
+      stop: (status: DavStopStatus) => {
+        current();
+        endpoint.stopped = new WebDavStop(status);
+        if (persist) {
+          this.onPause();
+          return pauseDav(status);
+        }
+      } };
+  }
 }
 
 export async function requireDavHealthy() {
@@ -103,25 +152,44 @@ export async function openSavedDav(state: SessionState, vaultId: string): Promis
   const base = `${target.origin}/${parts.join('/')}`;
   const valid = webDavConfig({ provider: 'custom', base, folder, username: config.username, password: config.password, confirmHttp: true });
   if (valid.url !== config.url) throw new Error('加密的网盘地址无效。');
-  return { ...valid, writeVerified: config.writeVerified === true };
+  const saved = { ...valid, writeVerified: config.writeVerified === true };
+  if (saved.writeVerified) {
+    // Keep the sealed fallback ready before any network request. A lock may
+    // erase the session key immediately after an integrity failure is observed.
+    const source = webDavSealed.bytes;
+    let cached = sessionFallbacks.get(state);
+    if (!cached || cached.seal.vaultId !== vaultId || cached.source.length !== source.length ||
+        !cached.source.every((byte, index) => byte === source[index])) {
+      const bytes = await derive<number[]>('seal-webdav', [state.key, state.wrap, JSON.stringify({ ...saved, writeVerified: false })]);
+      cached = { source, seal: { vaultId, bytes } };
+      sessionFallbacks.set(state, cached);
+    }
+    readOnlySeals.set(saved, cached.seal);
+  }
+  return saved;
 }
 
 export async function testDav(input: WebDavInput | undefined, remember: boolean, session: SessionState | undefined, vaultId: string | undefined,
-  context: DavContext, linkedEndpoint?: string): Promise<{ probe: DavProbe; resumed: boolean }> {
+  operation: DavContext, gate: DavRequestGate, linkedEndpoint?: string): Promise<{ probe: DavProbe; resumed: boolean }> {
   if ((!input || remember) && (!session || !vaultId)) throw new Error('请先创建或解锁密码库，才能保存网盘设置。');
   const stored = await read();
-  context.check?.();
+  operation.check?.();
   const paused = pauseStatus(stored);
-  const correctSaved = !!paused && !!stored.webDavSealed && stored.webDavSealed.vaultId === vaultId;
+  const hasSaved = !!stored.webDavSealed && stored.webDavSealed.vaultId === vaultId;
+  const correctSaved = !!paused && hasSaved;
   if (correctSaved && (!input || !remember)) throw new Error(correctedSettingsNeeded);
   const config = input ? webDavConfig(input) : await openSavedDav(session!, vaultId!);
   try {
     if (paused && linkedEndpoint && await endpointFingerprint(config.url) !== linkedEndpoint)
       throw new Error('连接地址与已验证的库不同。请在原同步目录修正连接设置。');
-    if (correctSaved) {
+    let sameTarget = !input || !hasSaved;
+    let previousUrl: string | undefined;
+    if (input && hasSaved) {
       const saved = await openSavedDav(session!, vaultId!);
       try {
-        if (config.password === saved.password) {
+        previousUrl = saved.url;
+        sameTarget = config.url === saved.url;
+        if (correctSaved && config.password === saved.password) {
           if (new URL(config.url).origin === koofrOrigin && new URL(saved.url).origin === koofrOrigin)
             throw new Error('Koofr 连接已暂停。请更换应用专用密码，再测试并保存连接。');
           // Outside Koofr, fixing permissions or waiting out a throttle need not change the login.
@@ -130,17 +198,22 @@ export async function testDav(input: WebDavInput | undefined, remember: boolean,
         }
       } finally { saved.password = ''; saved.username = ''; }
     }
-    const probe = await probeWebDav(config, { ...context, stop: pauseDav });
-    context.check?.();
+    operation.check?.();
+    const context = gate.context(config, operation, !!paused || !sameTarget, sameTarget);
+    const probe = await probeWebDav(config, context);
+    context.check();
     // A 404 does not establish that the server accepted the application credentials.
     if (probe.kind !== 'empty' && probe.kind !== 'existing' && !(input && probe.kind === 'missing' && !paused))
       return { probe, resumed: false };
     if (remember) {
       const update = await sealDavSettings(config, session!, vaultId!, probe.offsetSeconds, stored);
-      context.check?.();
+      context.check();
+      if (probe.kind === 'missing' && previousUrl && gate.stopped(previousUrl)) return { probe, resumed: false };
+      gate.reset();
       // Make the corrected, read-only connection and clearing the pause visible together.
-      await browser.storage.local.set({ ...update, ...(paused ? { webDavPaused: null } : {}) });
-      if (paused) await restoreDavBadge().catch(() => undefined);
+      const resetPause = !!paused || !sameTarget;
+      await browser.storage.local.set({ ...update, ...(resetPause ? { webDavPaused: null } : {}) });
+      if (resetPause) await restoreDavBadge().catch(() => undefined);
     } else if (!input) {
       const clock: ClockSample = { offset: probe.offsetSeconds, observedAt: Date.now(), enabled: stored.webDavClock?.enabled === true };
       await browser.storage.local.set({ webDavClock: clock });

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { probeWebDav, webDavConfig, WebDavStop, type WebDavInput } from './webdav';
+import { probeWebDav, webDavConfig, WebDavClient, WebDavStop, type WebDavInput } from './webdav';
 
 const input: WebDavInput = { provider: 'koofr', base: '', folder: 'Vault test', username: 'test@example.com', password: 'Fixture app password' };
 const endpoint = 'https://app.koofr.net/dav/Koofr/Vault%20test/';
@@ -8,6 +8,50 @@ const row = (href: string, collection = false, status = 200) =>
 const root = row('/dav/Koofr/Vault%20test/', true);
 const xml = (...rows: string[]) => `<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">${rows.join('')}</D:multistatus>`;
 const response = (...rows: string[]) => new Response(xml(...rows), { status: 207, headers: { Date: new Date(1_000_045_000).toUTCString() } });
+
+describe('WebDAV file download', () => {
+  it('reports the expected and received byte counts when a successful GET delivers an empty body', async () => {
+    const request = async () => new Response(null, { status: 200, headers: { 'Content-Length': '32' } });
+    const client = new WebDavClient(webDavConfig(input), {}, request);
+    await expect(client.get('head.bin', 64)).rejects.toThrow(/32 字节.*0 字节/);
+  });
+  it('reports how many bytes arrived when the browser signals a truncated transfer', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(Uint8Array.of(1, 2, 3)); },
+      pull(controller) { controller.error(new TypeError('network error')); },
+    });
+    const client = new WebDavClient(webDavConfig(input), {}, async () =>
+      new Response(body, { headers: { 'Content-Length': '32' } }));
+    await expect(client.get('head.bin', 64)).rejects.toThrow(/32 字节.*3 字节/);
+  });
+  it('accepts a decoded response whose wire length differs from its file size', async () => {
+    const file = Uint8Array.of(4, 8, 15);
+    const client = new WebDavClient(webDavConfig(input), {}, async () => new Response(file, { headers: {
+      'Content-Encoding': 'gzip', 'Content-Length': '23', ETag: '"compressed"',
+    } }));
+    await expect(client.get('head.bin', 64)).resolves.toEqual({ bytes: file, etag: '"compressed"' });
+  });
+  it('identifies a Koofr short download with its support request ID', async () => {
+    const requestId = '0a1bcdef-1234-4321-8899-0123456789ab';
+    const request = async () => new Response(null, { headers: { 'Content-Length': '32', 'X-Request-ID': requestId } });
+    const client = new WebDavClient(webDavConfig(input), {}, request);
+    await expect(client.get('head.bin', 64)).rejects.toThrow(
+      new RegExp(`32 字节.*0 字节.*Koofr.*文件类型.*${requestId}`),
+    );
+  });
+  it.each([
+    ['https://other.example/dav/', 'x-private-diagnostic'],
+    ['https://app.koofr.net.example/dav/Koofr/', 'x-private-diagnostic'],
+    ['https://app.koofr.net/dav/Koofr/', 'x-private-diagnostic'],
+  ])('keeps arbitrary response header text out of the short-read error for %s', async (url, identifier) => {
+    const request = async () => new Response(null, { headers: { 'Content-Length': '32', 'X-Request-ID': identifier } });
+    const client = new WebDavClient({ url, username: 'test', password: 'fixture' }, {}, request);
+    const failure = await client.get('head.bin', 64).then(() => '', (error: Error) => error.message);
+    expect(failure).toContain('实际收到 0 字节');
+    expect(failure).not.toContain(identifier);
+    expect(failure.includes('Koofr')).toBe(url.startsWith('https://app.koofr.net/'));
+  });
+});
 
 describe('read-only WebDAV connection', () => {
   it('uses the exact provider collection and never tests write access with a mutation', async () => {
@@ -61,5 +105,16 @@ describe('read-only WebDAV connection', () => {
     await expect(probeWebDav(conf, { signal: lock.signal, check: guard }, async () => {
       lock.abort(); return response(root);
     })).rejects.toThrow('已锁定');
+  });
+  it('refreshes the clock sample on a regular pack version poll and expires an invalid sample', async () => {
+    const now = () => 1_000_000_000;
+    const folder = row(endpoint + 'versions/', true);
+    const requests = vi.fn().mockResolvedValueOnce(response(folder)).mockResolvedValueOnce(new Response(xml(folder), { status: 207 }));
+    const observeClock = vi.fn();
+    const client = new WebDavClient(webDavConfig(input), { observeClock }, requests, now);
+    await client.list('versions/');
+    await client.list('versions/');
+    expect(observeClock.mock.calls).toEqual([[45, now()], [null, now()]]);
+    expect(requests.mock.calls.map(([url]) => url)).toEqual([endpoint + 'versions/', endpoint + 'versions/']);
   });
 });

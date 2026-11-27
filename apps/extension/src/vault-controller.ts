@@ -10,16 +10,16 @@ import type { CaptureTarget, FillCandidate, FillKind, FillPayload } from './auto
 import { planMigration, type MigrationBatch } from './migration';
 import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTABLE_FORMATS, STALE_EDIT, type AuthBackupPreview, type MigrationExport, type MigrationPreview } from './vault-messages';
 import type { QrScan } from './vault-messages';
-import { davClockOffset, davStatus, observeDavClock, openSavedDav, pauseDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
+import { DavRequestGate, davClockOffset, davStatus, observeDavClock, openSavedDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
 import { adoptDevice, nextJournalVersion, type JournalClock } from './sync/journal-device';
 import { endpointFingerprint, HEAD_LIMIT, packSyncFrames, readRemoteVault, type RemoteHeadInfo, type ReplayOutput } from './sync/bootstrap';
-import { proveConditionalWrites, WebDavClient, webDavConfig, type WebDavConfig } from './sync/webdav';
+import { proveLegacyWritesInVault, WebDavClient, webDavConfig, type WebDavConfig } from './sync/webdav';
 import { runDavSync, type SyncResult } from './sync/run';
 import { deviceProfile } from './sync/device-profile';
 import { listHistory, prepareRestore, restoreHistory, restoreHistoryLocally } from './sync/history';
 import { newPackVersionId, PackIntegrityError, PackTransport, preparePackVersion, type PackVersion } from './sync/pack-transport';
 import { openPackContent, openSetupRecovery, sealPackContent, sealSetupRecovery } from './sync/pack-content';
-import { applyPackFiles, applyPackView, combinePacks, equalPackBytes, fromPackMerge, inspectPack, latestPackWrap, loadPackContent, newPackAnchor,
+import { applyPackFiles, applyPackView, combinePacks, equalPackBytes, fromPackMerge, hasPendingPackWork, inspectPack, latestPackWrap, loadPackContent, newPackAnchor,
   packGraph, packMaterial, runWholeSync, type PackView } from './sync/pack-sync';
 import { emptySiteRules, openPackRules, preservePackRuleConflicts, resolvePackRuleConflict, sealPackRules, validatePackRules } from './sync/pack-settings';
 import { wholeHistory } from './sync/pack-history';
@@ -99,6 +99,7 @@ export class VaultController {
   private autofill?: AutofillSettings;
   private auditAbort = new AbortController();
   private davAbort = new AbortController();
+  private readonly davRequests = new DavRequestGate(() => { this.davClock = undefined; });
   private davClock?: Promise<Awaited<ReturnType<typeof readDavClock>>>;
   private davTimer?: ReturnType<typeof setTimeout>;
   private davFlight?: Promise<SyncResult>;
@@ -229,8 +230,8 @@ export class VaultController {
       if (result.snap.length) {
         const files = { ...active, head: new Uint8Array(result.head), snap: new Uint8Array(result.snap),
           updatedAtMs: Date.now(), everHadRecords: true, changesSinceBackup: active.changesSinceBackup + 1 };
-        await this.persistMutation(files, check);
-        this.engine!.restore_from_session(key, wrap, files.head, files.snap);
+        const saved = await this.persistMutation(files, check);
+        this.engine!.restore_from_session(key, wrap, saved.head, saved.snap);
       }
       check();
       return { type: 'answer', value: JSON.parse(result.reply) as PasskeyReply };
@@ -247,6 +248,7 @@ export class VaultController {
     this.auditAbort.abort(new Error('密码库已锁定，请重新解锁。'));
     this.auditAbort = new AbortController();
     this.davAbort.abort();
+    this.davRequests.reset();
     this.davAbort = new AbortController();
     clearTimeout(this.davTimer);
     this.davTimer = undefined;
@@ -415,23 +417,28 @@ export class VaultController {
     return code;
   }
 
-  private async persistMutation(files: store.VaultFiles, check: () => void, resolvedAnchor?: store.RemoteAnchor, replacementClock?: JournalClock) {
+  private async persistMutation(files: store.VaultFiles, check: () => void,
+    { resolvedAnchor, replacementClock, restoredConflicts }: { resolvedAnchor?: store.RemoteAnchor; replacementClock?: JournalClock; restoredConflicts?: Uint8Array } = {}) {
     const current = this.files!;
     const { key, wrap } = this.session!;
     const anchor = resolvedAnchor ?? await store.loadRemoteAnchor(files.vaultId);
+    const { clock, legacy } = await store.loadJournal(current.vaultId);
     check();
     if (anchor?.pack) {
-      if (!resolvedAnchor && anchor.conflicts?.length)
-        await derive<void>('sync:guard-staged', [key, wrap, current.head, current.snap, files.head, files.snap, anchor.conflicts]);
+      const identity = replacementClock ?? clock ?? nextJournalVersion(undefined, Date.now()).state;
+      const protectedRows = resolvedAnchor ? undefined : anchor.conflicts;
+      const marked = await derive<{ head: number[]; snap: number[] } | null>('sync:pack-edit', [key, wrap,
+        current.head, current.snap, files.head, files.snap, identity.deviceId, protectedRows ?? new Uint8Array()]);
+      const saved = marked ? { ...files, head: new Uint8Array(marked.head), snap: new Uint8Array(marked.snap) } : files;
       check();
-      await store.saveRemoteAnchor({ ...anchor, pack: { ...anchor.pack, dirty: true } }, files, replacementClock, false, false);
+      await store.saveRemoteAnchor({ ...anchor, conflicts: restoredConflicts ?? anchor.conflicts,
+        pack: { ...anchor.pack, dirty: true } }, saved, identity, false, false);
       this.packRevision++;
-      this.files = files;
+      this.files = saved;
       check();
       notifyDavPending();
-      return;
+      return saved;
     }
-    const { clock, legacy } = await store.loadJournal(current.vaultId);
     const version = nextJournalVersion(replacementClock ?? clock, Date.now());
     check();
     if (!resolvedAnchor) {
@@ -446,6 +453,7 @@ export class VaultController {
     this.files = files;
     this.scheduleDav(2500);
     check();
+    return files;
   }
 
   private async saveMutation(mutate: () => Mutation, check: () => void) {
@@ -457,7 +465,8 @@ export class VaultController {
       if (!snap.length) return 0; // An explicit no-op has no new encrypted snapshot.
       const files = { ...this.files!, head: result.head_bytes, snap, updatedAtMs: Date.now(),
         changesSinceBackup: (this.files!.changesSinceBackup ?? 0) + result.count };
-      await this.persistMutation(files, check);
+      const saved = await this.persistMutation(files, check);
+      if (saved !== files) this.engine!.restore_from_session(this.session!.key, this.session!.wrap, saved.head, saved.snap);
       return result.count;
     } catch (error) {
       // A rejected WASM mutation may have changed in-memory items before encoding failed.
@@ -489,14 +498,14 @@ export class VaultController {
     let session: store.SessionState | undefined;
     let material: Uint8Array<ArrayBuffer> | undefined;
     try {
-      const transport = new PackTransport(config, { check, signal: this.davAbort.signal, stop: pauseDav });
+      const transport = new PackTransport(config, this.davRequests.context(config, { check, signal: this.davAbort.signal }));
       const endpoint = await endpointFingerprint(config.url);
       const localRules = existing ? await this.readAutofillSettings(check) : emptySiteRules();
       const sourceStamp = existing && `${await digestHex(new Uint8Array(existing.head))}:${await digestHex(new Uint8Array(existing.snap))}`;
       const pending = await store.loadPackSetup(endpoint);
       check();
       if (pending && (existing ? pending.version.vaultId !== existing.vaultId : !!pending.source))
-        throw new Error('此目录有另一密码库的未完成建库记录。未覆盖原库，请选择其他测试目录。');
+        throw new Error('此目录有另一密码库的未完成建库记录。未覆盖原库，请选择其他同步目录。');
       if (pending && (existing ? pending.version.vaultId === existing.vaultId : !pending.source)) {
         const { version, ciphertext, clock, source, recovery } = pending;
         if (existing) session = this.session!;
@@ -515,7 +524,7 @@ export class VaultController {
         const rulesUnchanged = JSON.stringify(await openPackRules(session, view.rules)) === JSON.stringify(validatePackRules(localRules));
         const recoveryCode = recovery && await openSetupRecovery(material, version, recovery);
         check();
-        const initialized = await transport.create(material, version, ciphertext, message.scratchFolder);
+        const initialized = await transport.create(material, version, ciphertext);
         const listing = await transport.list(material, version.vaultId, [version]);
         check();
         const anchor = newPackAnchor(endpoint, listing, version, view, version.head!, 'applied');
@@ -555,19 +564,24 @@ export class VaultController {
       if (tracked.count === 0 && existing && (existing.everHadRecords || (existing.backedUpChangeCount ?? 0) + existing.changesSinceBackup > 0))
         throw new Error('曾包含凭证的库目前为空，未向网盘发布。请先恢复本地数据。');
       const rules = await sealPackRules(session, localRules);
-      const view = fromPackMerge(tracked, rules);
-      const header = await derive<{ head: number[] }>('sync:genesis', [key, wrap, view.head, view.snap, journal.id, journal.state.deviceId]);
-      const head = new Uint8Array(header.head);
+      const initial = fromPackMerge(tracked, rules);
+      const genesis = await derive<{ head: number[]; snap: number[] }>('sync:genesis',
+        [key, wrap, initial.head, initial.snap, journal.id, journal.state.deviceId]);
+      const head = new Uint8Array(genesis.head);
+      check();
+      const authenticated = await derive<RemoteHeadInfo>('sync:authenticate-head', [head, key, wrap]);
+      const view = { ...initial, head: new Uint8Array(authenticated.localHead), snap: new Uint8Array(genesis.snap) };
       material = await packMaterial(session);
       check();
       const identity = { id: newPackVersionId(), vaultId };
       const cipher = await sealPackContent(material, identity, view);
-      const version = await preparePackVersion({ ...identity, head, keyEpoch, parents: [], createdAt: Date.now() }, cipher);
+      const version = await preparePackVersion({ ...identity, packageEncoding: transport.newPackageEncoding,
+        head, keyEpoch, parents: [], createdAt: Date.now() }, cipher);
       const recovery = output && await sealSetupRecovery(material, version, output.recoveryCode);
       check();
       await store.savePackSetup(endpoint, { version, ciphertext: cipher, source: sourceStamp, clock: journal.state, recovery });
       check();
-      const initialized = await transport.create(material, version, cipher, message.scratchFolder);
+      const initialized = await transport.create(material, version, cipher);
       const listing = await transport.list(material, vaultId, [version]);
       check();
       const files = applyPackFiles({ ...existing, vaultId, keyEpoch, head: view.head, snap: view.snap,
@@ -603,7 +617,7 @@ export class VaultController {
     const key = randomBytes(32);
     let wrap: Uint8Array | undefined;
     try {
-      const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      const context = this.davRequests.context(config, { check, signal: this.davAbort.signal });
       const transport = new PackTransport(config, context);
       const candidates = await transport.joinCandidates();
       check();
@@ -722,7 +736,7 @@ export class VaultController {
         const sourceCount = await derive<number>('sync:verify-snapshot', [
           sourceSession!.key, sourceSession!.wrap, source!.head, source!.snap,
         ]);
-        const output = await derive<ReplayOutput>('sync:adopt', [sourceSession!.key, sourceSession!.wrap, source!.head, source!.snap,
+        const output = await derive<ReplayOutput>('sync:pack-adopt', [sourceSession!.key, sourceSession!.wrap, source!.head, source!.snap,
           key, session.wrap, files.head, files.snap, view.conflicts]);
         check();
         if (message.stamp === undefined) return { stamp, sourceCount, targetCount: view.count, mergedCount: output.count,
@@ -777,8 +791,7 @@ export class VaultController {
     return { ...state, linked: true, writeVerified, conflicts: anchor.conflictCount ?? 0, drafts: anchor.draftCount ?? 0,
       localRestoreHeld: !!anchor.localRestoreHeld, ...(anchor.pack && { format: 'pack' as const, siteRulesPending: anchor.pack.siteRules === 'pending',
         siteRulesApplied: anchor.pack.siteRules === 'applied', siteRuleConflicts: anchor.pack.ruleConflicts ?? 0,
-        pending: anchor.pack.dirty || !!anchor.pack.outbox || !!anchor.pack.integrated?.length || !!anchor.conflictCount ||
-          !!anchor.draftCount || !!anchor.pack.ruleConflicts }) };
+        pending: hasPendingPackWork(anchor), checkFailed: anchor.pack.checkFailed === true }) };
   }
 
   private async remoteKeyUpdate(password: string, check: () => void) {
@@ -830,22 +843,35 @@ export class VaultController {
     if (!anchor) return { kind: 'unlinked', pending: false };
     if (message.type === 'webdav-scheduled' &&
         (anchor.pack ? message.reason === 'legacy-interval' : ['startup', 'focus', 'interval'].includes(message.reason ?? ''))) {
-      return { kind: 'unchanged', pending: anchor.pack?.dirty === true };
+      return { kind: 'unchanged', pending: !!anchor.pack && hasPendingPackWork(anchor) };
     }
     const state = await davStatus(files.vaultId);
     if (!state.saved) return { kind: 'unlinked', pending: false };
-    if (state.paused) return { kind: 'paused', pending: !!anchor.draftCount ||
-      (anchor.pack ? anchor.pack.dirty || !!anchor.pack.outbox : await store.hasPendingWal(files.vaultId)) };
+    if (state.paused) return { kind: 'paused', pending: anchor.pack ? hasPendingPackWork(anchor) :
+      !!anchor.draftCount || await store.hasPendingWal(files.vaultId) };
     check();
     const config = await openSavedDav(session, files.vaultId);
     const signal = this.davAbort.signal;
+    const connection = this.davRequests.context(config, { check, signal });
     if (anchor.pack) {
       let revision = this.packRevision;
       const current = () => {
-        check();
+        connection.check();
         signal.throwIfAborted();
         if (this.session !== session) throw new Error('请重新解锁密码库后同步。');
         if (revision !== this.packRevision) throw packChanged;
+      };
+      const recordCheck = async (failed: boolean) => {
+        if ((anchor.pack!.checkFailed === true) === failed) return;
+        await this.enqueue(async () => {
+          check();
+          if (this.session !== session || this.files?.vaultId !== files.vaultId || revision !== this.packRevision) return;
+          const latest = await store.loadRemoteAnchor(files.vaultId);
+          check();
+          if (!latest?.pack || latest.endpoint !== anchor.endpoint || (latest.pack.checkFailed === true) === failed) return;
+          await store.saveRemoteAnchor({ ...latest, pack: { ...latest.pack, checkFailed: failed } }, this.files, undefined, false, false);
+          notifyDavPending();
+        });
       };
       // Release the controller queue while WebDAV is in flight. Check the same
       // local revision again inside each serialized commit.
@@ -859,8 +885,7 @@ export class VaultController {
           const result = await runWholeSync({
             files, session, anchor, material, device: (await store.loadJournal(files.vaultId)).clock?.deviceId,
             transport: new PackTransport(config, {
-              check: current, signal,
-              stop: status => { this.davClock = undefined; return pauseDav(status); },
+              ...connection, check: current,
               observeClock: async (offset, receivedAt) => {
                 await observeDavClock(files.vaultId, offset, receivedAt, current);
                 this.davClock = undefined;
@@ -881,17 +906,17 @@ export class VaultController {
             }),
           });
           current();
+          await recordCheck(false);
+          current();
           if (result.kind === 'key-update') await this.lock(false);
           return result;
         } catch (error) {
           if (error === packChanged) return { kind: 'deferred', pending: true };
           if (error instanceof PackIntegrityError && config.writeVerified) {
-            await this.enqueue(async () => {
-              current();
-              await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, current);
-              notifyDavPending();
-            });
+            await connection.revokeWriting();
+            notifyDavPending();
           }
+          await recordCheck(true);
           throw error;
         } finally { material?.fill(0); config.password = ''; config.username = ''; }
       } };
@@ -900,9 +925,9 @@ export class VaultController {
       check();
       await browser.alarms.create(DAV_LEGACY_ALARM, { periodInMinutes: 2 });
       check();
-      const context = { check, signal, stop: (status: 401 | 403 | 429) => { this.davClock = undefined; return pauseDav(status); },
+      const context = { ...connection,
         observeClock: async (offset: number | null, receivedAt: number) => {
-          await observeDavClock(files.vaultId, offset, receivedAt, check);
+          await observeDavClock(files.vaultId, offset, receivedAt, connection.check);
           this.davClock = undefined;
         } };
       const authorize = async (stamp: string) => {
@@ -984,9 +1009,9 @@ export class VaultController {
     const pendingResolutions = new Uint8Array((anchor.pendingResolutions?.length ?? 0) + output.receipts.length);
     if (anchor.pendingResolutions) pendingResolutions.set(anchor.pendingResolutions);
     pendingResolutions.set(output.receipts, anchor.pendingResolutions?.length ?? 0);
-    await this.persistMutation(updated, check, { ...anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount,
-      draftCount: output.draftCount, pendingResolutions: anchor.pack ? undefined : pendingResolutions });
-    this.engine!.restore_from_session(session.key, session.wrap, updated.head, updated.snap);
+    const saved = await this.persistMutation(updated, check, { resolvedAnchor: { ...anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount,
+      draftCount: output.draftCount, pendingResolutions: anchor.pack ? undefined : pendingResolutions } });
+    this.engine!.restore_from_session(session.key, session.wrap, saved.head, saved.snap);
     await showConflictBadge(output.conflictCount).catch(() => undefined);
     void browser.runtime.sendMessage({ target: 'vault-event', type: 'sync-changed' }).catch(() => undefined);
     return output.conflictCount;
@@ -1001,8 +1026,9 @@ export class VaultController {
     const config = await openSavedDav(session, files.vaultId);
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
-      const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      const context = this.davRequests.context(config, { check, signal: this.davAbort.signal });
       if (anchor.pack) {
+        const check = context.check;
         const material = await packMaterial(session);
         try {
           const transport = new PackTransport(config, context);
@@ -1030,7 +1056,7 @@ export class VaultController {
           return view.count;
         } catch (error) {
           if (error instanceof PackIntegrityError && config.writeVerified) {
-            await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, check);
+            await context.revokeWriting();
             notifyDavPending();
           }
           throw error;
@@ -1053,8 +1079,7 @@ export class VaultController {
       };
       if (message.destination === 'local') {
         return await restoreHistoryLocally(client, anchor, files, prepared, message.stamp, check, async (next, committed) => {
-          await this.persistMutation(committed, check, next);
-          reload(committed);
+          reload(await this.persistMutation(committed, check, { resolvedAnchor: next }));
         });
       }
       const { clock } = await store.loadJournal(files.vaultId);
@@ -1096,8 +1121,8 @@ export class VaultController {
       name: message.name?.trim(), time: now, system: profile.system, browser: profile.browserLabel, version: browser.runtime.getManifest().version })]);
     check();
     const updated = { ...files, head: new Uint8Array(output.head), snap: new Uint8Array(output.snap), updatedAtMs: now };
-    await this.persistMutation(updated, check, anchor, next);
-    this.engine!.restore_from_session(session.key, session.wrap, updated.head, updated.snap);
+    const saved = await this.persistMutation(updated, check, { resolvedAnchor: anchor, replacementClock: next });
+    this.engine!.restore_from_session(session.key, session.wrap, saved.head, saved.snap);
     return this.syncDevices({ type: 'webdav-devices' }, check);
   }
 
@@ -1112,7 +1137,7 @@ export class VaultController {
     const config = await openSavedDav(session, files.vaultId);
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
-      const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      const context = this.davRequests.context(config, { check, signal: this.davAbort.signal });
       if (anchor.pack) this.packRevision++;
       if (config.writeVerified) await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, check);
       if (anchor.pack) {
@@ -1123,11 +1148,11 @@ export class VaultController {
           const wrap = await latestPackWrap(listing, session, files.vaultId);
           if (wrap.info.keyEpoch !== files.keyEpoch) throw new Error('请先用新主密码验证远端库。');
           const version = listing.tips[0]!;
-          const cipher = await transport.download(version);
           check();
-          await transport.verifyWrites(material, version, cipher, message.scratchFolder);
+          await transport.verifyWrites(material, version);
           check();
-          await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, check);
+          await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, context.check);
+          this.davRequests.reset();
           if (anchor.localRestoreHeld)
             await store.saveRemoteAnchor({ ...anchor, localRestoreHeld: undefined }, files, undefined, false, false);
           return;
@@ -1137,7 +1162,7 @@ export class VaultController {
       if (!head || head === 'unchanged' || !head.etag) throw new Error('网盘未提供可验证的版本。密码库仍只读。');
       const checked = await derive<RemoteHeadInfo>('sync:authenticate-head', [head.bytes, session.key, session.wrap]);
       if (checked.keyEpoch !== files.keyEpoch) throw new Error('请先用新主密码验证远端库。');
-      await proveConditionalWrites(config, message.scratchFolder, context);
+      await proveLegacyWritesInVault(config, context);
       check();
       await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, check);
       if (anchor.localRestoreHeld) {
@@ -1218,14 +1243,22 @@ export class VaultController {
         if (anchor && anchor.pack) this.packRevision++;
         check();
         const { probe, resumed } = await testDav(message.input, message.remember === true, this.session, this.files?.vaultId,
-          { check, signal: operation }, anchor ? anchor.endpoint : undefined);
+          { check, signal: operation }, this.davRequests, anchor ? anchor.endpoint : undefined);
         if (resumed && anchor) this.scheduleDav();
         if (message.input && !anchor) {
-          const endpoint = await endpointFingerprint(webDavConfig(message.input).url);
-          const pending = await store.loadPackSetup(endpoint);
-          check();
-          if (pending && (this.files ? pending.version.vaultId === this.files.vaultId : !pending.source))
-            return { ...probe, createPending: true };
+          const config = webDavConfig(message.input);
+          try {
+            const pending = await store.loadPackSetup(await endpointFingerprint(config.url));
+            check();
+            if (pending && (this.files ? pending.version.vaultId === this.files.vaultId : !pending.source)) {
+              // If another device won the root claim, offer join/merge instead of
+              // trying to finish our own pending genesis over that library.
+              const canResume = probe.kind !== 'existing' || (probe.format === 'pack' &&
+                await new PackTransport(config, this.davRequests.context(config, { check, signal: operation })).matchesGenesis(pending.version));
+              check();
+              if (canResume) return { ...probe, createPending: true };
+            }
+          } finally { config.password = ''; config.username = ''; }
         }
         return probe;
       } finally { this.davClock = undefined; }
@@ -1415,9 +1448,9 @@ export class VaultController {
             if (message.type === 'preview-migration') return { ...(JSON.parse(output.report) as Omit<MigrationPreview, 'stamp'>), stamp };
             if (!output.count) return 0;
             const head = new Uint8Array(output.head), snap = new Uint8Array(output.snap);
-            await this.persistMutation({ ...this.files, head, snap, updatedAtMs: Date.now(),
+            const saved = await this.persistMutation({ ...this.files, head, snap, updatedAtMs: Date.now(),
               everHadRecords: true, changesSinceBackup: this.files.changesSinceBackup + output.count }, check);
-            engine.restore_from_session(session.key, session.wrap, head, snap);
+            engine.restore_from_session(session.key, session.wrap, saved.head, saved.snap);
             return output.count;
           }
           const batch = JSON.parse(await derive<string>('parse-mapped-csv', [bytes, mapping])) as MigrationBatch;
@@ -1723,9 +1756,9 @@ export class VaultController {
             !message.bytes.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255))
           throw new Error('请选择不超过 16 MiB 的备份，并输入文件密码。');
         const files = this.files;
+        const anchor = await store.loadRemoteAnchor(files.vaultId);
+        check();
         if (message.proof?.method === 'recovery') {
-          const anchor = await store.loadRemoteAnchor(files.vaultId);
-          check();
           if (anchor?.vaultId !== files.vaultId) throw new Error('只有已验证的网盘目标库支持用恢复码合入备份。');
           const code = message.proof.secret;
           if (typeof code !== 'string' || !code || code.length > 1024 ||
@@ -1735,21 +1768,24 @@ export class VaultController {
         } else await this.verifyMaster(message.proof, check);
         const bytes = new Uint8Array(message.bytes), now = Date.now();
         try {
-          const stamp = (await Promise.all([digestHex(bytes), digestHex(new Uint8Array(files.head)), digestHex(new Uint8Array(files.snap))])).join(':');
+          const staged = anchor?.pack ? new Uint8Array(anchor.conflicts ?? []) : undefined;
+          const stamp = (await Promise.all([digestHex(bytes), digestHex(new Uint8Array(files.head)), digestHex(new Uint8Array(files.snap)),
+            ...(staged ? [digestHex(staged)] : [])])).join(':');
           const confirm = message.type === 'import';
           if (confirm && message.stamp !== stamp) throw new Error('备份文件或目标库已变化，请重新预览。');
           check();
-          const { added, updated, skipped, head: nextHead, snap: nextSnap } =
-            await derive<Omit<VaultPackPreview, 'stamp'> & { head: number[]; snap: number[] }>('sync:import-pack',
-              [session.key, session.wrap, files.head, files.snap, bytes, message.password, now, confirm]);
+          const { added, updated, skipped, head: nextHead, snap: nextSnap, conflicts } =
+            await derive<Omit<VaultPackPreview, 'stamp'> & { head: number[]; snap: number[]; conflicts: number[] }>('sync:import-pack',
+              [session.key, session.wrap, files.head, files.snap, bytes, message.password, now, confirm, staged]);
           check();
           if (!confirm) return { added, updated, skipped, stamp } satisfies VaultPackPreview;
           const count = added + updated;
           if (!count) return 0;
           const head = new Uint8Array(nextHead), snap = new Uint8Array(nextSnap);
-          await this.persistMutation({ ...files, head, snap, updatedAtMs: now,
-            changesSinceBackup: files.changesSinceBackup + count, everHadRecords: files.everHadRecords || added > 0 }, check);
-          engine.restore_from_session(session.key, session.wrap, head, snap);
+          const saved = await this.persistMutation({ ...files, head, snap, updatedAtMs: now,
+            changesSinceBackup: files.changesSinceBackup + count, everHadRecords: files.everHadRecords || added > 0 }, check,
+            { restoredConflicts: staged && new Uint8Array(conflicts) });
+          engine.restore_from_session(session.key, session.wrap, saved.head, saved.snap);
           return count;
         } finally { bytes.fill(0); }
       }

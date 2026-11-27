@@ -25,6 +25,7 @@ pub(crate) struct Conflict {
 pub(crate) struct Draft {
     pub(crate) base: Option<VaultItem>,
     pub(crate) ours: Option<VaultItem>,
+    pub(crate) source: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -62,10 +63,11 @@ impl MsgPackWire for Staged {
         }
         for (id, drafts) in &self.drafts {
             for draft in drafts {
-                mp_write_array_len(out, 3);
+                mp_write_array_len(out, if draft.source.is_some() { 4 } else { 3 });
                 mp_write_str(out, id);
                 write_item(out, draft.base.as_ref());
                 write_item(out, draft.ours.as_ref());
+                if let Some(source) = &draft.source { mp_write_str(out, source); }
             }
         }
         for id in &self.tombstones {
@@ -83,22 +85,24 @@ impl MsgPackWire for Staged {
         let mut tombstones = BTreeSet::new();
         for _ in 0..len {
             let version = rd.read_array_len();
-            if !matches!(version, 2 | 3 | 5 | 7 | 8) { return Err(invalid()); }
+            if !matches!(version, 2 | 3 | 4 | 5 | 7 | 8) { return Err(invalid()); }
             let id = rd.read_string();
             if id.is_empty() { return Err(invalid()); }
             if version == 2 {
                 if rd.read_u64() != 1 || !tombstones.insert(id) { return Err(invalid()); }
                 continue;
             }
-            if version == 3 {
+            if matches!(version, 3 | 4) {
                 let base = read_item(rd)?;
                 let ours = read_item(rd)?;
+                let source = (version == 4).then(|| rd.read_string());
                 if merge::same(base.as_ref(), ours.as_ref()) ||
+                    source.as_ref().is_some_and(|name| name.trim().is_empty() || name.len() > 240) ||
                     base.iter().chain(&ours).any(|item| item.id != id)
                 {
                     return Err(invalid());
                 }
-                drafts.entry(id).or_default().push(Draft { base, ours });
+                drafts.entry(id).or_default().push(Draft { base, ours, source });
                 continue;
             }
             let count = rd.read_array_len();
@@ -241,10 +245,14 @@ pub fn wasm_sync_guard_staged(
     let after = super::verified_snapshot(&keys, &vault, epoch, proposed_head, proposed)?;
     let (before, after) = (crate::batch::indexed(&before)?, crate::batch::indexed(&after)?);
     let staged = Staged::open(&keys, &vault, staged)?;
+    Ok(guard_staged(&before, &after, &staged)?)
+}
+
+pub(crate) fn guard_staged(before: &BTreeMap<&str, &VaultItem>, after: &BTreeMap<&str, &VaultItem>, staged: &Staged) -> Result<(), VaultError> {
     let ids = staged.drafts.keys().map(String::as_str).chain(staged.rows.iter().flat_map(Conflict::affected_ids));
     for id in ids {
         if !merge::same(before.get(id).copied(), after.get(id).copied()) {
-            return Err(VaultError::InvalidInput("SyncConflict".into()).into());
+            return Err(VaultError::InvalidInput("SyncConflict".into()));
         }
     }
     Ok(())

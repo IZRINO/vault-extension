@@ -1,6 +1,6 @@
 import { loadPackCrypto } from './pack-crypto';
-import { DAV_PACK_ROOT, davPackPackageName, davPackRecordName, webDavConfig,
-  WebDavClient, WebDavContentError, WebDavHttpError, WebDavNetworkError, WebDavStop,
+import { DAV_PACK_ROOT, davPackPackageName, davPackProbeName, davPackRecordName, davPresets, isDavPackProbeIn,
+  WebDavClient, WebDavContentError, WebDavHttpError, WebDavLimitError, WebDavNetworkError, WebDavStop,
   type DavContext, type DavEntry, type WebDavConfig } from './webdav';
 
 export const MAX_PACK_BYTES = 16 * 1024 * 1024;
@@ -16,7 +16,13 @@ const vaultUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 const sha256Hex = /^[0-9a-f]{64}$/;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
-const packagePath = (id: string) => `packages/p_${id}.bin`;
+const jsonPrefix = encoder.encode('{"ciphertext":"');
+const jsonSuffix = encoder.encode('"}');
+// A multiple of three keeps Base64 padding at the very end.
+const base64ChunkBytes = 12 * 1024;
+const base64ChunkChars = base64ChunkBytes / 3 * 4;
+const packageExtension = (encoding: PackVersion['packageEncoding']) => encoding === 'json' ? 'json' : 'bin';
+const packagePath = (version: PackVersion) => `packages/p_${version.id}.${packageExtension(version.packageEncoding)}`;
 const recordPath = (id: string) => `versions/v_${id}.txt`;
 
 export interface PackVersion {
@@ -27,6 +33,7 @@ export interface PackVersion {
   bytes: number;
   createdAt: number;
   keyEpoch: number;
+  packageEncoding?: 'json';
   head?: Uint8Array<ArrayBuffer>;
   recordAuth?: { etag: string; mac: string };
 }
@@ -39,23 +46,69 @@ export interface PackListing {
 }
 
 export class PackIntegrityError extends Error {}
+class UnsupportedPackRecord extends Error {
+  constructor() { super('整包版本记录包含当前客户端不支持的格式，请升级后重试。已保留本机修改。'); }
+}
 
 type VersionData = Omit<PackVersion, 'head' | 'recordAuth'> & { head?: Uint8Array };
-type RecordData = [1, string, string, string[], string, number, number, number, string | null];
+type RecordData = [1 | 2, string, string, string[], string, number, number, number, string | null];
 
 const malformed = () => new Error('整包版本记录无效或目录不完整。未修改本机密码库。');
-const untrusted = () => new Error('无法认证同一密码库的整包版本记录。未修改本机密码库。');
-const rollback = () => new Error('网盘缺少已验证的版本或共同版本，已保留本机修改。');
+const invalidRecord = () => new PackIntegrityError(malformed().message);
+const untrusted = () => new PackIntegrityError('无法认证同一密码库的整包版本记录。未修改本机密码库。');
+const rollback = () => new PackIntegrityError('网盘缺少已验证的版本或共同版本，已保留本机修改。');
+const badRecordLength = () => new PackIntegrityError('版本目录声明的文件长度与版本记录不符。已保留本机修改。');
 const occupied = () => new Error('目录已有文件或另一台设备已建库。已保留本机密码库。');
-const corrupted = (cause?: WebDavContentError) => new PackIntegrityError(
-  `整包读回不完整或密文哈希不符。${cause?.message ?? ''}已保留本机修改。`, { cause },
+const corrupted = (detail?: string | WebDavContentError) => new PackIntegrityError(
+  `整包读回不完整或密文哈希不符。${typeof detail === 'string' ? detail : detail?.message ?? ''}已保留本机修改。`,
+  typeof detail === 'object' ? { cause: detail } : undefined,
 );
+const invalidLocalPack = () => new Error('本机待发布的整包与其版本记录不符。已保留本机修改。');
 const bounded = () => new Error('整包版本记录超过自动检查上限。已保留本机修改。');
 const hex = (bytes: Uint8Array) => Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 const base64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const decode64 = (text: string) => Uint8Array.from(atob(text), char => char.charCodeAt(0));
 const equals = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, at) => byte === b[at]);
-const sameVersion = (a: PackVersion, b: PackVersion) => JSON.stringify(versionData(a)) === JSON.stringify(versionData(b));
+export const sameVersion = (a: PackVersion, b: PackVersion) => JSON.stringify(versionData(a)) === JSON.stringify(versionData(b));
+
+function packageWireLength(bytes: number, encoding: PackVersion['packageEncoding']) {
+  return encoding === 'json' ? jsonPrefix.length + Math.ceil(bytes / 3) * 4 + jsonSuffix.length : bytes;
+}
+
+function encodePackage(ciphertext: Uint8Array<ArrayBuffer>, encoding: PackVersion['packageEncoding']) {
+  if (encoding !== 'json') return ciphertext;
+  const wire = new Uint8Array(packageWireLength(ciphertext.length, encoding));
+  wire.set(jsonPrefix);
+  let written = jsonPrefix.length;
+  for (let at = 0; at < ciphertext.length; at += base64ChunkBytes) {
+    const chunk = base64(ciphertext.subarray(at, at + base64ChunkBytes));
+    written += encoder.encodeInto(chunk, wire.subarray(written)).written;
+  }
+  wire.set(jsonSuffix, written);
+  return wire;
+}
+
+function decodePackage(version: PackVersion, wire: Uint8Array<ArrayBuffer>) {
+  if (version.packageEncoding !== 'json') return wire;
+  if (wire.length !== packageWireLength(version.bytes, version.packageEncoding))
+    throw corrupted(`JSON 整包应有 ${packageWireLength(version.bytes, version.packageEncoding)} 字节，实际收到 ${wire.length} 字节。`);
+  const payloadEnd = wire.length - jsonSuffix.length;
+  const invalid = () => corrupted('JSON 整包格式无效。');
+  if (!equals(wire.subarray(0, jsonPrefix.length), jsonPrefix) || !equals(wire.subarray(payloadEnd), jsonSuffix)) throw invalid();
+  const ciphertext = new Uint8Array(version.bytes);
+  let written = 0;
+  for (let at = jsonPrefix.length; at < payloadEnd; at += base64ChunkChars) {
+    let chunk: string, binary: string;
+    try {
+      chunk = decoder.decode(wire.subarray(at, Math.min(at + base64ChunkChars, payloadEnd)));
+      binary = atob(chunk);
+    } catch { throw invalid(); }
+    // atob accepts whitespace and noncanonical padding. Require the exact encoding.
+    if (binary.length !== Math.min(base64ChunkBytes, ciphertext.length - written) || btoa(binary) !== chunk) throw invalid();
+    for (let offset = 0; offset < binary.length; offset++) ciphertext[written++] = binary.charCodeAt(offset);
+  }
+  return ciphertext;
+}
 
 export const newPackVersionId = () => crypto.randomUUID().replaceAll('-', '');
 
@@ -64,10 +117,11 @@ function versionData(version: VersionData): RecordData {
       !Number.isSafeInteger(version.bytes) || version.bytes < 1 || version.bytes > MAX_PACK_BYTES ||
       !Number.isSafeInteger(version.createdAt) || version.createdAt < 1 ||
       !Number.isSafeInteger(version.keyEpoch) || version.keyEpoch < 1 ||
+      (version.packageEncoding !== undefined && version.packageEncoding !== 'json') ||
       version.parents.length > MAX_PARENTS || version.parents.some((parent, at, parents) =>
         !packId.test(parent) || parent === version.id || at > 0 && parent <= parents[at - 1]!) ||
       (version.head !== undefined && (version.head.length === 0 || version.head.length > MAX_HEAD_BYTES))) throw malformed();
-  return [1, version.id, version.vaultId, version.parents, version.sha256, version.bytes, version.createdAt,
+  return [version.packageEncoding === 'json' ? 2 : 1, version.id, version.vaultId, version.parents, version.sha256, version.bytes, version.createdAt,
     version.keyEpoch, version.head ? base64(version.head) : null];
 }
 
@@ -76,7 +130,7 @@ async function digest(bytes: Uint8Array<ArrayBuffer>) {
 }
 
 export async function preparePackVersion(input: Omit<VersionData, 'sha256' | 'bytes'>, ciphertext: Uint8Array) {
-  if (!ciphertext.length || ciphertext.length > MAX_PACK_BYTES) throw corrupted();
+  if (!ciphertext.length || ciphertext.length > MAX_PACK_BYTES) throw invalidLocalPack();
   const version: PackVersion = { ...input, parents: [...input.parents].sort(), sha256: await digest(asBuffer(ciphertext)),
     bytes: ciphertext.length, head: input.head ? new Uint8Array(input.head) : undefined };
   versionData(version);
@@ -99,21 +153,29 @@ function parseRecord(bytes: Uint8Array<ArrayBuffer>, expectId?: string, etag?: s
   try {
     const text = decoder.decode(bytes);
     const outer: unknown = JSON.parse(text);
-    if (!Array.isArray(outer) || outer.length !== 2 || typeof outer[1] !== 'string' || outer[1].length !== 44) throw malformed();
-    const fields: unknown = outer[0], mac = decode64(outer[1]);
-    if (!Array.isArray(fields) || fields.length !== 9 || fields[0] !== 1 || !Array.isArray(fields[3]) ||
+    if (!Array.isArray(outer)) throw malformed();
+    const fields: unknown = outer[0];
+    if (Array.isArray(fields) && (Number.isSafeInteger(fields[0]) && fields[0] > 2 ||
+        (fields[0] === 1 || fields[0] === 2) && (fields.length > 9 || outer.length > 2))) throw new UnsupportedPackRecord();
+    if (outer.length !== 2 || typeof outer[1] !== 'string' || outer[1].length !== 44) throw malformed();
+    const mac = decode64(outer[1]);
+    if (!Array.isArray(fields) || fields.length !== 9 || (fields[0] !== 1 && fields[0] !== 2) || !Array.isArray(fields[3]) ||
         fields[3].some(parent => typeof parent !== 'string') || !(fields[8] === null || typeof fields[8] === 'string') ||
         (fields[8]?.length ?? 0) > Math.ceil(MAX_HEAD_BYTES / 3) * 4 ||
         typeof fields[1] !== 'string' || typeof fields[2] !== 'string' || typeof fields[4] !== 'string' ||
         mac.length !== 32) throw malformed();
     const version: PackVersion = { id: fields[1], vaultId: fields[2], parents: fields[3], sha256: fields[4],
       bytes: fields[5], createdAt: fields[6], keyEpoch: fields[7], head: fields[8] === null ? undefined : decode64(fields[8]) };
+    if (fields[0] === 2) version.packageEncoding = 'json';
     if (expectId !== undefined ? version.id !== expectId || !version.parents.length : version.parents.length || !version.head) throw malformed();
     const data = versionData(version);
     if (JSON.stringify([data, base64(mac)]) !== text) throw malformed();
     if (etag) version.recordAuth = { etag, mac: outer[1] };
     return { version, mac, data: encoder.encode(JSON.stringify(data)), length: bytes.length };
-  } catch { throw malformed(); }
+  } catch (error) {
+    if (error instanceof UnsupportedPackRecord) throw error;
+    throw invalidRecord();
+  }
 }
 
 function cachedRecord(version: PackVersion) {
@@ -124,7 +186,12 @@ function cachedRecord(version: PackVersion) {
   return parseRecord(wire, version.parents.length ? version.id : undefined, etag);
 }
 
-function rootLayout(entries: readonly DavEntry[]) {
+const rootContents = (entries: readonly DavEntry[]) => entries.filter(entry => entry.collection || !davPackProbeName.test(entry.name));
+const packContents = (entries: readonly DavEntry[], directory: 'versions/' | 'packages/') =>
+  entries.filter(entry => entry.collection || !isDavPackProbeIn(entry.name, directory));
+
+function rootLayout(raw: readonly DavEntry[]) {
+  const entries = rootContents(raw);
   return entries.length === 3 &&
     entries.some(entry => entry.name === DAV_PACK_ROOT && !entry.collection) &&
     ['versions', 'packages'].every(name => entries.some(entry => entry.name === name && entry.collection));
@@ -133,7 +200,7 @@ function rootLayout(entries: readonly DavEntry[]) {
 function buildGraph(root: PackVersion, versions: PackVersion[], known: readonly PackVersion[]) {
   const byId = new Map([[root.id, root]]);
   for (const version of versions) {
-    if (byId.has(version.id) || version.vaultId !== root.vaultId) throw untrusted();
+    if (byId.has(version.id) || version.vaultId !== root.vaultId || version.packageEncoding !== root.packageEncoding) throw untrusted();
     byId.set(version.id, version);
   }
   for (const version of known) {
@@ -147,7 +214,7 @@ function buildGraph(root: PackVersion, versions: PackVersion[], known: readonly 
     if (parents.some(parent => !parent)) throw rollback();
     const parentEpoch = Math.max(...parents.map(parent => parent!.keyEpoch));
     if (version.keyEpoch < parentEpoch || version.keyEpoch > parentEpoch + 1 ||
-        version.keyEpoch > parentEpoch && !version.head) throw malformed();
+        version.keyEpoch > parentEpoch && !version.head) throw invalidRecord();
     missingParents.set(version.id, parents.length);
     for (const id of version.parents) {
       if (!childIds.has(id)) childIds.set(id, []);
@@ -166,19 +233,14 @@ function buildGraph(root: PackVersion, versions: PackVersion[], known: readonly 
       if (!remaining) ordered.push(byId.get(id)!);
     }
   }
-  if (ordered.length !== byId.size) throw malformed();
+  if (ordered.length !== byId.size) throw invalidRecord();
   return { versions: ordered, tips };
 }
 
-async function provePackWrites(config: WebDavConfig, scratchFolder: string, context: DavContext, request: typeof fetch,
-  ciphertext: Uint8Array<ArrayBuffer>,
-) {
-  const target = new URL(config.url);
-  const scratch = webDavConfig({ provider: 'custom', base: new URL('..', target).href, folder: scratchFolder,
-    username: config.username, password: config.password, confirmHttp: target.protocol === 'http:' });
-  if (scratch.url === target.href) throw new Error('测试目录必须和同步目录分开。');
+async function provePackWrites(config: WebDavConfig, context: DavContext, request: typeof fetch, encoding: PackVersion['packageEncoding']) {
   let stopped: WebDavStop | undefined;
-  const client = new WebDavClient(scratch, { ...context,
+  let canClean = true;
+  const client = new WebDavClient(config, { ...context,
     check: () => { if (stopped) throw stopped; context.check?.(); },
     stop: status => {
       if (stopped) return;
@@ -186,16 +248,17 @@ async function provePackWrites(config: WebDavConfig, scratchFolder: string, cont
       return context.stop?.(status);
     },
   }, request);
-  const listed = await client.list();
-  if (!listed || listed.entries.length) throw new Error('请准备独立的空测试目录。扩展不会创建测试目录。');
   const failure = (details: string) => new Error(`网盘未通过整包写入验证。${details}密码库目录仍只读。`);
   const duplicate = () => failure('网盘允许重复创建已有测试文件，可能覆盖其他设备的写入。');
-  const probes = new Map<string, { expected: Uint8Array<ArrayBuffer>; alternate: Uint8Array<ArrayBuffer>; limit: number; etag?: string }>();
+  const probes = new Map<string, { expected: Uint8Array<ArrayBuffer>; limit: number; etag?: string }>();
   const text = () => encoder.encode(`Vault WebDAV pack test ${crypto.randomUUID()}\n`);
-  const nameOf = (id: string, extension: 'txt' | 'bin') => `pack_verify_${id}.${extension}`;
-  const probe = async (id: string, extension: 'txt' | 'bin', expected: Uint8Array<ArrayBuffer>) => {
-    const name = nameOf(id, extension);
-    const alternate = extension === 'txt' ? text() : crypto.getRandomValues(new Uint8Array(32));
+  const sample = () => crypto.getRandomValues(new Uint8Array(32));
+  const packageExt = packageExtension(encoding);
+  const nameOf = (id: string, extension: 'txt' | 'bin' | 'json') => `pack_verify_${id}.${extension}`;
+  const probe = async (id: string, directory: '' | 'versions/' | 'packages/', expected: Uint8Array<ArrayBuffer>) => {
+    const extension = directory === 'packages/' ? packageExt : 'txt';
+    const name = `${directory}${nameOf(id, extension)}`;
+    const alternate = extension === 'txt' ? text() : encodePackage(sample(), encoding);
     const limit = Math.max(64, expected.length);
     const read = async () => {
       try { return await client.get(name, limit); }
@@ -204,23 +267,34 @@ async function provePackWrites(config: WebDavConfig, scratchFolder: string, cont
         throw error;
       }
     };
-    if (!await client.put(name, expected, { absent: true })) throw failure('网盘报告同名测试文件已存在。');
-    probes.set(name, { expected, alternate, limit });
+    if (await read() !== undefined || !await client.put(name, expected, { absent: true }))
+      throw failure('网盘报告同名测试文件已存在。');
+    // A lost initial PUT response leaves an unowned object; never clean it by name alone.
+    const owned = { expected, limit, etag: undefined as string | undefined };
+    probes.set(name, owned);
     const first = await read();
     if (!first || first === 'unchanged') throw failure('无法读回测试文件。');
     if (first.bytes.length !== expected.length)
       throw failure(`读回应有 ${expected.length} 字节，实际收到 ${first.bytes.length} 字节。`);
-    if (!equals(first.bytes, expected) || !first.etag) throw failure('测试文件内容不符或缺少强版本标签。');
+    if (!equals(first.bytes, expected)) throw failure('测试文件读回内容不符。');
+    if (!first.etag) throw failure('网盘未返回探针的强版本标签（ETag）。');
+    owned.etag = first.etag;
     try {
-      if (await client.put(name, alternate, { absent: true })) throw duplicate();
+      if (await client.put(name, alternate, { absent: true })) {
+        owned.expected = alternate;
+        owned.etag = undefined;
+        throw duplicate();
+      }
     } catch (error) {
       if (error instanceof WebDavHttpError && error.status >= 200 && error.status < 300) throw duplicate();
       throw error;
     }
     const after = await read();
     if (!after || after === 'unchanged' || after.etag !== first.etag || !equals(after.bytes, expected)) throw duplicate();
-    if (await client.delete(name, `"never-${id}"`)) throw failure('网盘允许用错误版本标签删除测试文件。');
-    probes.get(name)!.etag = first.etag;
+    if (await client.delete(name, `"never-${id}"`)) {
+      canClean = false;
+      throw failure('网盘允许用错误版本标签删除测试文件。');
+    }
   };
   const remove = async (name: string, etag: string, limit: number) => {
     if (!await client.delete(name, etag) || await client.get(name, limit) !== undefined)
@@ -229,25 +303,31 @@ async function provePackWrites(config: WebDavConfig, scratchFolder: string, cont
   // Use a separate one-time vault identity and MAC key. Nothing published here
   // can be accepted as a version of the actual vault.
   const proofVault = crypto.randomUUID();
-  const sample = () => crypto.getRandomValues(new Uint8Array(32));
-  const initial = sample(), another = sample();
+  const initial = sample(), staged = sample(), another = sample();
   const root = await preparePackVersion({ id: newPackVersionId(), vaultId: proofVault, keyEpoch: 1,
-    createdAt: Date.now(), parents: [], head: crypto.getRandomValues(new Uint8Array(384)) }, initial);
+    createdAt: Date.now(), parents: [], head: crypto.getRandomValues(new Uint8Array(384)), packageEncoding: encoding }, initial);
   const branch = (bytes: Uint8Array<ArrayBuffer>) => preparePackVersion({
-    id: newPackVersionId(), vaultId: proofVault, keyEpoch: 1, createdAt: Date.now(), parents: [root.id],
+    id: newPackVersionId(), vaultId: proofVault, keyEpoch: 1, createdAt: Date.now(), parents: [root.id], packageEncoding: encoding,
   }, bytes);
-  const [left, right] = [await branch(ciphertext), await branch(another)];
+  const [left, right] = [await branch(staged), await branch(another)];
+  const rootName = nameOf(root.id, 'txt');
+  const previousPack = `packages/${nameOf(root.id, packageExt)}`;
+  const ownRecords = new Set([left, right].map(version => nameOf(version.id, 'txt')));
+  const recordProbePath = (version: PackVersion) => version.id === root.id ? rootName : `versions/${nameOf(version.id, 'txt')}`;
   const { wasm_sync_pack_record_verify } = await loadPackCrypto();
   const seed = crypto.getRandomValues(new Uint8Array(32));
   const discover = async (expected: PackVersion[]) => {
-    const entries = (await client.list())?.entries;
-    const versionEntries = entries?.filter(entry => !entry.collection && entry.name.endsWith('.txt'));
-    if (!versionEntries || versionEntries.length !== expected.length || !expected.every(version =>
+    const rootEntries = (await client.list())?.entries;
+    const entries = (await client.list('versions/'))?.entries;
+    const versionEntries = entries?.filter(entry => !entry.collection && ownRecords.has(entry.name));
+    const children = expected.slice(1);
+    if (!rootEntries?.some(entry => !entry.collection && entry.name === rootName) ||
+      !versionEntries || versionEntries.length !== children.length || !children.every(version =>
       versionEntries.some(entry => entry.name === nameOf(version.id, 'txt'))))
       throw failure('网盘无法完整列出独立版本记录。');
     const verified: PackVersion[] = [];
     for (const version of expected) {
-      const object = await client.get(nameOf(version.id, 'txt'), MAX_RECORD_BYTES);
+      const object = await client.get(recordProbePath(version), MAX_RECORD_BYTES);
       if (!object || object === 'unchanged') throw failure('无法读回独立版本记录。');
       const record = parseRecord(object.bytes, version.id === root.id ? undefined : version.id);
       if (!sameVersion(record.version, version) || !wasm_sync_pack_record_verify(seed, proofVault, record.data, record.mac))
@@ -258,18 +338,19 @@ async function provePackWrites(config: WebDavConfig, scratchFolder: string, cont
   };
   try {
     const records = await Promise.all([root, left, right].map(version => encodeRecord(seed, version)));
-    await probe(root.id, 'bin', initial);
-    await probe(root.id, 'txt', records[0]!);
-    await probe(left.id, 'bin', ciphertext);
+    const initialWire = encodePackage(initial, encoding);
+    await probe(root.id, '', records[0]!);
+    await probe(root.id, 'packages/', initialWire);
+    await probe(left.id, 'packages/', encodePackage(staged, encoding));
     await discover([root]);
-    const previous = await client.get(nameOf(root.id, 'bin'), root.bytes);
-    if (!previous || previous === 'unchanged' || previous.bytes.length !== root.bytes || await digest(previous.bytes) !== root.sha256)
+    const previous = await client.get(previousPack, initialWire.length);
+    if (!previous || previous === 'unchanged' || !equals(previous.bytes, initialWire))
       throw failure('暂存新整包后无法验证上一版。');
-    await probe(right.id, 'bin', another);
-    const commits = await Promise.allSettled([probe(left.id, 'txt', records[1]!), probe(right.id, 'txt', records[2]!)]);
+    await probe(right.id, 'packages/', encodePackage(another, encoding));
+    const commits = await Promise.allSettled([probe(left.id, 'versions/', records[1]!), probe(right.id, 'versions/', records[2]!)]);
     const rejected = commits.find(result => result.status === 'rejected');
     if (rejected) throw stopped ?? rejected.reason;
-    if (await client.put(nameOf(left.id, 'txt'), records[1]!, { absent: true })) throw duplicate();
+    if (await client.put(recordProbePath(left), records[1]!, { absent: true })) throw duplicate();
     await discover([root, left, right]);
     for (const [name, object] of probes) {
       await remove(name, object.etag!, object.limit);
@@ -278,10 +359,10 @@ async function provePackWrites(config: WebDavConfig, scratchFolder: string, cont
   } finally {
     seed.fill(0);
     for (const [name, object] of probes) {
-      if (stopped || context.signal?.aborted) break;
+      if (!canClean || stopped || context.signal?.aborted) break;
       try {
         const own = await client.get(name, object.limit);
-        if (own && own !== 'unchanged' && own.etag && (equals(own.bytes, object.expected) || equals(own.bytes, object.alternate)))
+        if (own && own !== 'unchanged' && own.etag && (!object.etag || own.etag === object.etag) && equals(own.bytes, object.expected))
           await remove(name, own.etag, object.limit);
       } catch { /* Keep the probe when its bytes and version cannot be verified. */ }
     }
@@ -291,6 +372,15 @@ async function provePackWrites(config: WebDavConfig, scratchFolder: string, cont
 function uncertainWrite(error: unknown) {
   return error instanceof WebDavNetworkError || error instanceof WebDavHttpError &&
     (error.status === 408 || error.status >= 500 || error.status >= 200 && error.status < 300);
+}
+
+async function readMetadata<T>(request: Promise<T>, knownRecord = false): Promise<T> {
+  try { return await request; }
+  catch (error) {
+    if (error instanceof WebDavLimitError) throw knownRecord ? badRecordLength() : bounded();
+    if (error instanceof WebDavContentError) throw new PackIntegrityError(error.message, { cause: error });
+    throw error;
+  }
 }
 
 export class PackTransport {
@@ -309,50 +399,57 @@ export class PackTransport {
     } }, request);
   }
 
+  get newPackageEncoding(): PackVersion['packageEncoding'] {
+    return this.config.url.startsWith(davPresets.koofr) ? 'json' : undefined;
+  }
+
   private async root(allowLegacy: boolean, hasKnown = false, knownRoot?: PackVersion) {
     // A previously authenticated root supplies the directory identity. Check it
     // directly, and use its cached bytes only if the server returns 304.
     if (knownRoot) {
       const cached = cachedRecord(knownRoot);
-      const object = await this.client.get(DAV_PACK_ROOT, MAX_RECORD_BYTES, cached?.version.recordAuth?.etag);
+      const object = await readMetadata(this.client.get(DAV_PACK_ROOT, MAX_RECORD_BYTES, cached?.version.recordAuth?.etag), true);
       if (!object || object === 'unchanged' && !cached) throw rollback();
       const record = object === 'unchanged' ? cached! : parseRecord(object.bytes, undefined, object.etag);
       if (!sameVersion(record.version, knownRoot)) throw rollback();
       return { record, offsetSeconds: null };
     }
-    const rootFolder = await this.client.list();
+    const rootFolder = await readMetadata(this.client.list());
     if (allowLegacy && !rootFolder?.entries.some(entry => entry.name === DAV_PACK_ROOT)) return undefined;
     if (!rootFolder || !rootLayout(rootFolder.entries)) throw hasKnown ? rollback() : malformed();
-    const record = await this.client.get(DAV_PACK_ROOT, MAX_RECORD_BYTES);
+    const record = await readMetadata(this.client.get(DAV_PACK_ROOT, MAX_RECORD_BYTES));
     if (!record || record === 'unchanged') throw hasKnown ? rollback() : malformed();
     return { record: parseRecord(record.bytes, undefined, record.etag), offsetSeconds: rootFolder.offsetSeconds };
   }
 
   private async *records(bytes: number, known = new Map<string, PackVersion>()) {
-    const folder = await this.client.list('versions/');
+    const folder = await readMetadata(this.client.list('versions/'));
     if (!folder) throw known.size ? rollback() : malformed();
-    if (folder.entries.length >= MAX_VERSIONS) throw bounded();
-    const names = new Set(folder.entries.filter(entry => !entry.collection).map(entry => entry.name));
+    const entries = packContents(folder.entries, 'versions/');
+    if (entries.length >= MAX_VERSIONS) throw bounded();
+    const names = new Set(entries.filter(entry => !entry.collection).map(entry => entry.name));
     for (const version of known.values()) {
       if (version.parents.length && !names.has(`v_${version.id}.txt`)) throw rollback();
     }
     let remaining = MAX_TOTAL_RECORD_BYTES - bytes;
-    for (const entry of folder.entries.sort((a, b) => a.name < b.name ? -1 : a.name === b.name ? 0 : 1)) {
+    for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : a.name === b.name ? 0 : 1)) {
       if (entry.collection || !davPackRecordName.test(entry.name)) throw malformed();
-      if (remaining <= 0 || entry.bytes !== undefined && entry.bytes > Math.min(remaining, MAX_RECORD_BYTES)) throw bounded();
       const id = entry.name.slice(2, -4);
       const prior = known.get(id);
+      if (prior && entry.bytes !== undefined && entry.bytes > MAX_RECORD_BYTES) throw badRecordLength();
+      const limit = Math.min(remaining, MAX_RECORD_BYTES);
+      if (limit <= 0 || entry.bytes !== undefined && entry.bytes > limit) throw bounded();
       if (entry.etag && prior?.recordAuth?.etag === entry.etag) {
         const cached = cachedRecord(prior)!;
-        if (entry.bytes === undefined || entry.bytes === cached.length) {
-          if (cached.length > remaining) throw bounded();
-          remaining -= cached.length;
-          yield cached;
-          continue;
-        }
+        if (entry.bytes !== undefined && entry.bytes !== cached.length) throw badRecordLength();
+        if (cached.length > remaining) throw bounded();
+        remaining -= cached.length;
+        yield cached;
+        continue;
       }
-      const object = await this.client.get(recordPath(id), Math.min(remaining, MAX_RECORD_BYTES));
+      const object = await readMetadata(this.client.get(recordPath(id), limit), !!prior && limit === MAX_RECORD_BYTES);
       if (!object || object === 'unchanged') throw rollback();
+      if (entry.bytes !== undefined && object.bytes.length !== entry.bytes) throw badRecordLength();
       remaining -= object.bytes.length;
       yield parseRecord(object.bytes, id, object.etag);
     }
@@ -406,32 +503,54 @@ export class PackTransport {
     return [...distinct.values()];
   }
 
-  private async checkPackage(version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>) {
-    if (ciphertext.length !== version.bytes || await digest(ciphertext) !== version.sha256) throw corrupted();
+  // Setup routing only; creation still compares the authenticated root wire bytes.
+  async matchesGenesis(genesis: PackVersion): Promise<boolean> {
+    const object = await this.client.get(DAV_PACK_ROOT, MAX_RECORD_BYTES);
+    return !!object && object !== 'unchanged' && sameVersion(parseRecord(object.bytes).version, genesis);
+  }
+
+  private async checkPackage(version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>, source: 'local' | 'remote') {
+    if (ciphertext.length !== version.bytes)
+      throw source === 'local' ? invalidLocalPack() : corrupted(`应有 ${version.bytes} 字节，实际收到 ${ciphertext.length} 字节。`);
+    if (await digest(ciphertext) !== version.sha256) throw source === 'local' ? invalidLocalPack() : corrupted();
+  }
+
+  private async readPackage(version: PackVersion) {
+    const object = await this.client.get(packagePath(version), packageWireLength(version.bytes, version.packageEncoding)).catch((error: unknown) => {
+      if (error instanceof WebDavContentError) throw corrupted(error);
+      throw error;
+    });
+    if (object === 'unchanged') throw corrupted();
+    if (!object) return undefined;
+    const ciphertext = decodePackage(version, object.bytes);
+    await this.checkPackage(version, ciphertext, 'remote');
+    return ciphertext;
   }
 
   async download(version: PackVersion) {
     versionData(version);
-    const object = await this.client.get(packagePath(version.id), version.bytes).catch((error: unknown) => {
-      if (error instanceof WebDavContentError) throw corrupted(error);
-      throw error;
-    });
-    if (!object || object === 'unchanged') throw corrupted();
-    await this.checkPackage(version, object.bytes);
-    return object.bytes;
+    const ciphertext = await this.readPackage(version);
+    if (!ciphertext) throw corrupted();
+    return ciphertext;
   }
 
   private async stage(version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>) {
-    if (await this.client.put(packagePath(version.id), ciphertext, { absent: true }))
-      this.stats.packageUploadBytes += ciphertext.length;
+    // A timeout or partial startup may leave the uniquely named package behind.
+    // Read it before issuing an exclusive PUT, even if PROPFIND missed it.
+    if (await this.readPackage(version)) return;
+    const wire = encodePackage(ciphertext, version.packageEncoding);
+    if (await this.client.put(packagePath(version), wire, { absent: true }))
+      this.stats.packageUploadBytes += wire.length;
     await this.download(version);
   }
 
-  async verifyWrites(material: Uint8Array, version: PackVersion, ciphertext: Uint8Array<ArrayBuffer>, scratchFolder: string) {
+  async verifyWrites(material: Uint8Array, version: PackVersion) {
     this.writeAllowed = false;
-    await this.checkPackage(version, ciphertext);
+    const folder = await this.client.list();
+    if (!folder || !rootLayout(folder.entries)) throw malformed();
     await this.list(material, version.vaultId, [version]);
-    await provePackWrites(this.config, scratchFolder, this.context, this.request, ciphertext);
+    await this.download(version);
+    await provePackWrites(this.config, this.context, this.request, version.packageEncoding);
     this.writeAllowed = true;
     return true;
   }
@@ -440,7 +559,7 @@ export class PackTransport {
     if (!this.writeAllowed) throw new Error('网盘尚未通过整包写入验证，密码库目录仍只读。');
     if (!version.parents.length) throw malformed();
     versionData(version);
-    await this.checkPackage(version, ciphertext);
+    await this.checkPackage(version, ciphertext, 'local');
     const listing = await this.list(material, version.vaultId);
     const existing = listing.versions.find(item => item.id === version.id);
     if (existing) {
@@ -455,13 +574,10 @@ export class PackTransport {
     await this.stage(version, ciphertext);
     const path = recordPath(version.id);
     await this.client.put(path, record, { absent: true });
-    const committed = await this.client.get(path, MAX_RECORD_BYTES).catch((error: unknown) => {
-      if (error instanceof WebDavContentError) throw new PackIntegrityError(error.message, { cause: error });
-      throw error;
-    });
+    const committed = await readMetadata(this.client.get(path, MAX_RECORD_BYTES), true);
     if (!committed || committed === 'unchanged' || !equals(committed.bytes, record))
       throw new PackIntegrityError('无法认证刚发布的整包版本记录。已保留本机修改。');
-    const versions = await this.client.list('versions/');
+    const versions = await readMetadata(this.client.list('versions/'));
     if (!versions?.entries.some(entry => !entry.collection && `versions/${entry.name}` === path))
       throw new PackIntegrityError('网盘无法列出刚发布的整包版本记录。已保留本机修改。');
     const authenticated = parseRecord(committed.bytes, version.id, committed.etag).version;
@@ -470,11 +586,23 @@ export class PackTransport {
     return authenticated;
   }
 
-  async create(material: Uint8Array, genesis: PackVersion, ciphertext: Uint8Array<ArrayBuffer>, scratchFolder: string) {
+  async create(material: Uint8Array, genesis: PackVersion, ciphertext: Uint8Array<ArrayBuffer>) {
     if (genesis.parents.length || !genesis.head) throw malformed();
     const bytes = await encodeRecord(material, genesis);
-    await this.checkPackage(genesis, ciphertext);
-    const proof = () => provePackWrites(this.config, scratchFolder, this.context, this.request, ciphertext);
+    await this.checkPackage(genesis, ciphertext, 'local');
+    const proof = () => provePackWrites(this.config, this.context, this.request, genesis.packageEncoding);
+    const checkChildren = async (entries: readonly DavEntry[], requireBoth: boolean) => {
+      const has = (name: string) => entries.some(entry => entry.collection && entry.name === name);
+      if (requireBoth || has('versions')) {
+        const versions = await this.client.list('versions/');
+        if (!versions || packContents(versions.entries, 'versions/').length) throw occupied();
+      }
+      if (requireBoth || has('packages')) {
+        const packages = await this.client.list('packages/');
+        if (!packages || packContents(packages.entries, 'packages/').some(entry => entry.collection || !davPackPackageName.test(entry.name)))
+          throw occupied();
+      }
+    };
     const inspect = async () => {
       const folder = await this.client.list();
       if (folder?.entries.some(entry => entry.name === DAV_PACK_ROOT && !entry.collection)) {
@@ -484,28 +612,45 @@ export class PackTransport {
         await this.download(genesis);
         return { folder, committed: true };
       }
-      if (folder?.entries.some(entry => !entry.collection || !['versions', 'packages'].includes(entry.name))) throw occupied();
+      if (folder && rootContents(folder.entries).some(entry => !entry.collection || !['versions', 'packages'].includes(entry.name)))
+        throw occupied();
       return { folder, committed: false };
     };
-    const before = await inspect();
-    if (before.committed) {
+    const confirmExisting = async (offsetSeconds: number | null) => {
       if (!this.writeAllowed) await proof();
       this.writeAllowed = true;
-      return { offsetSeconds: before.folder!.offsetSeconds };
+      return { offsetSeconds };
+    };
+    let before = await inspect();
+    if (!before.folder) {
+      await this.client.makeVaultDirectory();
+      before = await inspect();
+      if (!before.folder) throw malformed();
     }
+    if (before.committed) return confirmExisting(before.folder.offsetSeconds);
+    const existing = rootContents(before.folder.entries);
+    await checkChildren(existing, false);
+    let initialized = false;
+    for (const name of ['versions', 'packages'] as const) {
+      if (existing.some(entry => entry.name === name)) continue;
+      await this.client.makePackDirectory(`${name}/`);
+      initialized = true;
+    }
+    if (initialized) {
+      const prepared = await inspect();
+      if (prepared.committed) return confirmExisting(prepared.folder!.offsetSeconds);
+      await checkChildren(prepared.folder?.entries ?? [], true);
+    }
+    await this.stage(genesis, ciphertext);
     await proof();
     const after = await inspect();
     if (after.committed) {
       this.writeAllowed = true;
       return { offsetSeconds: after.folder!.offsetSeconds };
     }
-    if (!after.folder) await this.client.makeVaultDirectory();
-    await this.client.makePackDirectory('versions/');
-    await this.client.makePackDirectory('packages/');
-    const [versions, packages] = [await this.client.list('versions/'), await this.client.list('packages/')];
-    if (!versions || versions.entries.length || !packages ||
-      packages.entries.some(entry => entry.collection || !davPackPackageName.test(entry.name))) throw occupied();
-    await this.stage(genesis, ciphertext);
+    if (!after.folder) throw malformed();
+    const versions = await this.client.list('versions/');
+    if (!versions || packContents(versions.entries, 'versions/').length) throw occupied();
     let uncertain: unknown;
     try { await this.client.put(DAV_PACK_ROOT, bytes, { absent: true }); }
     catch (error) {
