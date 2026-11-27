@@ -4,10 +4,13 @@ Vault 是一款用于 Microsoft Edge 和 Helium 的密码管理扩展。密码�
 
 ## 主要功能
 
-- **登录网站**：在登录框旁选择账号，填入用户名和密码；也可以用库中的通行密钥（Passkey）登录。仅仅打开网页不会触发密码填充。
+- **保管凭证**：本机加密保存网站登录、支付卡、身份与地址、开发者密钥。
+- **登录网站**：在登录框旁选择账号填入用户名和密码，或用通行密钥（Passkey）登录。Vault 可提示保存新账号或更新密码；仅仅打开网页不会填入密码。认不出表单时，可在「密码库 → 当前网站 → 标记登录框」点选输入框。目前标记只保存在本机。
 - **生成两步验证码**：扫描网页上的二维码，或手动添加验证器。支持 TOTP、HOTP 和 Steam Guard。
-- **迁入已有数据**：可导入浏览器导出的 CSV、Bitwarden JSON、KeePass 数据库和 Ente Auth 备份。先看预览，确认后才写入密码库。
-- **备份与同步**：将密码库导出为加密备份文件（`.vaultpack`）。需要在多台电脑间同步时，可以连接自己的 WebDAV 网盘。
+- **迁入或带走数据**：浏览器 CSV、Bitwarden、KeePass、Ente Auth 等可先预览，确认后才导入。也可按目标格式导出，例如 Bitwarden JSON 或通用 CSV；不是每种格式都能带走所有字段。
+- **备份与同步**：可单独导出加密备份文件。也可连接自己的 WebDAV 网盘，在「设置 → 网盘连接」点「立即同步」。新建的远端库默认同步加密整包（Koofr 用 JSON 封装密文），已有增量库沿用原协议，不会自动迁移。
+
+[v0.2.1 已正式发布](https://github.com/IZRINO/vault-extension/releases/tag/v0.2.1)。`v0.2.0` 的正式包已在 Edge、Helium 完成整包回环测试；**`v0.2.1` 同包双浏览器回归、真实 Koofr 建库和坚果云新版实测仍待签收**。实体 Windows Hello、真实网站表单和 Passkey 也需分别实测。详见[网盘验证记录](docs/agents/whole-pack-webdav.md)和[验收总览 #51](https://github.com/IZRINO/vault-extension/issues/51)。
 
 ## 安装正式版
 
