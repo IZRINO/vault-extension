@@ -12,23 +12,32 @@ import { AUTH_BACKUP_FORMATS, MAX_AUTH_BACKUP_BYTES, MAX_MIGRATION_BYTES, PORTAB
 import type { QrScan } from './vault-messages';
 import { davClockOffset, davStatus, observeDavClock, openSavedDav, pauseDav, readDavClock, requireDavHealthy, saveDavConnection, setDavCompensation, showConflictBadge, testDav } from './sync/connection';
 import { adoptDevice, nextJournalVersion, type JournalClock } from './sync/journal-device';
-import { createRemoteVault, endpointFingerprint, HEAD_LIMIT, packSyncFrames, readRemoteVault, type RemoteHeadInfo, type ReplayOutput } from './sync/bootstrap';
-import { proveConditionalWrites, WebDavClient, webDavConfig } from './sync/webdav';
+import { endpointFingerprint, HEAD_LIMIT, packSyncFrames, readRemoteVault, type RemoteHeadInfo, type ReplayOutput } from './sync/bootstrap';
+import { proveConditionalWrites, WebDavClient, webDavConfig, type WebDavConfig } from './sync/webdav';
 import { runDavSync, type SyncResult } from './sync/run';
 import { deviceProfile } from './sync/device-profile';
 import { listHistory, prepareRestore, restoreHistory, restoreHistoryLocally } from './sync/history';
+import { newPackVersionId, PackIntegrityError, PackTransport, preparePackVersion, type PackVersion } from './sync/pack-transport';
+import { openPackContent, openSetupRecovery, sealPackContent, sealSetupRecovery } from './sync/pack-content';
+import { applyPackFiles, applyPackView, combinePacks, equalPackBytes, fromPackMerge, inspectPack, latestPackWrap, loadPackContent, newPackAnchor,
+  packGraph, packMaterial, runWholeSync, type PackView } from './sync/pack-sync';
+import { emptySiteRules, openPackRules, preservePackRuleConflicts, resolvePackRuleConflict, sealPackRules, validatePackRules } from './sync/pack-settings';
+import { wholeHistory } from './sync/pack-history';
 import type { PasskeyCandidate, PasskeyPerformResult, PasskeyReply, PasskeyResolution, PasskeySelection, TrustedRequest } from './passkeys/protocol';
 import { checkScanSource, type ScanSource, type ScanTicket } from './qr-scan';
 import { markKey, markScope, sameMarkDraft, validLoginMark, validMarkDraft, type LoginMark } from './login-marks';
 
 export const LOCK_ALARM = 'vault-lock';
-export const DAV_ALARM = 'vault-webdav';
+export const DAV_LEGACY_ALARM = 'vault-webdav-legacy';
 export const IDLE_DETECTION_SECONDS = 60;
 type Core = Awaited<ReturnType<typeof loadVaultCore>>;
 type Engine = InstanceType<Core['WasmVaultEngine']>;
 type Created = { head: number[]; snap: number[]; wrap: number[]; vaultId: string; keyEpoch: number; recoveryCode: string };
 type Rotation = { head: number[]; wrap: number[]; keyEpoch: number };
 type Mutation = { head_bytes: Uint8Array; snap_bytes: Uint8Array; count: number; free(): void };
+type DavSyncMessage = Extract<VaultMessage, { type: 'webdav-sync' | 'webdav-scheduled' }>;
+const packChanged = new Error('本机密码库刚有变更，请在下一次检查继续同步。');
+const notifyDavPending = () => { void browser.runtime.sendMessage({ target: 'vault-event', type: 'webdav-pending' }).catch(() => undefined); };
 
 async function digestHex(bytes: Uint8Array<ArrayBuffer>) {
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
@@ -92,9 +101,14 @@ export class VaultController {
   private davAbort = new AbortController();
   private davClock?: Promise<Awaited<ReturnType<typeof readDavClock>>>;
   private davTimer?: ReturnType<typeof setTimeout>;
+  private davFlight?: Promise<SyncResult>;
+  private packRevision = 0;
+
+  constructor(private readonly onSiteRulesChanged: () => void = () => {}) {}
 
   handle(message: VaultMessage): Promise<unknown> {
     if (message.type === 'lock') return this.lock();
+    if (message.type === 'webdav-sync' || message.type === 'webdav-scheduled') return this.handleDavSync(message);
     return this.enqueue(check => this.dispatch(message, check));
   }
 
@@ -239,7 +253,7 @@ export class VaultController {
     this.davClock = undefined;
     const locking = store.clearSessionState().then(async () => {
       await browser.alarms.clear(LOCK_ALARM);
-      await browser.alarms.clear(DAV_ALARM);
+      await browser.alarms.clear(DAV_LEGACY_ALARM);
     });
     // Requests arriving after lock began must not read the session being erased.
     this.locking = locking;
@@ -332,7 +346,7 @@ export class VaultController {
     try {
       await this.touch();
       check();
-      this.scheduleDav();
+      this.scheduleDav(1200, 'unlock');
     } catch (error) { await this.lock(); throw error; }
   }
 
@@ -404,11 +418,24 @@ export class VaultController {
   private async persistMutation(files: store.VaultFiles, check: () => void, resolvedAnchor?: store.RemoteAnchor, replacementClock?: JournalClock) {
     const current = this.files!;
     const { key, wrap } = this.session!;
+    const anchor = resolvedAnchor ?? await store.loadRemoteAnchor(files.vaultId);
+    check();
+    if (anchor?.pack) {
+      if (!resolvedAnchor && anchor.conflicts?.length)
+        await derive<void>('sync:guard-staged', [key, wrap, current.head, current.snap, files.head, files.snap, anchor.conflicts]);
+      check();
+      await store.saveRemoteAnchor({ ...anchor, pack: { ...anchor.pack, dirty: true } }, files, replacementClock, false, false);
+      this.packRevision++;
+      this.files = files;
+      check();
+      notifyDavPending();
+      return;
+    }
     const { clock, legacy } = await store.loadJournal(current.vaultId);
     const version = nextJournalVersion(replacementClock ?? clock, Date.now());
     check();
     if (!resolvedAnchor) {
-      const staged = (await store.loadRemoteAnchor(files.vaultId))?.conflicts;
+      const staged = anchor?.conflicts;
       check();
       if (staged?.length) await derive<void>('sync:guard-staged', [key, wrap, current.head, current.snap, files.head, files.snap, staged]);
     }
@@ -459,56 +486,105 @@ export class VaultController {
     const key = this.session?.key ?? randomBytes(32);
     const existing = this.files;
     const config = message.input ? webDavConfig(message.input) : await openSavedDav(this.session!, existing!.vaultId);
+    let session: store.SessionState | undefined;
+    let material: Uint8Array<ArrayBuffer> | undefined;
     try {
-      const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      const transport = new PackTransport(config, { check, signal: this.davAbort.signal, stop: pauseDav });
+      const endpoint = await endpointFingerprint(config.url);
+      const localRules = existing ? await this.readAutofillSettings(check) : emptySiteRules();
+      const sourceStamp = existing && `${await digestHex(new Uint8Array(existing.head))}:${await digestHex(new Uint8Array(existing.snap))}`;
+      const pending = await store.loadPackSetup(endpoint);
+      check();
+      if (pending && (existing ? pending.version.vaultId !== existing.vaultId : !!pending.source))
+        throw new Error('此目录有另一密码库的未完成建库记录。未覆盖原库，请选择其他测试目录。');
+      if (pending && (existing ? pending.version.vaultId === existing.vaultId : !pending.source)) {
+        const { version, ciphertext, clock, source, recovery } = pending;
+        if (existing) session = this.session!;
+        else {
+          const verified = await derive<RemoteHeadInfo>('sync:unlock-head', [version.head!, key, message.masterPassword, false]);
+          session = { key, wrap: new Uint8Array(verified.wrap), unlockedAtMs: Date.now(), lastActivityMs: Date.now() };
+          verified.wrap.fill(0);
+        }
+        const keyEpoch = existing?.keyEpoch ?? version.keyEpoch;
+        material = await packMaterial(session);
+        const initial = await openPackContent(material, version, ciphertext);
+        if (version.keyEpoch !== keyEpoch) initial.head = new Uint8Array(await derive<number[]>('sync:rebase-wrap', [
+          session.key, session.wrap, existing!.head, initial.head, initial.snap,
+        ]));
+        const view = await inspectPack(session, initial);
+        const rulesUnchanged = JSON.stringify(await openPackRules(session, view.rules)) === JSON.stringify(validatePackRules(localRules));
+        const recoveryCode = recovery && await openSetupRecovery(material, version, recovery);
+        check();
+        const initialized = await transport.create(material, version, ciphertext, message.scratchFolder);
+        const listing = await transport.list(material, version.vaultId, [version]);
+        check();
+        const anchor = newPackAnchor(endpoint, listing, version, view, version.head!, 'applied');
+        const edited = !!existing && (source !== sourceStamp || !rulesUnchanged);
+        if (edited) anchor.pack!.dirty = true;
+        if (version.keyEpoch !== keyEpoch) anchor.rotationFrom = version.keyEpoch;
+        const files = edited ? { ...existing!, packRules: rulesUnchanged ? view.rules : await sealPackRules(session, localRules) }
+          : applyPackFiles({ ...existing, vaultId: version.vaultId, keyEpoch, head: view.head, snap: view.snap,
+            updatedAtMs: Date.now(), changesSinceBackup: existing?.changesSinceBackup ?? 0 }, view);
+        await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, initialized.offsetSeconds, check);
+        await store.saveRemoteAnchor(anchor, files, clock, !existing);
+        check();
+        this.files = files;
+        this.autofill = undefined;
+        if (!existing) await this.activate(key, Array.from(session.wrap), check);
+        else this.engine!.restore_from_session(key, session.wrap, files.head, files.snap);
+        await store.clearPackSetup(endpoint);
+        return recoveryCode ? { recoveryCode, vaultId: files.vaultId } : undefined;
+      }
       const profile = await deviceProfile();
       check();
-      const initialized = await createRemoteVault(config, message.scratchFolder, context, async () => {
-        check();
-        const output = existing ? undefined : await derive<Created>('wasm_create_new_vault', [message.masterPassword, 65536, 3, 4, key, Date.now()]);
-        check();
-        const wrap = this.session?.wrap ?? new Uint8Array(output!.wrap);
-        const vaultId = existing?.vaultId ?? output!.vaultId;
-        const clock = (await store.loadJournal(vaultId)).clock;
-        check();
-        const version = nextJournalVersion(clock, Date.now());
-        const localHead = existing?.head ?? new Uint8Array(output!.head);
-        const localSnap = existing?.snap ?? new Uint8Array(output!.snap);
-        const count = await derive<number>('sync:verify-snapshot', [key, wrap, localHead, localSnap]);
-        if (count === 0 && existing && (existing.everHadRecords || (existing.backedUpChangeCount ?? 0) + existing.changesSinceBackup > 0))
-          throw new Error('曾包含凭证的库目前为空，未向网盘发布。请先恢复本地数据。');
-        const tracked = await derive<ReplayOutput>('sync:device-change', [key, wrap, localHead, localSnap, JSON.stringify({
-          action: 'track', id: version.state.deviceId, tag: version.state.tag, name: message.deviceName?.trim() || profile.suggestedName,
-          system: profile.system, browser: profile.browserLabel, version: browser.runtime.getManifest().version, time: Date.now(),
-        })]);
-        check();
-        const genesis = await derive<{ head: number[]; snap: number[] }>('sync:genesis', [key, wrap, new Uint8Array(tracked.head),
-          new Uint8Array(tracked.snap), version.id, version.state.deviceId]);
-        check();
-        return { head: new Uint8Array(genesis.head), snap: new Uint8Array(genesis.snap), snapshotId: `snap_${version.id}`, output, wrap, version, count };
-      });
-      const { genesis } = initialized;
-      const { wrap, output, version } = genesis;
-      const remote = await derive<RemoteHeadInfo>('sync:authenticate-head', [initialized.head.bytes, key, wrap]);
-      const endpoint = await endpointFingerprint(config.url);
+      const output = existing ? undefined : await derive<Created>('wasm_create_new_vault', [message.masterPassword, 65536, 3, 4, key, Date.now()]);
       check();
-      const files: store.VaultFiles = { ...existing, vaultId: remote.vaultId, keyEpoch: remote.keyEpoch, head: new Uint8Array(remote.localHead),
-        snap: genesis.snap, updatedAtMs: Date.now(), changesSinceBackup: existing?.changesSinceBackup ?? 0 };
-      await store.saveRemoteAnchor({ vaultId: files.vaultId, endpoint, head: initialized.head.bytes, snap: genesis.snap,
-        etag: initialized.head.etag, objects: [], appliedHead: files.head, appliedSnap: files.snap,
-        hasRecords: genesis.count > 0, checkedAt: Date.now() }, files, version.state, !existing);
+      session = this.session ?? { key, wrap: new Uint8Array(output!.wrap), unlockedAtMs: Date.now(), lastActivityMs: Date.now() };
+      const { wrap } = session;
+      const vaultId = existing?.vaultId ?? output!.vaultId;
+      const keyEpoch = existing?.keyEpoch ?? output!.keyEpoch;
+      const clock = (await store.loadJournal(vaultId)).clock;
+      const journal = nextJournalVersion(clock, Date.now());
+      check();
+      const localHead = existing?.head ?? new Uint8Array(output!.head);
+      const localSnap = existing?.snap ?? new Uint8Array(output!.snap);
+      const tracked = await derive<ReplayOutput>('sync:device-change', [key, wrap, localHead, localSnap, JSON.stringify({
+        action: 'track', id: journal.state.deviceId, tag: journal.state.tag, name: message.deviceName?.trim() || profile.suggestedName,
+        system: profile.system, browser: profile.browserLabel, version: browser.runtime.getManifest().version, time: Date.now(),
+      })]);
+      if (tracked.count === 0 && existing && (existing.everHadRecords || (existing.backedUpChangeCount ?? 0) + existing.changesSinceBackup > 0))
+        throw new Error('曾包含凭证的库目前为空，未向网盘发布。请先恢复本地数据。');
+      const rules = await sealPackRules(session, localRules);
+      const view = fromPackMerge(tracked, rules);
+      const header = await derive<{ head: number[] }>('sync:genesis', [key, wrap, view.head, view.snap, journal.id, journal.state.deviceId]);
+      const head = new Uint8Array(header.head);
+      material = await packMaterial(session);
+      check();
+      const identity = { id: newPackVersionId(), vaultId };
+      const cipher = await sealPackContent(material, identity, view);
+      const version = await preparePackVersion({ ...identity, head, keyEpoch, parents: [], createdAt: Date.now() }, cipher);
+      const recovery = output && await sealSetupRecovery(material, version, output.recoveryCode);
+      check();
+      await store.savePackSetup(endpoint, { version, ciphertext: cipher, source: sourceStamp, clock: journal.state, recovery });
+      check();
+      const initialized = await transport.create(material, version, cipher, message.scratchFolder);
+      const listing = await transport.list(material, vaultId, [version]);
+      check();
+      const files = applyPackFiles({ ...existing, vaultId, keyEpoch, head: view.head, snap: view.snap,
+        updatedAtMs: Date.now(), changesSinceBackup: existing?.changesSinceBackup ?? 0 }, view);
+      await saveDavConnection({ ...config, writeVerified: true }, session, vaultId, initialized.offsetSeconds, check);
+      await store.saveRemoteAnchor(newPackAnchor(endpoint, listing, version, view, head, 'applied'), files, journal.state, !existing);
+      check();
       this.files = files;
+      this.autofill = undefined;
       if (!existing) await this.activate(key, Array.from(wrap), check);
-      else {
-        check();
-        this.engine!.restore_from_session(key, wrap, files.head, files.snap);
-      }
-      await saveDavConnection({ ...config, writeVerified: true }, this.session!, files.vaultId, initialized.offsetSeconds, check);
-      this.scheduleDav();
+      else this.engine!.restore_from_session(key, wrap, files.head, files.snap);
+      await store.clearPackSetup(endpoint);
       return output ? { recoveryCode: output.recoveryCode, vaultId: files.vaultId } : undefined;
     } finally {
       config.password = ''; config.username = '';
-      if (!existing) key.fill(0);
+      material?.fill(0);
+      if (!existing) { key.fill(0); session?.wrap.fill(0); }
     }
   }
 
@@ -527,7 +603,12 @@ export class VaultController {
     const key = randomBytes(32);
     let wrap: Uint8Array | undefined;
     try {
-      const client = new WebDavClient(config, { check, signal: this.davAbort.signal, stop: pauseDav });
+      const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      const transport = new PackTransport(config, context);
+      const candidates = await transport.joinCandidates();
+      check();
+      if (candidates.length) return await this.joinWholeVault(message, config, transport, candidates, key, check);
+      const client = new WebDavClient(config, context);
       const restored = await readRemoteVault(client, async head => {
         const result = await derive<RemoteHeadInfo>('sync:unlock-head', [head.bytes, key, message.secret, message.method === 'recovery']);
         check();
@@ -590,12 +671,93 @@ export class VaultController {
     } finally { key.fill(0); wrap?.fill(0); config.password = ''; config.username = ''; }
   }
 
-  private scheduleDav(wait = 1200) {
+  private async joinWholeVault(
+    message: Extract<VaultMessage, { type: 'webdav-join' | 'webdav-merge' }>, config: WebDavConfig,
+    transport: PackTransport, candidates: PackVersion[], key: Uint8Array, check: () => void,
+  ) {
+    const source = this.files, sourceSession = this.session;
+    let session: store.SessionState | undefined;
+    let material: Uint8Array<ArrayBuffer> | undefined;
+    try {
+      let unlocked: RemoteHeadInfo | undefined;
+      for (const candidate of candidates) {
+        try {
+          unlocked = await derive<RemoteHeadInfo>('sync:unlock-head', [candidate.head!, key, message.secret, message.method === 'recovery']);
+          break;
+        } catch { check(); }
+      }
+      if (!unlocked) throw new Error('无法验证网盘密码库，请核对该库自己的主密码或恢复码。');
+      const { vaultId, keyEpoch } = unlocked;
+      session = { key, wrap: new Uint8Array(unlocked.wrap), unlockedAtMs: Date.now(), lastActivityMs: Date.now() };
+      unlocked.wrap.fill(0);
+      material = await packMaterial(session);
+      check();
+      const listing = await transport.list(material, vaultId);
+      const wrap = await latestPackWrap(listing, session, vaultId);
+      if (wrap.info.keyEpoch !== keyEpoch ||
+          !await derive<boolean>('sync:same-wrap', [key, session.wrap, wrap.head, new Uint8Array(unlocked.localHead)]))
+        throw new Error('网盘主密码已变化，请用该库当前主密码或恢复码重新加入。');
+      check();
+      const cached = new Map<string, Promise<PackView>>();
+      const load = (version: PackVersion) => {
+        const found = cached.get(version.id) ?? loadPackContent(transport, material!, version, session!, keyEpoch,
+          new Uint8Array(unlocked!.localHead), check);
+        cached.set(version.id, found);
+        return found;
+      };
+      const first = [...listing.tips].sort((a, b) => a.id.localeCompare(b.id))[0]!;
+      const firstView = await load(first);
+      const endpoint = await endpointFingerprint(config.url);
+      const anchor = newPackAnchor(endpoint, listing, first, firstView, wrap.head, 'pending');
+      const view = listing.tips.length === 1 ? firstView : await combinePacks(listing, firstView, first.id, listing.tips, load, session, check);
+      let nextAnchor = applyPackView(anchor, view);
+      let files = applyPackFiles({ vaultId, keyEpoch, head: view.head, snap: view.snap, updatedAtMs: Date.now(),
+        changesSinceBackup: 0, remoteKeyUpdate: false }, view);
+      if (listing.tips.length > 1) nextAnchor = { ...nextAnchor, pack: { ...nextAnchor.pack!, integrated: listing.tips.map(tip => tip.id).sort() } };
+      if (message.type === 'webdav-merge') {
+        if (source!.vaultId === vaultId) throw new Error('两个库的身份相同。请使用新浏览器配置加入远端，或验证并导入 .vaultpack。');
+        const stamp = [endpoint, await digestHex(new Uint8Array(source!.head)), await digestHex(new Uint8Array(source!.snap)),
+          ...listing.tips.map(version => `${version.id}/${version.sha256}`).sort()].join(':');
+        if (message.stamp !== undefined && message.stamp !== stamp) throw new Error('本机库或远端库已改动，请重新预览。');
+        const sourceCount = await derive<number>('sync:verify-snapshot', [
+          sourceSession!.key, sourceSession!.wrap, source!.head, source!.snap,
+        ]);
+        const output = await derive<ReplayOutput>('sync:adopt', [sourceSession!.key, sourceSession!.wrap, source!.head, source!.snap,
+          key, session.wrap, files.head, files.snap, view.conflicts]);
+        check();
+        if (message.stamp === undefined) return { stamp, sourceCount, targetCount: view.count, mergedCount: output.count,
+          conflicts: output.conflictCount } satisfies import('./vault-messages').DavJoinPreview;
+        if (source!.changesSinceBackup > 0) throw new Error('请先为本机源库下载最新的 .vaultpack 加密备份，再重新预览。');
+        const merged = fromPackMerge(output, view.rules);
+        files = { ...applyPackFiles(files, merged), changesSinceBackup: sourceCount };
+        nextAnchor = applyPackView({ ...nextAnchor, pack: { ...nextAnchor.pack!, dirty: true } }, merged);
+        const clock = nextJournalVersion(undefined, Date.now(), output.hlc).state;
+        const settings = { autoLockMinutes: this.settings!.autoLockMinutes, pinFailures: 0 };
+        await store.saveSettings(settings);
+        this.settings = settings;
+        check();
+        await store.adoptRemoteVault(source!, nextAnchor, files, clock);
+        this.files = files;
+        await this.lock(false);
+      } else {
+        await store.saveRemoteAnchor(nextAnchor, files, undefined, true);
+        this.files = files;
+      }
+      check();
+      this.autofill = undefined;
+      await this.activate(key, Array.from(session.wrap), check);
+      await saveDavConnection(config, this.session!, vaultId, undefined, check);
+      await showConflictBadge(nextAnchor.conflictCount ?? 0).catch(() => undefined);
+      return this.status();
+    } finally { material?.fill(0); session?.wrap.fill(0); }
+  }
+
+  private scheduleDav(wait = 1200, reason?: 'unlock') {
     if (!this.session || this.davTimer && wait < 2500) return;
     clearTimeout(this.davTimer);
     this.davTimer = setTimeout(() => {
       this.davTimer = undefined;
-      void this.handle({ type: 'webdav-scheduled' }).catch(() => undefined);
+      void this.handle({ type: 'webdav-scheduled', reason }).catch(() => undefined);
     }, wait);
   }
 
@@ -613,7 +775,10 @@ export class VaultController {
       finally { config.password = ''; config.username = ''; }
     }
     return { ...state, linked: true, writeVerified, conflicts: anchor.conflictCount ?? 0, drafts: anchor.draftCount ?? 0,
-      localRestoreHeld: !!anchor.localRestoreHeld };
+      localRestoreHeld: !!anchor.localRestoreHeld, ...(anchor.pack && { format: 'pack' as const, siteRulesPending: anchor.pack.siteRules === 'pending',
+        siteRulesApplied: anchor.pack.siteRules === 'applied', siteRuleConflicts: anchor.pack.ruleConflicts ?? 0,
+        pending: anchor.pack.dirty || !!anchor.pack.outbox || !!anchor.pack.integrated?.length || !!anchor.conflictCount ||
+          !!anchor.draftCount || !!anchor.pack.ruleConflicts }) };
   }
 
   private async remoteKeyUpdate(password: string, check: () => void) {
@@ -638,7 +803,8 @@ export class VaultController {
       await store.saveSettings(settings);
       check();
       const nextFiles = { ...files, head: nextHead, keyEpoch: remote.keyEpoch, remoteKeyUpdate: false };
-      await store.saveRemoteAnchor({ ...anchor, observedHead: undefined, observedKeyEpoch: undefined, rotationFrom: undefined, checkedAt: undefined },
+      await store.saveRemoteAnchor({ ...anchor, head: anchor.pack ? anchor.observedHead : anchor.head,
+        observedHead: undefined, observedKeyEpoch: undefined, rotationFrom: undefined, checkedAt: undefined },
         nextFiles, undefined, false, false);
       this.files = nextFiles;
       await this.activate(key, Array.from(wrap), check);
@@ -646,32 +812,109 @@ export class VaultController {
     } finally { key.fill(0); wrap?.fill(0); }
   }
 
-  private async syncWebDav(message: Extract<VaultMessage, { type: 'webdav-sync' | 'webdav-scheduled' }>, check: () => void): Promise<SyncResult> {
+  private handleDavSync(message: DavSyncMessage): Promise<SyncResult> {
+    const active = this.davFlight;
+    if (active) return message.type === 'webdav-scheduled' ? active :
+      active.catch(() => undefined).then(() => this.handleDavSync(message));
+    const flight = this.enqueue(check => this.prepareDavSync(message, check))
+      .then(prepared => 'run' in prepared ? prepared.run() : prepared);
+    this.davFlight = flight;
+    return flight.finally(() => { if (this.davFlight === flight) this.davFlight = undefined; });
+  }
+
+  private async prepareDavSync(message: DavSyncMessage, check: () => void): Promise<SyncResult | { run(): Promise<SyncResult> }> {
     if (!this.session || !this.files || !this.engine?.is_unlocked()) return { kind: 'locked', pending: false };
     const { files, session } = this;
     const anchor = await store.loadRemoteAnchor(files.vaultId);
     check();
     if (!anchor) return { kind: 'unlinked', pending: false };
+    if (message.type === 'webdav-scheduled' &&
+        (anchor.pack ? message.reason === 'legacy-interval' : ['startup', 'focus', 'interval'].includes(message.reason ?? ''))) {
+      return { kind: 'unchanged', pending: anchor.pack?.dirty === true };
+    }
     const state = await davStatus(files.vaultId);
     if (!state.saved) return { kind: 'unlinked', pending: false };
-    if (state.paused) return { kind: 'paused', pending: !!anchor.draftCount || await store.hasPendingWal(files.vaultId) };
+    if (state.paused) return { kind: 'paused', pending: !!anchor.draftCount ||
+      (anchor.pack ? anchor.pack.dirty || !!anchor.pack.outbox : await store.hasPendingWal(files.vaultId)) };
     check();
     const config = await openSavedDav(session, files.vaultId);
     const signal = this.davAbort.signal;
+    if (anchor.pack) {
+      let revision = this.packRevision;
+      const current = () => {
+        check();
+        signal.throwIfAborted();
+        if (this.session !== session) throw new Error('请重新解锁密码库后同步。');
+        if (revision !== this.packRevision) throw packChanged;
+      };
+      // Release the controller queue while WebDAV is in flight. Check the same
+      // local revision again inside each serialized commit.
+      return { run: async () => {
+        let material: Uint8Array<ArrayBuffer> | undefined;
+        try {
+          current();
+          if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
+          material = await packMaterial(session);
+          current();
+          const result = await runWholeSync({
+            files, session, anchor, material, device: (await store.loadJournal(files.vaultId)).clock?.deviceId,
+            transport: new PackTransport(config, {
+              check: current, signal,
+              stop: status => { this.davClock = undefined; return pauseDav(status); },
+              observeClock: async (offset, receivedAt) => {
+                await observeDavClock(files.vaultId, offset, receivedAt, current);
+                this.davClock = undefined;
+              },
+            }),
+            writable: config.writeVerified === true && !anchor.localRestoreHeld,
+            check: current,
+            commit: (next, updated) => this.enqueue(async () => {
+              current();
+              await this.commitWholePack(anchor, next, updated, current);
+              revision = ++this.packRevision;
+            }),
+            authorize: stamp => this.enqueue(async () => {
+              current();
+              if (message.type !== 'webdav-sync' || message.confirmation?.stamp !== stamp) return false;
+              await this.verifyMaster(message.confirmation.proof, current);
+              return true;
+            }),
+          });
+          current();
+          if (result.kind === 'key-update') await this.lock(false);
+          return result;
+        } catch (error) {
+          if (error === packChanged) return { kind: 'deferred', pending: true };
+          if (error instanceof PackIntegrityError && config.writeVerified) {
+            await this.enqueue(async () => {
+              current();
+              await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, current);
+              notifyDavPending();
+            });
+          }
+          throw error;
+        } finally { material?.fill(0); config.password = ''; config.username = ''; }
+      } };
+    }
     try {
       check();
-      await browser.alarms.create(DAV_ALARM, { periodInMinutes: 2 });
+      await browser.alarms.create(DAV_LEGACY_ALARM, { periodInMinutes: 2 });
       check();
+      const context = { check, signal, stop: (status: 401 | 403 | 429) => { this.davClock = undefined; return pauseDav(status); },
+        observeClock: async (offset: number | null, receivedAt: number) => {
+          await observeDavClock(files.vaultId, offset, receivedAt, check);
+          this.davClock = undefined;
+        } };
+      const authorize = async (stamp: string) => {
+        if (message.type !== 'webdav-sync' || !message.confirmation || message.confirmation.stamp !== stamp) return false;
+        await this.verifyMaster(message.confirmation.proof, check);
+        return true;
+      };
       const result = await runDavSync(config, {
         files, session, anchor, clock: (await store.loadJournal(files.vaultId)).clock,
         pending: await store.hasPendingWal(files.vaultId),
         compactWhenIdle: message.type === 'webdav-scheduled',
-        forceHead: message.type === 'webdav-sync', context: { check, signal,
-          stop: status => { this.davClock = undefined; return pauseDav(status); },
-          observeClock: async (offset, receivedAt) => {
-            await observeDavClock(files.vaultId, offset, receivedAt, check);
-            this.davClock = undefined;
-          } },
+        forceHead: message.type === 'webdav-sync', context,
         commit: async (next, current, consume, clock) => {
           check();
           await store.saveRemoteAnchor(next, current, clock, false, consume);
@@ -683,15 +926,29 @@ export class VaultController {
           }
           if (next.conflictCount !== anchor.conflictCount) await showConflictBadge(next.conflictCount ?? 0).catch(() => undefined);
         },
-        authorize: async stamp => {
-          if (message.type !== 'webdav-sync' || !message.confirmation || message.confirmation.stamp !== stamp) return false;
-          await this.verifyMaster(message.confirmation.proof, check);
-          return true;
-        },
+        authorize,
       });
       if (result.kind === 'key-update') await this.lock(false);
       return result;
     } finally { config.password = ''; config.username = ''; }
+  }
+
+  private async commitWholePack(original: store.RemoteAnchor, next: store.RemoteAnchor, files: store.VaultFiles, check: () => void) {
+    check();
+    const previous = this.files;
+    await store.saveRemoteAnchor(next, files, undefined, false, false);
+    check();
+    if (previous !== files) {
+      this.files = files;
+      this.engine!.restore_from_session(this.session!.key, this.session!.wrap, files.head, files.snap);
+      if (next.pack?.siteRules === 'applied' && files.packRules && (!previous?.packRules || !equalPackBytes(files.packRules, previous.packRules))) {
+        this.autofill = undefined;
+        this.onSiteRulesChanged();
+      }
+      void browser.runtime.sendMessage({ target: 'vault-event', type: 'sync-changed' }).catch(() => undefined);
+    }
+    if (next.conflictCount !== original.conflictCount) await showConflictBadge(next.conflictCount ?? 0).catch(() => undefined);
+    notifyDavPending();
   }
 
   private async reviewConflicts(message: Extract<VaultMessage, { type: 'webdav-conflicts' | 'webdav-resolve-preview' | 'webdav-resolve' }>, check: () => void) {
@@ -719,14 +976,16 @@ export class VaultController {
       return JSON.parse(preview);
     }
     await this.verifyMaster(message.proof, check);
-    const output = await derive<ReplayOutput>('sync:resolve', [session.key, session.wrap, files.head, files.snap, staged, rules, Date.now()]);
+    const output = await derive<ReplayOutput>(anchor.pack ? 'sync:pack-resolve' : 'sync:resolve',
+      [session.key, session.wrap, files.head, files.snap, staged, rules, Date.now()]);
     check();
     const updated = { ...files, head: new Uint8Array(output.head), snap: new Uint8Array(output.snap), updatedAtMs: Date.now(),
       changesSinceBackup: files.changesSinceBackup + message.rules.length, everHadRecords: files.everHadRecords || output.count > 0 };
     const pendingResolutions = new Uint8Array((anchor.pendingResolutions?.length ?? 0) + output.receipts.length);
     if (anchor.pendingResolutions) pendingResolutions.set(anchor.pendingResolutions);
     pendingResolutions.set(output.receipts, anchor.pendingResolutions?.length ?? 0);
-    await this.persistMutation(updated, check, { ...anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount, draftCount: output.draftCount, pendingResolutions });
+    await this.persistMutation(updated, check, { ...anchor, conflicts: new Uint8Array(output.conflicts), conflictCount: output.conflictCount,
+      draftCount: output.draftCount, pendingResolutions: anchor.pack ? undefined : pendingResolutions });
     this.engine!.restore_from_session(session.key, session.wrap, updated.head, updated.snap);
     await showConflictBadge(output.conflictCount).catch(() => undefined);
     void browser.runtime.sendMessage({ target: 'vault-event', type: 'sync-changed' }).catch(() => undefined);
@@ -742,7 +1001,42 @@ export class VaultController {
     const config = await openSavedDav(session, files.vaultId);
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
-      const client = new WebDavClient(config, { check, signal: this.davAbort.signal, stop: pauseDav });
+      const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      if (anchor.pack) {
+        const material = await packMaterial(session);
+        try {
+          const transport = new PackTransport(config, context);
+          const prepared = await wholeHistory(transport, material, anchor, session, files, config.writeVerified === true, check,
+            message.type === 'webdav-history' ? undefined : message.id);
+          if (message.type === 'webdav-history') return await prepared.list();
+          const { view, guard, preview } = await prepared.preview();
+          if (message.type === 'webdav-history-preview') return preview;
+          if (message.destination !== (preview.readOnly ? 'local' : 'remote') || message.stamp !== preview.stamp)
+            throw new Error('网盘或本机状态已变化，请重新预览。');
+          await this.verifyMaster(message.proof, check);
+          const readOnly = message.destination === 'local';
+          if (!readOnly && guard.blocked) throw new Error('恢复结果为空库，已拦截向网盘发布。');
+          const next = applyPackView({ ...anchor, localRestoreHeld: readOnly, pack: { ...anchor.pack, dirty: true } }, view);
+          const restored = { ...applyPackFiles(files, view), changesSinceBackup: files.changesSinceBackup + 1 };
+          this.packRevision++;
+          await this.commitWholePack(anchor, next, restored, check);
+          if (!readOnly) {
+            const result = await runWholeSync({ files: restored, session, anchor: next, material, transport, writable: true,
+              check, authorize: async stamp => stamp === guard.stamp,
+              commit: (updated, current) => this.commitWholePack(next, updated, current, check) });
+            if (result.kind === 'confirm-deletion' || result.kind === 'deferred' || result.kind === 'key-update' || result.kind === 'empty')
+              throw new Error('历史已恢复到本机，待网盘同步。请在设置中查看同步状态。');
+          }
+          return view.count;
+        } catch (error) {
+          if (error instanceof PackIntegrityError && config.writeVerified) {
+            await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, check);
+            notifyDavPending();
+          }
+          throw error;
+        } finally { material.fill(0); }
+      }
+      const client = new WebDavClient(config, context);
       // Keep the connection credentials until the last request in the operation finishes.
       if (message.type === 'webdav-history') return await listHistory(client, anchor, session, files);
       if (await store.hasPendingWal(files.vaultId)) throw new Error('本机仍有待上传的编辑，请先同步再恢复历史。');
@@ -819,7 +1113,26 @@ export class VaultController {
     try {
       if (anchor.endpoint !== await endpointFingerprint(config.url)) throw new Error('连接地址与已验证的库不同。');
       const context = { check, signal: this.davAbort.signal, stop: pauseDav };
+      if (anchor.pack) this.packRevision++;
       if (config.writeVerified) await saveDavConnection({ ...config, writeVerified: false }, session, files.vaultId, undefined, check);
+      if (anchor.pack) {
+        const material = await packMaterial(session);
+        try {
+          const transport = new PackTransport(config, context);
+          const listing = await transport.list(material, files.vaultId, anchor.pack.known);
+          const wrap = await latestPackWrap(listing, session, files.vaultId);
+          if (wrap.info.keyEpoch !== files.keyEpoch) throw new Error('请先用新主密码验证远端库。');
+          const version = listing.tips[0]!;
+          const cipher = await transport.download(version);
+          check();
+          await transport.verifyWrites(material, version, cipher, message.scratchFolder);
+          check();
+          await saveDavConnection({ ...config, writeVerified: true }, session, files.vaultId, undefined, check);
+          if (anchor.localRestoreHeld)
+            await store.saveRemoteAnchor({ ...anchor, localRestoreHeld: undefined }, files, undefined, false, false);
+          return;
+        } finally { material.fill(0); }
+      }
       const head = await new WebDavClient(config, context).get('head.bin', HEAD_LIMIT);
       if (!head || head === 'unchanged' || !head.etag) throw new Error('网盘未提供可验证的版本。密码库仍只读。');
       const checked = await derive<RemoteHeadInfo>('sync:authenticate-head', [head.bytes, session.key, session.wrap]);
@@ -849,17 +1162,71 @@ export class VaultController {
     if (message.type === 'webdav-status') return this.davConnectionStatus(check);
     if (message.type === 'webdav-create') return this.createLinkedVault(message, check);
     if (message.type === 'webdav-join' || message.type === 'webdav-merge') return this.joinRemoteVault(message, check);
-    if (message.type === 'webdav-sync' || message.type === 'webdav-scheduled') return this.syncWebDav(message, check);
+    if (message.type === 'webdav-site-rules' || message.type === 'webdav-site-rules-choice') {
+      if (!this.session || !this.files || !engine.is_unlocked()) throw new Error('请先解锁密码库。');
+      const files = this.files;
+      const anchor = await store.loadRemoteAnchor(files.vaultId);
+      check();
+      if (!anchor?.pack || anchor.pack.siteRules !== 'pending' || !files.packRules) {
+        if (message.type === 'webdav-site-rules') return null;
+        throw new Error('没有待选用的网站规则。');
+      }
+      const stamp = await digestHex(new Uint8Array(files.packRules));
+      if (message.type === 'webdav-site-rules') {
+        const rules = await openPackRules(this.session, files.packRules);
+        check();
+        return { stamp, sites: Object.entries(rules.sites).map(([rule, flags]) => ({ rule, flags })), domainGroups: rules.equivalentDomains };
+      }
+      if (typeof message.use !== 'boolean' || message.stamp !== stamp) throw new Error('远端网站规则已变化，请重新预览。');
+      await store.saveRemoteAnchor({ ...anchor, pack: { ...anchor.pack, siteRules: message.use ? 'applied' : 'skipped' } },
+        files, undefined, false, false);
+      this.packRevision++;
+      check();
+      this.autofill = undefined;
+      this.onSiteRulesChanged();
+      return;
+    }
+    if (message.type === 'webdav-rule-conflicts' || message.type === 'webdav-rule-conflict-choice') {
+      if (!this.session || !this.files || !engine.is_unlocked()) throw new Error('请先解锁密码库。');
+      const files = this.files, session = this.session;
+      const anchor = await store.loadRemoteAnchor(files.vaultId);
+      check();
+      if (!anchor?.pack || anchor.pack.siteRules !== 'applied' || !files.packRules?.length || !anchor.pack.ruleConflicts) {
+        if (message.type === 'webdav-rule-conflicts') return null;
+        throw new Error('没有待裁决的关联域名。');
+      }
+      const stamp = await digestHex(new Uint8Array(files.packRules));
+      const rules = await openPackRules(session, files.packRules);
+      check();
+      if (message.type === 'webdav-rule-conflicts') return { stamp, alternatives: rules.domainConflicts ?? [] };
+      if (stamp !== message.stamp) throw new Error('待裁决的关联域名已变化，请重新预览。');
+      const updated = resolvePackRuleConflict(rules, message.index, message.choice);
+      const packRules = await sealPackRules(session, updated);
+      check();
+      const next = { ...anchor, pack: { ...anchor.pack, dirty: true, ruleConflicts: updated.domainConflicts?.length ?? 0 } };
+      const current = { ...files, packRules };
+      await this.commitWholePack(anchor, next, current, check);
+      this.packRevision++;
+      return;
+    }
     if (message.type === 'webdav-enable-write') return this.enableDavWriting(message, check);
     if (message.type === 'webdav-test') {
       if (this.files && (!engine.is_unlocked() || !this.session)) throw new Error('请先解锁密码库，再测试网盘连接。');
       const operation = this.davAbort.signal;
       try {
         const anchor = message.remember === true && this.files && await store.loadRemoteAnchor(this.files.vaultId);
+        if (anchor && anchor.pack) this.packRevision++;
         check();
         const { probe, resumed } = await testDav(message.input, message.remember === true, this.session, this.files?.vaultId,
           { check, signal: operation }, anchor ? anchor.endpoint : undefined);
         if (resumed && anchor) this.scheduleDav();
+        if (message.input && !anchor) {
+          const endpoint = await endpointFingerprint(webDavConfig(message.input).url);
+          const pending = await store.loadPackSetup(endpoint);
+          check();
+          if (pending && (this.files ? pending.version.vaultId === this.files.vaultId : !pending.source))
+            return { ...probe, createPending: true };
+        }
         return probe;
       } finally { this.davClock = undefined; }
     }
@@ -873,7 +1240,7 @@ export class VaultController {
           opening.items = JSON.parse(engine.list_summaries_json()) as ItemSummary[];
         } finally { await touch; }
         check();
-        this.scheduleDav();
+        if (!this.files?.packRules) this.scheduleDav();
         performance.clearMarks('vault:open-response-ready');
         performance.mark('vault:open-response-ready');
       }
@@ -920,16 +1287,18 @@ export class VaultController {
     if (message.type === 'recover' || message.type === 'change-password') {
       this.validatePassword(message.newPassword);
       const anchor = await store.loadRemoteAnchor(this.files.vaultId);
-      if (anchor?.rotationFrom != null) throw new Error('上次主密码修改尚未同步。请先完成网盘同步。');
+      if (anchor?.rotationFrom != null || anchor?.pack?.outbox) throw new Error('还有未完成的网盘发布，请先完成同步再修改主密码。');
       const key = randomBytes(32);
       try {
         const output = await derive<Rotation>(message.type === 'recover' ? 'wasm_recover_and_reset_master_password' : 'wasm_change_master_password',
           [this.files.head, message.type === 'recover' ? message.recoveryCode : message.currentPassword, message.newPassword, key, Date.now()]);
         check();
         const nextFiles = { ...this.files, head: new Uint8Array(output.head), keyEpoch: output.keyEpoch, updatedAtMs: Date.now() };
-        if (anchor) await store.saveRemoteAnchor({ ...anchor, rotationFrom: this.files.keyEpoch }, nextFiles, undefined, false, false);
+        if (anchor) await store.saveRemoteAnchor({ ...anchor, rotationFrom: this.files.keyEpoch,
+          pack: anchor.pack && { ...anchor.pack, dirty: true } }, nextFiles, undefined, false, false);
         else await store.saveVaultFiles(nextFiles);
         this.files = nextFiles;
+        if (anchor?.pack) notifyDavPending();
         delete settings.pinWrap; delete settings.prf; settings.pinFailures = 0;
         await store.saveSettings(settings);
         await this.activate(key, output.wrap, check);
@@ -1342,6 +1711,7 @@ export class VaultController {
         if (changeCount > backedUp) {
           const files = { ...this.files, backedUpChangeCount: changeCount, changesSinceBackup: total - changeCount };
           await store.saveVaultFiles(files);
+          if (files.packRules) this.packRevision++;
           this.files = files;
         }
         return null;
@@ -1493,6 +1863,17 @@ export class VaultController {
   }
   private async readAutofillSettings(check: () => void): Promise<AutofillSettings> {
     if (this.autofill) return structuredClone(this.autofill);
+    const files = this.files!;
+    if (files.packRules) {
+      const anchor = await store.loadRemoteAnchor(files.vaultId);
+      check();
+      if (!anchor?.pack) throw new Error('无法验证本机网站规则。');
+      const rules = anchor.pack.siteRules === 'applied' ? files.packRules : files.localPackRules;
+      const active = rules ? await openPackRules(this.session!, rules) : emptySiteRules();
+      check();
+      this.autofill = active;
+      return structuredClone(active);
+    }
     const stored = await browser.storage.local.get<{
       autofillSealed?: { vaultId: string; bytes: number[] }; autofill?: AutofillSettings;
     }>(['autofillSealed', 'autofill']);
@@ -1518,6 +1899,24 @@ export class VaultController {
   }
   private async saveAutofillSettings(settings: AutofillSettings, check: () => void) {
     const valid = this.validateAutofillSettings(settings);
+    const current = this.files!;
+    if (current.packRules) {
+      const anchor = await store.loadRemoteAnchor(current.vaultId);
+      check();
+      if (!anchor?.pack) throw new Error('无法验证本机网站规则。');
+      const active = anchor.pack.siteRules === 'applied';
+      const rules = active ? preservePackRuleConflicts(await openPackRules(this.session!, current.packRules), valid) : valid;
+      const bytes = await sealPackRules(this.session!, rules);
+      check();
+      const files = active ? { ...current, packRules: bytes } : { ...current, localPackRules: bytes };
+      await store.saveRemoteAnchor({ ...anchor, pack: { ...anchor.pack, dirty: anchor.pack.dirty || active } }, files, undefined, false, false);
+      this.packRevision++;
+      this.files = files;
+      check();
+      this.autofill = valid;
+      if (active) notifyDavPending();
+      return;
+    }
     const json = JSON.stringify(valid);
     if (new TextEncoder().encode(json).length > 256 * 1024) throw new Error('网站偏好超过 256 KiB。');
     const bytes = await derive<number[]>('seal-preferences', [this.session!.key, this.session!.wrap, json]);

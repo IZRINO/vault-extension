@@ -78,7 +78,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
           : operation === 'parse-ente' || operation === 'export-ente' ? '/ente-worker.js'
           : audit ? '/audit-worker.js'
           : ['csv-headers', 'parse-mapped-csv', 'export-login-csv', 'parse-authenticator-backup', 'portable-import', 'portable-export'].includes(operation) ? '/migration-worker.js'
-          : ['seal-preferences', 'open-preferences', 'seal-webdav', 'open-webdav', 'sign-authorization', 'verify-authorization'].includes(operation) ? '/preferences-worker.js'
+          : ['seal-preferences', 'open-preferences', 'seal-webdav', 'open-webdav', 'sign-authorization', 'verify-authorization', 'sync-pack-material'].includes(operation) ? '/preferences-worker.js'
           : operation.startsWith('sync:') ? '/sync-worker.js'
           : operation.startsWith('passkey:') ? '/passkey-worker.js'
           : operation === 'validate-totp' || operation === 'generate-hotp' || operation === 'generate-otp' ? '/otp-worker.js' : '/kdf-worker.js';

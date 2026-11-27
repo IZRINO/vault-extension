@@ -6,7 +6,11 @@ import { davPresets, probeWebDav, webDavConfig, type DavContext, type DavProbe, 
 interface Seal { vaultId: string; bytes: number[] }
 interface ClockSample { offset: number | null; observedAt: number; enabled: boolean }
 interface LocalData { webDavSealed?: Seal; webDavPaused?: DavStopStatus | null; webDavClock?: ClockSample; webDavConflicts?: number }
-export interface DavConnectionStatus { saved: boolean; paused?: DavStopStatus; offsetSeconds: number | null; clockExpiresAt?: number; compensation: boolean; linked?: boolean; writeVerified?: boolean; conflicts?: number; drafts?: number; localRestoreHeld?: boolean }
+export interface DavConnectionStatus {
+  saved: boolean; paused?: DavStopStatus; offsetSeconds: number | null; clockExpiresAt?: number; compensation: boolean;
+  linked?: boolean; writeVerified?: boolean; conflicts?: number; drafts?: number; localRestoreHeld?: boolean; format?: 'pack'; pending?: boolean;
+  siteRulesPending?: boolean; siteRulesApplied?: boolean; siteRuleConflicts?: number;
+}
 const keys: (keyof LocalData)[] = ['webDavSealed', 'webDavPaused', 'webDavClock', 'webDavConflicts'];
 const maxClockAge = 30 * 60 * 1000;
 const read = () => browser.storage.local.get<LocalData>(keys);

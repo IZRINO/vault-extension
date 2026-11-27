@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use vault_core::crypto::{FileRole, VaultKeyHierarchy};
 use vault_core::error::VaultError;
 use vault_core::json_lite::JVal;
-use vault_core::model::{CredentialData, VaultItem, generate_uuid_v4};
-use vault_core::sync_codec::{MpReader, MsgPackWire, mp_write_array_len, mp_write_bin, mp_write_str, open_compact_object, seal_compact_object};
+use vault_core::model::{CredentialData, VaultItem, VaultSnapshot, generate_uuid_v4};
+use vault_core::sync_codec::{MpReader, MsgPackWire, mp_write_array_len, mp_write_bin, mp_write_str, mp_write_uint, open_compact_object, seal_compact_object};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 use crate::{batch::{invalid, read_item, write_item}, merge, remote};
 
+#[derive(Clone)]
 pub(crate) struct Conflict {
     pub(crate) id: String,
     pub(crate) fields: Vec<String>,
@@ -20,20 +21,22 @@ pub(crate) struct Conflict {
     pub(crate) additional: Vec<(VaultItem, String)>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Draft {
     pub(crate) base: Option<VaultItem>,
     pub(crate) ours: Option<VaultItem>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Staged {
     pub(crate) rows: Vec<Conflict>,
     pub(crate) drafts: BTreeMap<String, Vec<Draft>>,
+    pub(crate) tombstones: BTreeSet<String>,
 }
 
 impl MsgPackWire for Staged {
     fn encode_msgpack(&self, out: &mut Vec<u8>) {
-        mp_write_array_len(out, self.rows.len() + self.draft_count());
+        mp_write_array_len(out, self.rows.len() + self.draft_count() + self.tombstones.len());
         for row in &self.rows {
             mp_write_array_len(out, if row.additional.is_empty() { 7 } else { 8 });
             mp_write_str(out, &row.id);
@@ -65,6 +68,11 @@ impl MsgPackWire for Staged {
                 write_item(out, draft.ours.as_ref());
             }
         }
+        for id in &self.tombstones {
+            mp_write_array_len(out, 2);
+            mp_write_str(out, id);
+            mp_write_uint(out, 1);
+        }
     }
     fn decode_msgpack(rd: &mut MpReader<'_>) -> Result<Self, VaultError> {
         let len = rd.read_array_len();
@@ -72,11 +80,16 @@ impl MsgPackWire for Staged {
         let mut rows = Vec::with_capacity(len as usize);
         let mut seen = BTreeSet::new();
         let mut drafts = BTreeMap::<String, Vec<Draft>>::new();
+        let mut tombstones = BTreeSet::new();
         for _ in 0..len {
             let version = rd.read_array_len();
-            if !matches!(version, 3 | 5 | 7 | 8) { return Err(invalid()); }
+            if !matches!(version, 2 | 3 | 5 | 7 | 8) { return Err(invalid()); }
             let id = rd.read_string();
             if id.is_empty() { return Err(invalid()); }
+            if version == 2 {
+                if rd.read_u64() != 1 || !tombstones.insert(id) { return Err(invalid()); }
+                continue;
+            }
             if version == 3 {
                 let base = read_item(rd)?;
                 let ours = read_item(rd)?;
@@ -125,7 +138,7 @@ impl MsgPackWire for Staged {
             rows.push(Conflict { id, fields, base, ours, theirs, receipt, sources, additional });
         }
         rd.finish()?;
-        Ok(Self { rows, drafts })
+        Ok(Self { rows, drafts, tombstones })
     }
 }
 
@@ -137,8 +150,8 @@ impl Staged {
         open_compact_object(keys.manifest_key(), FileRole::Wal, Some(&format!("conflicts:{vault_id}")), bytes)
     }
     pub(crate) fn seal(&self, keys: &VaultKeyHierarchy, vault_id: &str) -> Result<Vec<u8>, VaultError> {
-        if self.rows.is_empty() && self.drafts.is_empty() { return Ok(Vec::new()); }
-        if self.rows.len() + self.draft_count() > 16_384 {
+        if self.rows.is_empty() && self.drafts.is_empty() && self.tombstones.is_empty() { return Ok(Vec::new()); }
+        if self.rows.len() + self.draft_count() + self.tombstones.len() > 16_384 {
             return Err(VaultError::CompactObjectTooLarge);
         }
         seal_compact_object(keys.manifest_key(), FileRole::Wal, &format!("conflicts:{vault_id}"), 1, self)
@@ -383,37 +396,44 @@ pub fn wasm_sync_resolve(
 ) -> Result<remote::Replayed, JsValue> {
     let (key, wrap, rules) = (Zeroizing::new(key), Zeroizing::new(wrap), Zeroizing::new(rules));
     let (vault, epoch, keys) = super::keys(&key, &wrap)?;
-    let mut snapshot = super::verified_snapshot(&keys, &vault, epoch, current_head, current)?;
+    let snapshot = super::verified_snapshot(&keys, &vault, epoch, current_head, current)?;
     let staged = Staged::open(&keys, &vault, staged)?;
+    let (snapshot, pending, receipts) = resolve_staged(snapshot, staged, &rules, time as u64)?;
+    let mut result = remote::materialize(&keys, current_head, snapshot)?;
+    result.set_conflicts(&pending, &keys, &vault)?;
+    result.set_receipts(receipts);
+    Ok(result)
+}
+
+pub(crate) fn resolve_staged(
+    mut snapshot: VaultSnapshot, staged: Staged, rules: &str, time: u64,
+) -> Result<(VaultSnapshot, Staged, Vec<u8>), VaultError> {
     let mut items: BTreeMap<_, _> = snapshot.items.drain(..).map(|item| (item.id.clone(), item)).collect();
-    let rules = JVal::parse(&rules)?;
+    let rules = JVal::parse(rules)?;
     let mut selections = selected_rules(&rules, staged.rows.len())?;
     let mut remaining = Vec::new();
     let mut receipts = Vec::new();
     for row in staged.rows {
         let Some(rule) = selections.remove(&row.id) else { remaining.push(row); continue; };
         let shown_id = row.theirs.as_ref().map_or(row.id.as_str(), |item| &item.id);
-        if !merge::same(items.get(shown_id), row.theirs.as_ref()) { return Err(invalid().into()); }
+        if !merge::same(items.get(shown_id), row.theirs.as_ref()) { return Err(invalid()); }
         for (item, _) in &row.additional {
-            if !merge::same(items.get(&item.id), Some(item)) { return Err(invalid().into()); }
+            if !merge::same(items.get(&item.id), Some(item)) { return Err(invalid()); }
             items.remove(&item.id);
         }
         if let Some(receipt) = row.receipt { receipts.extend(receipt); }
         items.remove(shown_id);
         items.remove(&row.id);
         for mut item in resolve_one(&row, rule)? {
-            item.updated_at_ms = (time as u64).max(item.updated_at_ms);
+            item.updated_at_ms = time.max(item.updated_at_ms);
             item.revision = item.revision.saturating_add(1);
-            if items.insert(item.id.clone(), item).is_some() { return Err(invalid().into()); }
+            if items.insert(item.id.clone(), item).is_some() { return Err(invalid()); }
         }
     }
-    if !selections.is_empty() { return Err(invalid().into()); }
+    if !selections.is_empty() { return Err(invalid()); }
     snapshot.items = items.into_values().collect();
-    let pending = Staged { rows: remaining, drafts: staged.drafts };
-    let mut result = remote::materialize(&keys, current_head, snapshot)?;
-    result.set_conflicts(&pending, &keys, &vault)?;
-    result.set_receipts(receipts);
-    Ok(result)
+    let pending = Staged { rows: remaining, drafts: staged.drafts, tombstones: staged.tombstones };
+    Ok((snapshot, pending, receipts))
 }
 
 #[cfg(test)]

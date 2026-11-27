@@ -388,7 +388,7 @@ pub(crate) fn replay(
     crate::device::indexed(&snapshot.device_registry)?;
     snapshot.included_wal_ids = consumed.into_iter().collect();
     provenance.store(&mut snapshot);
-    Ok((snapshot, Staged { rows: blocked.into_values().collect(), drafts: BTreeMap::new() }))
+    Ok((snapshot, Staged { rows: blocked.into_values().collect(), ..Staged::default() }))
 }
 
 #[cfg(test)]

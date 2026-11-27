@@ -1,4 +1,4 @@
-import init, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav,
+import init, { wasm_open_preferences, wasm_seal_preferences, wasm_open_webdav, wasm_seal_webdav, wasm_sync_pack_material,
   wasm_sign_authorization, wasm_verify_authorization } from '../../../crates/vault-preferences/pkg/vault_preferences.js';
 
 export default defineUnlistedScript(() => {
@@ -16,6 +16,9 @@ export default defineUnlistedScript(() => {
         value = Array.from(wasm_seal_webdav(key, wrap, payload));
       } else if (data.operation === 'open-webdav' && payload instanceof Uint8Array) {
         value = wasm_open_webdav(key, wrap, payload);
+      } else if (data.operation === 'sync-pack-material') {
+        const material = wasm_sync_pack_material(key, wrap);
+        try { value = Array.from(material); } finally { material.fill(0); }
       } else if (data.operation === 'sign-authorization') {
         value = Array.from(wasm_sign_authorization(...data.args as Parameters<typeof wasm_sign_authorization>));
       } else if (data.operation === 'verify-authorization') {
@@ -24,7 +27,7 @@ export default defineUnlistedScript(() => {
       self.postMessage({ ok: true, value });
     } catch {
       const label = data.operation.endsWith('-authorization') ? '本机授权'
-        : data.operation.endsWith('-webdav') ? '网盘设置' : '网站偏好';
+        : data.operation.endsWith('-webdav') || data.operation === 'sync-pack-material' ? '网盘设置' : '网站偏好';
       self.postMessage({ ok: false, error: `${label}处理失败，请重新解锁后重试。` });
     } finally {
       for (const arg of data.args) if (arg instanceof Uint8Array) arg.fill(0);

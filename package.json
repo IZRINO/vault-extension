@@ -15,6 +15,7 @@
     "test:phase-2": "node scripts/test-phase-2.cjs",
     "test:autofill": "node scripts/test-autofill.cjs",
     "test:migration": "node scripts/test-migration.cjs",
+    "test:pack-sync": "node scripts/test-pack-sync.cjs",
     "test:passkeys": "node scripts/test-passkeys.cjs",
     "test:kdbx": "node scripts/test-kdbx.cjs"
   },

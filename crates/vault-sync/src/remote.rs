@@ -379,7 +379,7 @@ pub fn wasm_sync_compact(
     next_remote_snapshot(&keys, head, old, current, id).map_err(Into::into)
 }
 
-fn restore_counters(current: &VaultSnapshot, restored: &mut VaultSnapshot, pack: bool) -> Result<(), VaultError> {
+pub(crate) fn restore_counters(current: &VaultSnapshot, restored: &mut VaultSnapshot, pack: bool) -> Result<(), VaultError> {
     use std::collections::BTreeMap;
     let passkeys = vault_passkeys::bundle::CounterEvidence::from_items(&current.items).map_err(|_| batch::invalid())?;
     let mut trusted = BTreeMap::<_, u64>::new();

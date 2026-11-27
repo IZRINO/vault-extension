@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -33,6 +33,7 @@ const state = vi.hoisted(() => ({ files: undefined as VaultFiles | undefined, se
   remoteVaultId: undefined as string | undefined, remotePoll: undefined as Pick<RemoteAnchor, 'endpoint' | 'objects' | 'checkedAt'> | undefined }));
 vi.mock('./vault-storage', () => ({
   loadVaultFiles: async () => structuredClone(state.files),
+  loadPackSetup: async () => undefined,
   loadRemoteAnchor: async (vaultId: string) => structuredClone(state.observedKeyUpdate ??
     (state.remoteVaultId === vaultId ? { vaultId, ...state.remotePoll } : undefined)),
   loadJournal: async () => ({ clock: structuredClone(state.pendingWal.at(-1)?.state), legacy: state.legacy }),
@@ -135,6 +136,9 @@ beforeAll(async () => {
   output.free();
 });
 beforeEach(() => {
+  // Each test uses fresh service workers; callbacks from old workers cannot
+  // wake up into another test's shared IndexedDB/session fixture.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   state.files = structuredClone(fixture); state.session = undefined; state.pause = undefined;
   state.pauseEnte = undefined;
   state.pauseAudit = undefined;
@@ -155,6 +159,10 @@ beforeEach(() => {
       set: async (values: Record<string, unknown>) => { Object.assign(state.local, structuredClone(values)); },
       remove: async (key: string) => { delete state.local[key]; },
     } } });
+});
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
 });
 async function unlocked() { const controller = new VaultController(); await controller.handle({ type: 'unlock', password }); return controller; }
 
@@ -450,7 +458,6 @@ describe('real WASM + background session integration', () => {
       return new Response(`<multistatus xmlns="DAV:"><response><href>${name}</href><propstat><prop><resourcetype><collection/></resourcetype></prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>`,
         { status: 207 });
     });
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     let controller: VaultController | undefined, restarted: VaultController | undefined;
     try {
       controller = await unlocked();
@@ -484,7 +491,6 @@ describe('real WASM + background session integration', () => {
     } finally {
       await restarted?.lock();
       await controller?.lock();
-      vi.useRealTimers();
       fetchMock.mockRestore();
     }
   });
@@ -621,7 +627,7 @@ describe('real WASM + background session integration', () => {
         onInstalled: { addListener() {} }, onStartup: { addListener() {} },
       },
       tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} }, onActivated: { addListener() {} } },
-      windows: { onRemoved: { addListener() {} } },
+      windows: { onRemoved: { addListener() {} }, onFocusChanged: { addListener() {} }, getAll: async () => [] },
       commands: { onCommand: { addListener() {} } },
       contextMenus: { onClicked: { addListener() {} } },
       alarms: { get: async () => undefined, create: async () => undefined, clear: async () => true,
@@ -1121,7 +1127,7 @@ describe('real WASM + background session integration', () => {
     const rejected = expect(pending).rejects.toThrow('已锁定');
     const queued = controller.handle({ type: 'unlock', password });
     const queuedRejected = expect(queued).rejects.toThrow('已锁定');
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await vi.advanceTimersByTimeAsync(30);
     await controller.lock(); release(); await rejected; await queuedRejected;
     expect(state.session).toBeUndefined();
   });

@@ -1,4 +1,14 @@
 export type Proof = { method: 'master' | 'pin'; secret: string };
+export type DavScheduledReason = 'startup' | 'focus' | 'interval' | 'unlock' | 'legacy-interval';
+export interface DavSiteRulesPreview {
+  stamp: string;
+  sites: { rule: string; flags: import('./autofill-settings').SiteFlags }[];
+  domainGroups: string[][];
+}
+export interface DavRuleConflictsPreview {
+  stamp: string;
+  alternatives: { first: string[][]; second: string[][] }[];
+}
 export type BackupImportProof = Proof | { method: 'recovery'; secret: string };
 export const MAX_VAULTPACK_BYTES = 16 * 1024 * 1024;
 export const MAX_BROWSER_CSV_BYTES = 2 * 1024 * 1024;
@@ -77,6 +87,10 @@ export type VaultMessage =
   | { type: 'webdav-clock'; enabled: boolean }
   | { type: 'webdav-create'; input?: import('./sync/webdav').WebDavInput; scratchFolder: string; masterPassword: string; deviceName?: string }
   | { type: 'webdav-join'; input: import('./sync/webdav').WebDavInput; method: 'master' | 'recovery'; secret: string }
+  | { type: 'webdav-site-rules' }
+  | { type: 'webdav-site-rules-choice'; use: boolean; stamp: string }
+  | { type: 'webdav-rule-conflicts' }
+  | { type: 'webdav-rule-conflict-choice'; stamp: string; index: number; choice: 'first' | 'second' }
   | { type: 'webdav-merge'; input: import('./sync/webdav').WebDavInput; method: 'master' | 'recovery'; secret: string; proof: Proof; stamp?: string }
   | { type: 'webdav-enable-write'; scratchFolder: string; masterPassword: string }
   | { type: 'webdav-update-key'; password: string }
@@ -89,7 +103,7 @@ export type VaultMessage =
   | { type: 'webdav-history-restore'; id: string; stamp: string; proof: Proof; destination: 'local' | 'remote' }
   | { type: 'webdav-devices' }
   | { type: 'webdav-device-change'; action: 'register' | 'claim' | 'rename' | 'remove'; id?: string; name?: string; proof: Proof }
-  | { type: 'webdav-scheduled' }
+  | { type: 'webdav-scheduled'; reason?: DavScheduledReason }
   | { type: 'csv-headers'; bytes: number[] }
   | ({ type: 'preview-auth-backup' } & AuthBackupInput)
   | ({ type: 'import-auth-backup'; stamp: string; proof: Proof } & AuthBackupInput)

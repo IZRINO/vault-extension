@@ -124,6 +124,8 @@ node apps/extension/node_modules/typescript/bin/tsc -p apps/extension/tsconfig.j
 `node scripts/test-sync-lifecycle.cjs` 验证远端主密码轮换、重新配置本机包装及重装设备认领；使用相同的本机故障服务和独立配置。
 加 `--backup-only` 则验证使用目标恢复码加入已有远端库，再合入独立 `.vaultpack`；只在用户显式启用写入并验证条件写后同步。
 
+新建整包远端库（#52）使用 `pnpm run test:pack-sync`，见[整包复测与真网盘签收](agents/whole-pack-webdav.md)。此处依赖旧增量文件与压实的测试流程保留为 #52 之前的构建基线。
+
 ## 本机记录
 
 - 归档：`test-results/Vault-2026-11-20-6043489c46a1-chrome.zip`，5,985,824 B。SHA-256：`6043489c46a1191d7cc417d16a80654c4963a38f61372fabbbfe186d2810315b`。解压目录：`test-results/release-unpacked-6043489c46a1`。

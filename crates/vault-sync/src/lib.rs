@@ -5,12 +5,14 @@ mod conflict;
 mod device;
 mod journal;
 mod merge;
+mod pack;
 mod reconcile;
 mod remote;
 pub use reconcile::*;
 pub use remote::*;
 pub use conflict::*;
 pub use device::*;
+pub use pack::*;
 
 use vault_core::crypto::{SecretKey, VaultKeyHierarchy};
 use vault_core::error::VaultError;

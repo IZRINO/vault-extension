@@ -63,7 +63,8 @@ async function setup() {
       runtime: { ...browser.runtime, onConnect: event, onInstalled: event, onStartup: event },
       alarms: { ...browser.alarms, onAlarm: event },
       idle: { setDetectionInterval() {}, onStateChanged: event },
-      tabs: { onRemoved: event, onUpdated: event, onActivated: event }, windows: { onRemoved: event },
+      tabs: { onRemoved: event, onUpdated: event, onActivated: event },
+      windows: { onRemoved: event, onFocusChanged: event, getAll: async () => [] },
       commands: { onCommand: event }, contextMenus: { onClicked: event },
     });
     vi.stubGlobal('defineBackground', (start: () => void) => start);

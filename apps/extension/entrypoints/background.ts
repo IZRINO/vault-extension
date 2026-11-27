@@ -1,8 +1,8 @@
-import { VaultController, DAV_ALARM, LOCK_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
+import { VaultController, DAV_LEGACY_ALARM, LOCK_ALARM, IDLE_DETECTION_SECONDS } from '../src/vault-controller';
 import { loadVaultCore } from '../src/vault-core';
 import { isVaultPage } from '../src/sender-policy';
 import { CLIPBOARD_ALARM, clearExpiredClipboard, restoreClipboardAlarm } from '../src/clipboard';
-import type { VaultMessage } from '../src/vault-messages';
+import type { DavScheduledReason, VaultMessage } from '../src/vault-messages';
 import { AutofillController } from '../src/autofill-controller';
 import type { AutofillMessage } from '../src/autofill-messages';
 import type { SiteFlags } from '../src/autofill-settings';
@@ -11,9 +11,17 @@ import { PasskeyController } from '../src/passkeys/controller';
 import { PASSKEY_PORT } from '../src/passkeys/protocol';
 import { connectQrScan, QR_SCAN_PORT } from '../src/qr-scan';
 
+const DAV_ALARM = 'vault-webdav';
+const DAV_INTERVAL_MINUTES = 5;
+const DAV_FOCUS_DEBOUNCE_MS = 300;
+
 export default defineBackground(() => {
   performance.mark('vault:background-entry');
-  const vault = new VaultController();
+  const vault = new VaultController(() => {
+    autofill.clear();
+    passkeys.stop();
+    notifyAutofill('settings-changed');
+  });
   const autofill = new AutofillController(vault);
   const passkeys = new PasskeyController(vault);
   const ready = Promise.all([
@@ -22,6 +30,41 @@ export default defineBackground(() => {
   ]);
   void ready.then(restoreDavBadge).catch(() => undefined);
   void ready.then(restoreClipboardAlarm).catch(() => undefined);
+  let focusRevision = 0;
+  let focusTimer: ReturnType<typeof setTimeout> | undefined;
+  let davSchedule = Promise.resolve();
+  function updateDavSchedule(reason?: Extract<DavScheduledReason, 'startup' | 'focus' | 'interval'>) {
+    if (reason === 'interval' && focusTimer !== undefined) return;
+    davSchedule = davSchedule.then(async () => {
+      await ready;
+      const revision = focusRevision;
+      const [windows, alarm] = await Promise.all([
+        browser.windows.getAll({ windowTypes: ['normal', 'popup'] }),
+        browser.alarms.get(DAV_ALARM),
+      ]);
+      if (revision !== focusRevision) return;
+      if (!windows.some(window => window.focused)) {
+        if (alarm) await browser.alarms.clear(DAV_ALARM);
+        return;
+      }
+      if (alarm?.periodInMinutes !== DAV_INTERVAL_MINUTES) {
+        await browser.alarms.create(DAV_ALARM, { periodInMinutes: DAV_INTERVAL_MINUTES });
+      }
+      if (reason && revision === focusRevision) {
+        void vault.handle({ type: 'webdav-scheduled', reason }).catch(() => undefined);
+      }
+    }).catch(() => undefined);
+  }
+  browser.windows.onFocusChanged.addListener(() => {
+    focusRevision++;
+    clearTimeout(focusTimer);
+    focusTimer = setTimeout(() => {
+      focusTimer = undefined;
+      updateDavSchedule('focus');
+    }, DAV_FOCUS_DEBOUNCE_MS);
+  });
+  // The browser can discard its alarms while the service worker is away.
+  updateDavSchedule();
   const notifyAutofill = (type: 'settings-changed' | 'site-settings-changed') => {
     void browser.tabs.query({}).then(tabs => Promise.allSettled(tabs.filter(tab => tab.id != null)
       .map(tab => browser.tabs.sendMessage(tab.id!, { target: 'vault-fill', type })))).catch(() => undefined);
@@ -119,11 +162,18 @@ export default defineBackground(() => {
       { target: 'vault-fill', type: 'open', reason: 'context-menu' }, { frameId: info.frameId ?? 0 }).catch(() => undefined);
   });
   browser.alarms.onAlarm.addListener(alarm => {
-    if (alarm.name === DAV_ALARM) void ready.then(() => vault.handle({ type: 'webdav-scheduled' })).catch(() => undefined);
+    if (alarm.name === DAV_ALARM) updateDavSchedule('interval');
+    if (alarm.name === DAV_LEGACY_ALARM) {
+      void ready.then(() => vault.handle({ type: 'webdav-scheduled', reason: 'legacy-interval' })).catch(() => undefined);
+    }
     if (alarm.name === LOCK_ALARM) void ready.then(() => vault.lockExpiredSession()).then(locked => {
       if (locked) { autofill.clear(); passkeys.stop(); }
     }).catch(() => undefined);
     if (alarm.name === CLIPBOARD_ALARM) void clearExpiredClipboard().catch(() => undefined);
   });
-  browser.runtime.onStartup.addListener(() => { registerMenu(); passkeys.stop(); void vault.lock(); });
+  browser.runtime.onStartup.addListener(() => {
+    registerMenu();
+    passkeys.stop();
+    void ready.then(() => vault.lock()).then(() => updateDavSchedule('startup')).catch(() => undefined);
+  });
 });

@@ -415,6 +415,20 @@ details.fold[open] > summary > .icon {
   padding: 4px 12px 14px;
 }
 
+.site-rule-list {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.site-rule-list dt {
+  font-weight: 600;
+}
+
+.site-rule-list > * + * {
+  padding-block-start: 8px;
+  border-block-start: 1px solid var(--line);
+}
+
 /* 编辑器 */
 .form {
   display: grid;

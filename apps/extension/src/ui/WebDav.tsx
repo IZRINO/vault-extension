@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
-import { RotateCw } from 'lucide-react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { ChevronRight, RotateCw } from 'lucide-react';
+import { SITE_FLAG_KEYS, type SiteFlags } from '../autofill-settings';
 import type { DavConnectionStatus } from '../sync/connection';
 import { deviceProfile } from '../sync/device-profile';
 import type { SyncResult } from '../sync/run';
 import type { DavProbe, WebDavInput } from '../sync/webdav';
-import { request, type DavJoinPreview } from '../vault-messages';
+import { request, type DavJoinPreview, type DavRuleConflictsPreview, type DavSiteRulesPreview } from '../vault-messages';
 import { AreaField, ErrorBanner, Ico, SecretField, SelectField, SwitchRow, TextField } from './components';
 import { errorText } from './lib';
 import type { EmergencyKit } from './Welcome';
@@ -12,6 +13,7 @@ import { openConflictReview } from './shell';
 import { SyncHistory } from './SyncHistory';
 import { SyncDevices } from './SyncDevices';
 
+type ConnectionProbe = DavProbe & { createPending?: true };
 const probeText: Record<DavProbe['kind'], string> = {
   empty: '已连接，目标目录为空。只读测试未创建任何文件。',
   existing: '找到已有密码库。连接测试没有下载或更改凭证。',
@@ -22,7 +24,7 @@ const syncText: Record<SyncResult['kind'], string> = {
   synced: '同步完成。',
   unchanged: '没有新变更。',
   'read-only': '网盘当前只读，未上传本机变更。',
-  deferred: '仍有本机草稿未上传。',
+  deferred: '本机还有待同步的修改。',
   unlinked: '尚未连接密码库。',
   locked: '先解锁密码库。',
   paused: '网盘连接已暂停。',
@@ -31,6 +33,17 @@ const syncText: Record<SyncResult['kind'], string> = {
   'key-update': '另一台设备已修改主密码，请在解锁页验证新密码。',
   'confirm-deletion': '有一批删除尚未发送到网盘。',
 };
+const disabledLabels: Record<keyof SiteFlags, string> = {
+  inlineDisabled: '隐藏填充图标',
+  saveDisabled: '关闭密码保存提示',
+  passkeyDisabled: '由浏览器处理通行密钥',
+};
+
+function DomainGroupList({ groups }: { groups: string[][] }) {
+  return groups.length
+    ? <ul className="fold-body site-rule-list" role="list">{groups.map((group, index) => <li key={index}>{group.join('、')}</li>)}</ul>
+    : <p className="fold-body hint">这一版没有关联域名。</p>;
+}
 
 export default function WebDav({ onboarding = false, stayLocal, onCreated, refresh }: {
   onboarding?: boolean; stayLocal?(next: 'create' | 'restore'): void; onCreated?(kit: EmergencyKit): void; refresh?(): Promise<void>;
@@ -42,7 +55,7 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const [password, setPassword] = useState('');
   const [confirmHttp, setConfirmHttp] = useState(false);
   const [status, setStatus] = useState<DavConnectionStatus>();
-  const [result, setResult] = useState<DavProbe>();
+  const [result, setResult] = useState<ConnectionProbe>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [method, setMethod] = useState<'master' | 'recovery'>('master');
@@ -57,6 +70,10 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   const [editingDevices, setEditingDevices] = useState(false);
   const [localMaster, setLocalMaster] = useState('');
   const [joinReview, setJoinReview] = useState<DavJoinPreview>();
+  const [siteRules, setSiteRules] = useState<DavSiteRulesPreview>();
+  const [ruleConflicts, setRuleConflicts] = useState<DavRuleConflictsPreview>();
+  const rulesHeading = useRef<HTMLHeadingElement>(null);
+  const rulesHeadingId = useId();
   const input: WebDavInput = { provider, base, folder, username, password, confirmHttp };
   useEffect(() => {
     let live = true;
@@ -64,12 +81,38 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
       if (live) setStatus(value);
     }).catch(e => { if (live) setError(errorText(e)); });
     const changed = (changes: Record<string, unknown>, area: string) => {
-      if (area === 'local' && ('webDavClock' in changes || 'webDavPaused' in changes)) update();
+      if (area === 'local' && ('webDavClock' in changes || 'webDavPaused' in changes || 'webDavConflicts' in changes)) update();
+    };
+    const notified = (message?: { target?: string; type?: string }) => {
+      if (message?.target === 'vault-event' && (message.type === 'sync-changed' || message.type === 'webdav-pending')) update();
     };
     update();
     browser.storage.onChanged.addListener(changed);
-    return () => { live = false; browser.storage.onChanged.removeListener(changed); };
+    browser.runtime.onMessage.addListener(notified);
+    return () => {
+      live = false;
+      browser.storage.onChanged.removeListener(changed);
+      browser.runtime.onMessage.removeListener(notified);
+    };
   }, []);
+  const siteRulesPending = status?.siteRulesPending === true;
+  useEffect(() => {
+    if (!siteRulesPending) { setSiteRules(undefined); return; }
+    let live = true;
+    if (onboarding) rulesHeading.current?.focus();
+    void request<DavSiteRulesPreview | null>({ type: 'webdav-site-rules' }).then(value => {
+      if (live) {
+        setSiteRules(value ?? undefined);
+        if (!value) void request<DavConnectionStatus>({ type: 'webdav-status' }).then(current => {
+          if (live) setStatus(current);
+        }).catch(e => { if (live) setError(errorText(e)); });
+      }
+    }).catch(e => { if (live) setError(errorText(e)); });
+    return () => { live = false; };
+  }, [onboarding, siteRulesPending]);
+  const reviewingRules = !!ruleConflicts && status?.siteRulesApplied === true;
+  useEffect(() => { if (reviewingRules) rulesHeading.current?.focus(); }, [reviewingRules]);
+  const resumingGenesis = result?.createPending === true;
   useEffect(() => {
     const end = status?.clockExpiresAt;
     if (end === undefined) return;
@@ -78,11 +121,11 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     return () => window.clearTimeout(timer);
   }, [status?.clockExpiresAt]);
   useEffect(() => {
-    if (result?.kind !== 'empty' && result?.kind !== 'missing') return;
+    if (resumingGenesis || (result?.kind !== 'empty' && result?.kind !== 'missing')) return;
     let live = true;
     void deviceProfile().then(({ suggestedName }) => { if (live) setDeviceName(value => value ?? suggestedName); }).catch(() => undefined);
     return () => { live = false; };
-  }, [result?.kind]);
+  }, [result?.kind, resumingGenesis]);
   function clearResult() { setResult(undefined); setJoinReview(undefined); setLocalMaster(''); setError(''); setSecret(''); setConfirm(''); }
   async function run(action: () => Promise<void>) {
     setBusy(true); setError('');
@@ -94,9 +137,9 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
   }
   const test = (fresh: boolean) => run(async () => {
     clearResult();
-    const value = await request<DavProbe>({ type: 'webdav-test', input: fresh ? input : undefined, remember: fresh && !onboarding });
+    const value = await request<ConnectionProbe>({ type: 'webdav-test', input: fresh ? input : undefined, remember: fresh && !onboarding });
     setResult(value);
-    setFromSaved(!onboarding);
+    setFromSaved(!onboarding && (!fresh || value.kind !== 'incomplete'));
     if (!onboarding && fresh && value.kind !== 'incomplete' && value.kind !== 'existing') setPassword('');
     setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
   });
@@ -109,15 +152,50 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
         if (!joinReview) { setJoinReview(next); return; }
       }
       setPassword(''); clearResult();
-      await refresh?.();
-      setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
+      const current = await request<DavConnectionStatus>({ type: 'webdav-status' });
+      setStatus(current);
+      if (!current.siteRulesPending) await refresh?.();
     } catch (error) {
       if (error instanceof Error && error.message.includes('重新预览')) setJoinReview(undefined);
       throw error;
     } finally { setSecret(''); setLocalMaster(''); }
   });
+  const chooseSiteRules = (use: boolean) => run(async () => {
+    if (!siteRules) return;
+    try {
+      await request({ type: 'webdav-site-rules-choice', use, stamp: siteRules.stamp });
+    } catch (error) {
+      setSiteRules(await request<DavSiteRulesPreview | null>({ type: 'webdav-site-rules' }).catch(() => null) ?? undefined);
+      throw error;
+    }
+    setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
+    await refresh?.();
+  });
+  const retrySiteRules = () => run(async () => {
+    const next = await request<DavSiteRulesPreview | null>({ type: 'webdav-site-rules' });
+    setSiteRules(next ?? undefined);
+    if (!next) {
+      setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
+      await refresh?.();
+    }
+  });
+  async function loadRuleConflicts() {
+    const next = await request<DavRuleConflictsPreview | null>({ type: 'webdav-rule-conflicts' });
+    setRuleConflicts(next ?? undefined);
+    setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
+  }
+  const chooseRuleConflict = (index: number, choice: 'first' | 'second') => run(async () => {
+    if (!ruleConflicts) return;
+    try {
+      await request({ type: 'webdav-rule-conflict-choice', index, choice, stamp: ruleConflicts.stamp });
+    } catch (error) {
+      await loadRuleConflicts().catch(() => undefined);
+      throw error;
+    }
+    await loadRuleConflicts();
+  });
   const create = () => run(async () => {
-    if (onboarding && secret !== confirm) throw new Error('两次主密码输入不一致。');
+    if (onboarding && !resumingGenesis && secret !== confirm) throw new Error('两次主密码输入不一致。');
     const kit = await request<EmergencyKit | undefined>({ type: 'webdav-create', input: fromSaved ? undefined : input,
       scratchFolder, masterPassword: secret, deviceName });
     setSecret(''); setPassword(''); setConfirm(''); setResult(undefined);
@@ -143,6 +221,58 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     } finally { setSecret(''); }
   });
   const offset = status?.saved ? status.offsetSeconds : result?.offsetSeconds;
+  const latestResult = status?.pending === false && syncResult?.pending ? undefined : syncResult;
+  const pending = status?.pending ?? latestResult?.pending;
+  const syncDisplay = pending && (!latestResult || latestResult.kind === 'synced' || latestResult.kind === 'unchanged')
+    ? 'deferred' : latestResult?.kind;
+  if (siteRulesPending) return <section className="section" aria-labelledby={rulesHeadingId} aria-busy={busy}>
+    <h2 id={rulesHeadingId} ref={rulesHeading} tabIndex={-1}>预览网盘库的网站规则</h2>
+    <p className="lede">{onboarding && '已加入网盘密码库。'}关联域名可以共用登录凭证。采用前，请核对这些网站。</p>
+    {siteRules ? <>
+      {siteRules.sites.length > 0 && <details className="fold" open>
+        <summary>网站开关 · {siteRules.sites.length} 项<Ico of={ChevronRight} /></summary>
+        <dl className="fold-body site-rule-list">
+          {siteRules.sites.map(({ rule, flags }) => <div key={rule}>
+            <dt>{rule}</dt>
+            <dd className="hint">{SITE_FLAG_KEYS.filter(key => flags[key]).map(key => disabledLabels[key]).join('、') || '使用默认开关'}</dd>
+          </div>)}
+        </dl>
+      </details>}
+      {siteRules.domainGroups.length > 0 && <details className="fold" open>
+        <summary>关联域名 · {siteRules.domainGroups.length} 组<Ico of={ChevronRight} /></summary>
+        <DomainGroupList groups={siteRules.domainGroups} />
+      </details>}
+      {siteRules.sites.length === 0 && siteRules.domainGroups.length === 0 && <p className="hint">网盘库还没有网站规则。</p>}
+      <p className="hint">此选择只影响这台设备。</p>
+      <div className="actions">
+        <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void chooseSiteRules(true)}>采用网盘网站规则</button>
+        <button type="button" className="btn" disabled={busy} onClick={() => void chooseSiteRules(false)}>跳过网站规则</button>
+      </div>
+    </> : error
+      ? <button type="button" className="btn" disabled={busy} onClick={() => void retrySiteRules()}>重试预览</button>
+      : <p className="hint" role="status">正在读取网站规则…</p>}
+    {error && <ErrorBanner text={error} />}
+  </section>;
+  if (reviewingRules && ruleConflicts) return <section className="section" aria-labelledby={rulesHeadingId} aria-busy={busy}>
+    <div className="actions">
+      <button type="button" className="btn" disabled={busy} onClick={() => { setRuleConflicts(undefined); setError(''); }}>返回网盘设置</button>
+    </div>
+    <h2 id={rulesHeadingId} ref={rulesHeading} tabIndex={-1}>处理关联域名冲突</h2>
+    <p className="lede">不同设备编辑了相同的关联设置。请核对哪些网站可以共用登录凭证，再选择一版。</p>
+    {error && <ErrorBanner text={error} />}
+    {ruleConflicts.alternatives.map(({ first, second }, index) =>
+      <section key={index} className="section" aria-label={`关联域名冲突 ${index + 1}`}>
+        {ruleConflicts.alternatives.length > 1 && <h3>第 {index + 1} 项</h3>}
+        {([['first', '第一版', first], ['second', '第二版', second]] as const).map(([choice, label, groups]) =>
+          <details key={choice} className="fold" open>
+            <summary>{label}<Ico of={ChevronRight} /></summary>
+            <DomainGroupList groups={groups} />
+            <div className="fold-body">
+              <button type="button" className="btn" disabled={busy} onClick={() => void chooseRuleConflict(index, choice)}>采用{label}</button>
+            </div>
+          </details>)}
+      </section>)}
+  </section>;
   if (readingHistory) return <SyncHistory close={() => setReadingHistory(false)} changed={async () => {
     await refresh?.();
     setStatus(await request<DavConnectionStatus>({ type: 'webdav-status' }));
@@ -167,15 +297,17 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
     </div>}
     {!!status?.conflicts && <button className="btn" type="button" disabled={busy} onClick={() => void openConflictReview().catch(e => setError(errorText(e)))}>
       处理 {status.conflicts} 项同步冲突</button>}
+    {status?.siteRulesApplied && !!status.siteRuleConflicts && <button className="btn" type="button" disabled={busy} onClick={() => void run(loadRuleConflicts)}>
+      处理 {status.siteRuleConflicts} 项关联域名冲突</button>}
     {status?.linked && verifyWrites && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void enable(); }}>
       <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy} />
       <SecretField label="当前主密码" value={secret} onChange={setSecret} required maxLength={1024} disabled={busy} autoComplete="current-password" />
       <button className="btn btn-primary" disabled={busy}>验证并启用网盘写入</button>
     </form>}
-    {syncResult && <p className={syncResult.kind === 'synced' || syncResult.kind === 'unchanged' ? 'banner banner-ok' : 'banner banner-warn'}
-      role="status">{syncText[syncResult.kind]}</p>}
-    {syncResult?.kind === 'confirm-deletion' && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void sync(true); }}>
-      <p className="hint">移除 {syncResult.removed} 条有效凭证（{syncResult.before} → {syncResult.after} 条）。</p>
+    {syncDisplay && <p className={syncDisplay === 'synced' || syncDisplay === 'unchanged' ? 'banner banner-ok' : 'banner banner-warn'}
+      role="status">{syncText[syncDisplay]}</p>}
+    {latestResult?.kind === 'confirm-deletion' && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void sync(true); }}>
+      <p className="hint">移除 {latestResult.removed} 条有效凭证（{latestResult.before} → {latestResult.after} 条）。</p>
       <SecretField label="主密码" value={secret} onChange={setSecret} required maxLength={1024} disabled={busy} autoComplete="current-password" />
       <div className="actions"><button className="btn btn-primary" disabled={busy}>确认同步这批删除</button>
         <button type="button" className="btn" disabled={busy} onClick={() => { setSyncResult(undefined); setSecret(''); }}>取消</button></div>
@@ -196,8 +328,9 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
       <button className="btn btn-primary" disabled={busy}>{busy ? '正在连接…' : onboarding ? '测试连接' : '测试并保存连接'}</button>
     </form>
     {error && <ErrorBanner text={error} />}
-    {result && <p role="status" className={result.kind === 'incomplete' ? 'banner banner-warn' : 'banner banner-ok'}>{probeText[result.kind]}</p>}
-    {(onboarding || (status && !status.linked && !!password)) && result?.kind === 'existing' &&
+    {result && <p role="status" className={resumingGenesis || result.kind === 'incomplete' ? 'banner banner-warn' : 'banner banner-ok'}>
+      {resumingGenesis ? '上次创建这个网盘库时中断了。' : probeText[result.kind]}</p>}
+    {!resumingGenesis && (onboarding || (status && !status.linked && !!password)) && result?.kind === 'existing' &&
       <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void restore(); }}>
       {joinReview && <section className="section" aria-label="合并预览">
         <p className="hint">本机 {joinReview.sourceCount} 条，网盘 {joinReview.targetCount} 条。合并后 {joinReview.mergedCount} 条，{joinReview.conflicts} 项待裁决。</p>
@@ -216,15 +349,15 @@ export default function WebDav({ onboarding = false, stayLocal, onCreated, refre
         {joinReview && <button type="button" className="btn" disabled={busy} onClick={() => { setJoinReview(undefined); setSecret(''); setLocalMaster(''); }}>取消合并</button>}
       </div>
     </form>}
-    {!status?.linked && !status?.paused && (result?.kind === 'empty' || result?.kind === 'missing') && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void create(); }}>
-      <TextField label="本机名称" value={deviceName ?? ''} onChange={setDeviceName} maxLength={80} disabled={busy} />
+    {!status?.linked && !status?.paused && (resumingGenesis || result?.kind === 'empty' || result?.kind === 'missing') && <form className="form" onSubmit={event => { event.preventDefault(); if (!busy) void create(); }}>
+      {!resumingGenesis && <TextField label="本机名称" value={deviceName ?? ''} onChange={setDeviceName} maxLength={80} disabled={busy} />}
       <TextField label="独立空测试目录名" value={scratchFolder} onChange={setScratchFolder} required maxLength={100} disabled={busy}
         hint="与同步目录同级，必须已存在且为空。只在此目录读写随机测试文件。" />
-      <SecretField label={onboarding ? '新主密码' : '当前主密码'} value={secret} onChange={setSecret} required
-        minLength={onboarding ? 12 : undefined} maxLength={1024} disabled={busy} autoComplete={onboarding ? 'new-password' : 'current-password'} />
-      {onboarding && <SecretField label="再次输入主密码" value={confirm} onChange={setConfirm} required disabled={busy}
+      <SecretField label={onboarding && !resumingGenesis ? '新主密码' : '当前主密码'} value={secret} onChange={setSecret} required
+        minLength={onboarding ? 12 : undefined} maxLength={1024} disabled={busy} autoComplete={onboarding && !resumingGenesis ? 'new-password' : 'current-password'} />
+      {onboarding && !resumingGenesis && <SecretField label="再次输入主密码" value={confirm} onChange={setConfirm} required disabled={busy}
         minLength={12} maxLength={1024} autoComplete="new-password" />}
-      <button className="btn btn-primary" disabled={busy}>{busy ? '正在验证并建库…' : '验证写入并在网盘建库'}</button>
+      <button className="btn btn-primary" disabled={busy}>{busy ? '正在验证并建库…' : resumingGenesis ? '继续创建网盘库' : '验证写入并在网盘建库'}</button>
     </form>}
     {offset != null && <p className="hint">网盘时间与本机相差 {Math.abs(offset)} 秒，本机时钟{offset > 0 ? '偏慢' : '偏快'}。</p>}
     {status?.saved && <SwitchRow label="补偿时间验证码偏差" checked={status.compensation} disabled={busy || (!status.compensation && (status.paused != null || status.offsetSeconds == null))}

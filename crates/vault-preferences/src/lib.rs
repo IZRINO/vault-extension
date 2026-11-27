@@ -5,6 +5,11 @@ use vault_core::session::SessionWrappedDekBlob;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+mod pack_payload;
+mod pack_record;
+pub use pack_payload::*;
+pub use pack_record::*;
+
 #[derive(Clone, Copy)]
 enum Domain { Autofill, WebDav }
 impl Domain {
@@ -87,6 +92,17 @@ pub fn wasm_open_webdav(session_key: Vec<u8>, session_wrap: Vec<u8>, sealed: Vec
     open(&key, &wrap, &sealed, Domain::WebDav).map_err(Into::into)
 }
 
+#[wasm_bindgen]
+pub fn wasm_sync_pack_material(session_key: Vec<u8>, session_wrap: Vec<u8>) -> Result<Vec<u8>, JsValue> {
+    let (key, wrap) = (Zeroizing::new(session_key), Zeroizing::new(session_wrap));
+    let (vault, _, dek) = SessionWrappedDekBlob::unwrap(&wrap, &SecretKey::from_slice(&key)?)?;
+    let mut material = Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(vault.as_bytes()), dek.as_bytes())
+        .expand(b"vault:whole-sync:material:v1", material.as_mut())
+        .map_err(|_| VaultError::CryptoAuthFailed)?;
+    Ok(material.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +135,18 @@ mod tests {
         assert!(!sealed.windows(7).any(|w| w == b"private"));
         assert!(open(key.as_bytes(), &wrap, &sealed, Domain::Autofill).is_err());
         assert_eq!(open(key.as_bytes(), &wrap, &sealed, Domain::WebDav).unwrap(), plain);
+    }
+    #[test]
+    fn sync_pack_material_is_shared_only_by_sessions_of_the_same_vault() {
+        let dek = SecretKey::random().unwrap();
+        let first = SecretKey::random().unwrap();
+        let second = SecretKey::random().unwrap();
+        let a = SessionWrappedDekBlob::wrap("vault-a", 1, &dek, &first).unwrap();
+        let b = SessionWrappedDekBlob::wrap("vault-a", 2, &dek, &second).unwrap();
+        let foreign = SessionWrappedDekBlob::wrap("vault-b", 1, &dek, &second).unwrap();
+        let material = wasm_sync_pack_material(first.as_bytes().to_vec(), a).unwrap();
+        assert_eq!(material.len(), 32);
+        assert_eq!(material, wasm_sync_pack_material(second.as_bytes().to_vec(), b).unwrap());
+        assert_ne!(material, wasm_sync_pack_material(second.as_bytes().to_vec(), foreign).unwrap());
     }
 }

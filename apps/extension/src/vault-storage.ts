@@ -1,6 +1,8 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import type { JournalClock } from './sync/journal-device';
 import type { RemoteWal } from './sync/bootstrap';
+import type { WholePackState } from './sync/pack-sync';
+import type { PackVersion } from './sync/pack-transport';
 
 interface VaultDbSchema extends DBSchema {
   vault: { key: string; value: VaultFiles };
@@ -8,9 +10,17 @@ interface VaultDbSchema extends DBSchema {
   pendingWal: { key: string; value: PendingWal };
   journal: { key: string; value: JournalClock };
   remoteState: { key: string; value: RemoteAnchor };
+  packSetup: { key: string; value: PendingPackSetup };
 }
 export interface PendingWal { vaultId: string; bytes: Uint8Array }
 export interface JournalCommit { id: string; state: JournalClock; bytes: Uint8Array; replaceLegacy: boolean }
+export interface PendingPackSetup {
+  version: PackVersion;
+  ciphertext: Uint8Array<ArrayBuffer>;
+  clock: JournalClock;
+  source?: string;
+  recovery?: Uint8Array<ArrayBuffer>;
+}
 export interface RemoteAnchor {
   vaultId: string; endpoint: string; head: Uint8Array; snap: Uint8Array; etag?: string;
   objects: RemoteWal[];
@@ -26,6 +36,7 @@ export interface RemoteAnchor {
   rotationFrom?: number;
   observedKeyEpoch?: number;
   observedHead?: Uint8Array;
+  pack?: WholePackState;
   // Head and snapshot remain authenticated ciphertext; do not store a plaintext copy of the root or records.
 }
 export interface VaultFiles {
@@ -36,6 +47,10 @@ export interface VaultFiles {
   /** Absolute change count covered by the latest confirmed backup; absent on older vaults. */
   backedUpChangeCount?: number;
   everHadRecords?: boolean;
+  /** Authenticated, vault-scoped preferences copied into whole-vault sync packages. */
+  packRules?: Uint8Array;
+  /** Local preferences when this device declines the cloud rules. */
+  localPackRules?: Uint8Array;
 }
 export interface SessionState {
   key: Uint8Array; wrap: Uint8Array; unlockedAtMs: number; lastActivityMs: number;
@@ -46,13 +61,14 @@ export interface LocalSettings {
 }
 let dbPromise: Promise<IDBPDatabase<VaultDbSchema>> | undefined;
 function database() {
-  dbPromise ??= openDB<VaultDbSchema>('vault-extension', 4, {
+  dbPromise ??= openDB<VaultDbSchema>('vault-extension', 5, {
     upgrade(db) {
       if (!db.objectStoreNames.contains('vault')) db.createObjectStore('vault');
       if (!db.objectStoreNames.contains('pendingChanges')) db.createObjectStore('pendingChanges');
       if (!db.objectStoreNames.contains('pendingWal')) db.createObjectStore('pendingWal');
       if (!db.objectStoreNames.contains('journal')) db.createObjectStore('journal');
       if (!db.objectStoreNames.contains('remoteState')) db.createObjectStore('remoteState');
+      if (!db.objectStoreNames.contains('packSetup')) db.createObjectStore('packSetup');
     },
   });
   return dbPromise;
@@ -66,6 +82,12 @@ export async function loadJournal(vaultId: string): Promise<{ clock?: JournalClo
   return { clock, legacy: key !== undefined };
 }
 export async function loadRemoteAnchor(vaultId: string) { return (await database()).get('remoteState', vaultId); }
+export async function loadPackSetup(endpoint: string) { return (await database()).get('packSetup', endpoint); }
+export async function savePackSetup(endpoint: string, setup: PendingPackSetup) {
+  const tx = (await database()).transaction('packSetup', 'readwrite', { durability: 'strict' });
+  await Promise.all([tx.store.put(setup, endpoint), tx.done]);
+}
+export async function clearPackSetup(endpoint: string) { await (await database()).delete('packSetup', endpoint); }
 export async function hasPendingWal(vaultId: string) {
   const db = await database();
   const tx = db.transaction(['pendingWal', 'pendingChanges']);
@@ -93,7 +115,7 @@ export async function saveRemoteAnchor(anchor: RemoteAnchor, files: VaultFiles, 
     consume ? tx.objectStore('pendingChanges').delete('hotp-snapshot') : undefined,
     clock ? tx.objectStore('journal').put(clock, anchor.vaultId) : undefined, tx.done]);
 }
-export async function adoptRemoteVault(source: VaultFiles, anchor: RemoteAnchor, target: VaultFiles, change: JournalCommit) {
+export async function adoptRemoteVault(source: VaultFiles, anchor: RemoteAnchor, target: VaultFiles, change: JournalCommit | JournalClock) {
   const tx = (await database()).transaction(['vault', 'remoteState', 'journal', 'pendingWal', 'pendingChanges'], 'readwrite', { durability: 'strict' });
   const vault = tx.objectStore('vault'), remote = tx.objectStore('remoteState');
   const [current, known] = await Promise.all([vault.get('active'), remote.get(source.vaultId)]);
@@ -108,8 +130,8 @@ export async function adoptRemoteVault(source: VaultFiles, anchor: RemoteAnchor,
     vault.add(current, `merged-source:${current.vaultId}`),
     vault.put(target, 'active'),
     remote.put(anchor, target.vaultId),
-    tx.objectStore('journal').put(change.state, target.vaultId),
-    tx.objectStore('pendingWal').add({ vaultId: target.vaultId, bytes: change.bytes }, change.id),
+    tx.objectStore('journal').put('state' in change ? change.state : change, target.vaultId),
+    'bytes' in change ? tx.objectStore('pendingWal').add({ vaultId: target.vaultId, bytes: change.bytes }, change.id) : undefined,
     tx.objectStore('pendingChanges').delete('hotp-snapshot'),
     tx.done,
   ]);

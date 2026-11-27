@@ -16,24 +16,51 @@ export interface WebDavInput {
 
 export interface WebDavConfig { url: string; username: string; password: string; writeVerified?: boolean }
 export type DavStopStatus = 401 | 403 | 429;
-export type DavProbe = { kind: 'empty' | 'existing' | 'incomplete' | 'missing'; offsetSeconds: number | null; writeAllowed: false };
+export type DavProbe = { kind: 'empty' | 'existing' | 'incomplete' | 'missing'; offsetSeconds: number | null; writeAllowed: false; format?: 'pack' };
 export interface DavEntry { name: string; collection: boolean; etag?: string; bytes?: number }
 export interface DavContext {
   signal?: AbortSignal;
   check?(): void;
   observeClock?(offsetSeconds: number | null, receivedAt: number): Promise<void>;
+  observeRead?(path: string, bytes: number): void;
   stop?(status: DavStopStatus): void | Promise<void>;
 }
 
 export interface DavObject { bytes: Uint8Array<ArrayBuffer>; etag?: string }
 export const davSnapshotName = /^snap_[0-9a-f]{14}_[0-9a-f]{8}_[0-9a-f]{14}\.bin$/;
 export const davWalName = /^[0-9a-f]{14}_[0-9a-f]{8}_[0-9a-f]{14}\.bin$/;
+export const davPackRecordName = /^v_[0-9a-f]{32}\.txt$/;
+export const davPackPackageName = /^p_[0-9a-f]{32}\.bin$/;
+export const DAV_PACK_ROOT = 'pack-root.txt';
 const probeName = /^verify_[0-9a-f]{32}\.bin$/;
+const packProbeName = /^pack_verify_[0-9a-f]{32}\.(?:bin|txt)$/;
 const davObjectPath = (name: string) => name === 'head.bin' || name === 'wal-budget.bin' || davSnapshotName.test(name) ||
-  (name.startsWith('wal/') && davWalName.test(name.slice(4))) || probeName.test(name);
+  (name.startsWith('wal/') && davWalName.test(name.slice(4))) || probeName.test(name) || packProbeName.test(name) || name === DAV_PACK_ROOT ||
+  (name.startsWith('versions/') && davPackRecordName.test(name.slice(9))) ||
+  (name.startsWith('packages/') && davPackPackageName.test(name.slice(9)));
 const strongTag = (value: string | null) => value && /^"[\x21\x23-\x7e]{1,512}"$/.test(value) ? value : undefined;
 const discard = (response: Response) => { void response.body?.cancel().catch(() => undefined); };
-const unexpected = (response: Response) => new Error(`WebDAV 请求未完成（HTTP ${response.status}）。`);
+export class WebDavHttpError extends Error {
+  constructor(readonly status: number) { super(`WebDAV 请求未完成（HTTP ${status}）。`); }
+}
+const unexpected = (response: Response) => new WebDavHttpError(response.status);
+
+export class WebDavContentError extends Error {}
+export class WebDavNetworkError extends Error {}
+
+class WebDavReadError extends WebDavContentError {
+  constructor(readonly declared: number, readonly received: number, hint = '') {
+    super(`WebDAV 文件读回不完整。服务器声明 ${declared} 字节，实际收到 ${received} 字节。${hint}`);
+  }
+}
+
+function fileLength(response: Response) {
+  // Fetch decodes content encodings before exposing the stream; Content-Length measures the encoded body.
+  const encoding = response.headers.get('Content-Encoding');
+  const length = response.headers.get('Content-Length');
+  if (encoding && encoding.toLowerCase() !== 'identity') return undefined;
+  return length !== null && /^\d+$/.test(length) ? Number(length) : undefined;
+}
 
 const statusHint: Record<DavStopStatus, string> = {
   401: '网盘拒绝了登录。请核对账户和应用专用密码后手动测试。',
@@ -86,26 +113,34 @@ export function webDavConfig(input: WebDavInput): WebDavConfig {
   return { url: url.href, username: input.username.trim(), password: input.password };
 }
 
-export async function boundedBody(response: Response, limit: number): Promise<Uint8Array<ArrayBuffer>> {
-  if (Number(response.headers.get('Content-Length')) > limit) {
+export async function boundedBody(response: Response, limit: number, expectedLength?: number): Promise<Uint8Array<ArrayBuffer>> {
+  const declared = fileLength(response);
+  if (declared !== undefined && declared > limit) {
     void response.body?.cancel().catch(() => undefined);
-    throw new Error('WebDAV 响应超过大小限制。');
+    throw new WebDavContentError('WebDAV 响应超过大小限制。');
   }
-  if (!response.body) return new Uint8Array();
+  if (!response.body) {
+    if (expectedLength) throw new WebDavReadError(expectedLength, 0);
+    return new Uint8Array();
+  }
   const reader = response.body.getReader(), chunks: Uint8Array[] = [];
   let size = 0;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await reader.read().catch((error: unknown) => {
+        if (expectedLength !== undefined && size !== expectedLength) throw new WebDavReadError(expectedLength, size);
+        throw error;
+      });
       if (done) break;
       size += value.byteLength;
       if (size > limit) {
         void reader.cancel().catch(() => undefined);
-        throw new Error('WebDAV 响应超过大小限制。');
+        throw new WebDavContentError('WebDAV 响应超过大小限制。');
       }
       chunks.push(value);
     }
   } finally { reader.releaseLock(); }
+  if (expectedLength !== undefined && size !== expectedLength) throw new WebDavReadError(expectedLength, size);
   const joined = new Uint8Array(size);
   let offset = 0;
   for (const chunk of chunks) { joined.set(chunk, offset); offset += chunk.length; }
@@ -203,7 +238,7 @@ export class WebDavClient {
       });
     } catch {
       checkDav(this.context);
-      throw new Error('无法连接 WebDAV。请核对地址、网络和证书，连接不跟随重定向。');
+      throw new WebDavNetworkError('无法连接 WebDAV。请核对地址、网络和证书，连接不跟随重定向。');
     } finally { login.fill(0); }
     if (stopStatus(response.status)) { discard(response); return this.stop(response.status); }
     if (this.context.signal?.aborted) { discard(response); checkDav(this.context); }
@@ -217,15 +252,16 @@ export class WebDavClient {
     if (response.status === 304 && knownTag) { discard(response); return 'unchanged'; }
     if (response.status !== 200) { discard(response); throw unexpected(response); }
     let bytes: Uint8Array<ArrayBuffer>;
-    try { bytes = await boundedBody(response, limit); }
+    try { bytes = await boundedBody(response, limit, fileLength(response)); }
     catch (error) { checkDav(this.context); throw error; }
     checkDav(this.context);
+    this.context.observeRead?.(name, bytes.length);
     return { bytes, etag: strongTag(response.headers.get('ETag')) };
   }
 
   async put(name: string, bytes: Uint8Array<ArrayBuffer>, condition: { absent: true } | { match: string }) {
     if (!davObjectPath(name) || ('match' in condition && !strongTag(condition.match))) throw malformed();
-    const response = await this.send(name, 'PUT', { 'Content-Type': 'application/octet-stream',
+    const response = await this.send(name, 'PUT', { 'Content-Type': name.endsWith('.txt') ? 'text/plain; charset=utf-8' : 'application/octet-stream',
       ...('match' in condition ? { 'If-Match': condition.match } : { 'If-None-Match': '*' }) }, bytes);
     discard(response);
     if (response.status === 412) return false;
@@ -254,8 +290,15 @@ export class WebDavClient {
     if (![201, 405].includes(response.status)) throw unexpected(response);
   }
 
+  async makePackDirectory(relative: 'versions/' | 'packages/') {
+    if (relative !== 'versions/' && relative !== 'packages/') throw malformed();
+    const response = await this.send(relative, 'MKCOL', {});
+    discard(response);
+    if (![201, 405].includes(response.status)) throw unexpected(response);
+  }
+
   async list(relative = ''): Promise<{ entries: DavEntry[]; offsetSeconds: number | null } | undefined> {
-    if (relative !== '' && relative !== 'wal/') throw malformed();
+    if (!['', 'wal/', 'versions/', 'packages/'].includes(relative)) throw malformed();
     const target = new URL(relative, this.config.url);
     const started = this.now();
     const response = await this.send(relative, 'PROPFIND', { Depth: '1', 'Content-Type': 'application/xml; charset=utf-8' }, propfind);
@@ -263,7 +306,11 @@ export class WebDavClient {
     if (response.status === 404) { discard(response); return undefined; }
     if (response.status !== 207) { discard(response); throw new Error(`服务器未返回可验证的 WebDAV 目录（HTTP ${response.status}）。`); }
     let rows: DavRow[];
-    try { rows = parseResponses(new TextDecoder('utf-8', { fatal: true }).decode(await boundedBody(response, maxListingBytes))); }
+    try {
+      const bytes = await boundedBody(response, maxListingBytes);
+      this.context.observeRead?.(relative, bytes.length);
+      rows = parseResponses(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    }
     catch { checkDav(this.context); throw malformed(); }
     for (const row of rows) {
       for (const status of [row.status, ...row.properties.map(p => p.status)]) {
@@ -366,6 +413,9 @@ export async function probeWebDav(config: WebDavConfig, context: DavContext, req
   const listed = await new WebDavClient(config, context, request, now).list();
   if (!listed) return { kind: 'missing', offsetSeconds: null, writeAllowed: false };
   const { entries, offsetSeconds } = listed;
+  if (entries.length === 3 && entries.some(entry => entry.name === DAV_PACK_ROOT && !entry.collection) &&
+    ['versions', 'packages'].every(name => entries.some(entry => entry.name === name && entry.collection)))
+    return { kind: 'existing', format: 'pack', offsetSeconds, writeAllowed: false };
   const head = entries.some(entry => entry.name === 'head.bin' && !entry.collection);
   const snap = entries.some(entry => /^snap_[A-Za-z0-9_-]{1,128}\.bin$/.test(entry.name) && !entry.collection);
   const wal = entries.some(entry => entry.name === 'wal' && entry.collection);

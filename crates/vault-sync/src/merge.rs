@@ -271,7 +271,10 @@ pub(crate) fn item(
     choices: &Choices, sources: (&str, &str),
 ) -> Result<Merge, VaultError> {
     let mut fields = FieldMerge { choices, contested: Vec::new() };
-    let mut selected = if same(ours, theirs) || same(ours, base) {
+    let mut selected = if let Some(side) = choices.get("$item") {
+        fields.contested.push("$item".into());
+        if side == "ours" { ours.cloned() } else { theirs.cloned() }
+    } else if same(ours, theirs) || same(ours, base) {
         theirs.cloned()
     } else if same(theirs, base) {
         ours.cloned()
@@ -286,7 +289,7 @@ pub(crate) fn item(
             }
             _ => {
                 fields.contested.push("$item".into());
-                if choices.get("$item").is_some_and(|side| side == "ours") { ours.cloned() } else { theirs.cloned() }
+                theirs.cloned()
             }
         }
     };

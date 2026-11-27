@@ -157,7 +157,7 @@ fn reconcile(
     result.hlc_timestamp = result.hlc_timestamp.max(ours.hlc_timestamp);
     result.device_registry = crate::device::merge(&base.device_registry, &ours.device_registry, &theirs.device_registry)?;
     provenance.store(&mut result);
-    Ok((result, Staged { rows: conflicts, drafts }))
+    Ok((result, Staged { rows: conflicts, drafts, ..Staged::default() }))
 }
 
 #[wasm_bindgen]
